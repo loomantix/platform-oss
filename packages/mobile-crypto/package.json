@@ -1,6 +1,6 @@
 {
   "name": "@loomantix/mobile-crypto",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "At-rest AES-256-GCM encryption helpers for React Native + Expo (SecureStore-backed master key, factory API).",
   "repository": {
