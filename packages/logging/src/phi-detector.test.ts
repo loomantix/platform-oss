@@ -428,8 +428,8 @@ describe('PHI Detector', () => {
     });
   });
 
-  describe('Real-world examples from audit', () => {
-    describe('file-transcription.service.ts patterns', () => {
+  describe('realistic logging payloads', () => {
+    describe('rawDataSample leak detection', () => {
       it('detects rawDataSample PHI leak', () => {
         const logMessage = {
           rawDataSample: JSON.stringify({
@@ -449,7 +449,7 @@ describe('PHI Detector', () => {
       });
     });
 
-    describe('pyannoteai.service.ts patterns', () => {
+    describe('voiceprint and speaker payloads', () => {
       it('detects voiceprint in webhook payload', () => {
         const logMessage = {
           voiceprint: 'base64_encoded_data',
@@ -464,7 +464,7 @@ describe('PHI Detector', () => {
       });
     });
 
-    describe('segmentation.service.ts patterns', () => {
+    describe('debug-mode data dumps', () => {
       it('detects debug mode data dumps', () => {
         const debugLog = 'Saving fullData to /tmp/debug.json';
         expect(detectPHI(debugLog)).toBe(true);

@@ -106,8 +106,9 @@ export function createCrypto(opts: CreateCryptoOptions): MobileCrypto {
     // backup. That means an iCloud backup of this device cannot decrypt the
     // ciphertext files on a different device, even if the ciphertext itself
     // is in the backup. Trade-off: a user restoring to a new device loses
-    // their offline queue + RQ cache (both short-TTL, acceptable per threat
-    // model in docs/security/mobile-encryption.md).
+    // the decryptability of any ciphertext written on the previous device —
+    // acceptable for short-TTL offline buffers, where data is meant to be
+    // flushed soon and orphaned ciphertext can be discarded.
     await SecureStore.setItemAsync(keyAlias, bytesToBase64(fresh), {
       keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
     });
@@ -163,8 +164,9 @@ export function createCrypto(opts: CreateCryptoOptions): MobileCrypto {
    *   unavailable, etc.). Callers should not delete the file in that case —
    *   the data is likely fine and will decrypt on a later retry.
    *
-   * Splitting those two cases is deliberate: conflating them caused data
-   * loss risk per Gemini's review on PR #556.
+   * Splitting those two cases is deliberate: conflating them lets a
+   * caller mistake a recoverable transient error for terminal corruption
+   * and "clean up" still-decryptable data, causing real data loss.
    */
   async function decryptString(payload: Uint8Array): Promise<string | null> {
     assertBootstrapped();
