@@ -1,6 +1,6 @@
 {
   "name": "@loomantix/logging",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Structured logging primitives for NestJS backends: pino + OpenTelemetry trace context, PHI-safe redaction + detector, and a pluggable event sink.",
   "repository": {
