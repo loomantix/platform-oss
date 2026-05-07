@@ -3,6 +3,7 @@ import { LoggerService, LogLevel } from '@nestjs/common';
 import pino, { Logger as PinoLogger } from 'pino';
 import { createPinoConfig } from './pino.config';
 import { emitToEventSink } from './event-sink';
+import { detectPHI, hasPHIFields } from './phi-detector';
 
 /**
  * Coerce a value to a safe string, never throwing. Used for:
@@ -168,7 +169,19 @@ export class PinoLoggerService implements LoggerService {
       Object.assign(formatted, message);
       return undefined;
     }
-    return toSafeString(message);
+    // Non-plain, non-Error, non-string message (array, class instance, etc).
+    // toSafeString JSON-stringifies into `msg`, which pino.redact.paths does
+    // NOT cover (redact only applies to the merge object). Scan for PHI
+    // before stringifying so a caller logging e.g. `logger.info(someInstance)`
+    // can't bypass redaction by carrying sensitive fields on a non-plain shape.
+    if (hasPHIFields(message)) {
+      return '[redacted: object containing PHI fields]';
+    }
+    const stringified = toSafeString(message);
+    if (stringified !== undefined && detectPHI(stringified)) {
+      return '[redacted: matches PHI pattern]';
+    }
+    return stringified;
   }
 
   /**

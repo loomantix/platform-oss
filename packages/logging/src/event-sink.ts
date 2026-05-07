@@ -31,8 +31,10 @@ export function emitToEventSink(
   message?: string,
 ): void {
   // Check presence of `event` rather than truthiness — an event named ''
-  // (empty string) is still a legitimate event field per the docs.
-  if (!eventSink || !('event' in entry)) {
+  // (empty string) is still a legitimate event field per the docs. Use
+  // `Object.hasOwn` so inherited prototype properties named `event` (e.g.
+  // from a class instance accidentally passed in) don't trigger forwarding.
+  if (!eventSink || !Object.hasOwn(entry, 'event')) {
     return;
   }
 

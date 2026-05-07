@@ -12,7 +12,7 @@ export const MAGIC_VERSION = 1 as const;
 // Stored at the head of every ciphertext blob so readers can distinguish our
 // encrypted format from legacy plaintext JSON without guessing or
 // speculatively attempting decryption. The trailing byte is a format version
-// reserved for future key-rotation work (see issue #557).
+// reserved for future key-rotation work.
 const MAGIC = Uint8Array.from([0x4c, 0x4d, 0x58, MAGIC_VERSION]);
 
 declare global {
