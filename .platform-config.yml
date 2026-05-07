@@ -112,7 +112,6 @@ substitutions:
       fire-and-forget by contract; layer durability above the sink
       callback if you need it.
 
-# Platform-oss consumes the full OSS skill set as-is. The upstream sync
-# manifest already excludes Loomantix-internal skills (phone-install,
-# task-packet) at the source, so no per-target skips are required here.
+# Platform-oss consumes the full set of skills + agents synced from the
+# upstream manifest. No per-target overrides are required here.
 skip_targets: []
