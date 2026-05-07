@@ -1,0 +1,46 @@
+{
+  "name": "loomantix-platform-oss",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.29.3",
+  "description": "Reusable @loomantix/* infrastructure packages: mobile-crypto, web-crypto, logging.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/loomantix/platform-oss.git"
+  },
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm -r --if-present run test",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "lint": "eslint --no-error-on-unmatched-pattern \"packages/*/src/**/*.ts\" \"packages/*/*.config.ts\"",
+    "lint:fix": "eslint --no-error-on-unmatched-pattern \"packages/*/src/**/*.ts\" \"packages/*/*.config.ts\" --fix",
+    "format": "prettier . --write --list-different --cache",
+    "format:check": "prettier . --check",
+    "prepare": "if [ \"$HUSKY\" = \"0\" ] || [ -n \"$CI\" ]; then exit 0; fi; if [ -x ./node_modules/.bin/husky ]; then ./node_modules/.bin/husky; fi"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.5.0",
+    "@commitlint/config-conventional": "^20.5.0",
+    "@eslint/js": "^9.39.4",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-jsdoc": "^62.9.0",
+    "eslint-plugin-prettier": "^5.5.5",
+    "globals": "^16.5.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.1",
+    "prettier-plugin-toml": "^2.0.6",
+    "typescript-eslint": "^8.57.2"
+  },
+  "lint-staged": {
+    "packages/**/*.ts": [
+      "prettier --write",
+      "eslint --fix"
+    ],
+    "*.{json,yaml,yml,md}": [
+      "prettier --write"
+    ]
+  }
+}

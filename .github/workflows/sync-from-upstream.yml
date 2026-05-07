@@ -1,0 +1,186 @@
+# Sync canonical files from loomantix/claude-platform — produces verified commits.
+#
+# Adapted from the upstream template at:
+# https://github.com/loomantix/claude-platform/blob/main/.github/workflows/sync-from-upstream.yml.template
+#
+# How this works:
+#
+#   1. Authenticates as a GitHub App via `actions/create-github-app-token@v1`.
+#      Required secrets on this repo (org-allowlisted to billing-substrate):
+#        - LOOM_BOT_APP_ID         (App id — existing loomantix-org secret)
+#        - LOOM_BOT_APP_PRIVATE_KEY (PEM-encoded private key — same)
+#      The `loomantix` App must be installed on this repo with `contents: write`
+#      and `pull_requests: write`.
+#
+#   2. Replaces `git commit + git push` with `scripts/create-signed-commit.py`
+#      from the cloned upstream repo. That script uses the GitHub Contents
+#      API (git/blobs → git/trees → git/commits → git/refs) to create the
+#      sync commit. Commits created via that path are auto-signed by GitHub
+#      with `committer: GitHub`, `verified: true`.
+#
+#   3. Uses the App's installation token (not the default GITHUB_TOKEN /
+#      github-actions[bot]) for both the commit creation and the
+#      `gh pr create` call.
+#
+# Trust model: UPSTREAM_REF defaults to a tag (`sync-v1`), not `main`, so
+# pushes to upstream main don't auto-propagate. Bumping the tag is the
+# deliberate gate. Kill switch via `SKIP_UPSTREAM_SYNC` repo variable.
+
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # daily at 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: sync-from-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: loomantix/claude-platform
+  UPSTREAM_REF: sync-v1
+  SYNC_BRANCH_PREFIX: sync/upstream
+  PR_BASE_BRANCH: main
+
+jobs:
+  sync:
+    if: vars.SKIP_UPSTREAM_SYNC == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate App installation token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.LOOM_BOT_APP_ID }}
+          private-key: ${{ secrets.LOOM_BOT_APP_PRIVATE_KEY }}
+
+      - name: Checkout consumer repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.PR_BASE_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Clone upstream
+        run: |
+          set -euo pipefail
+          # Wipe any prior clone — on warm runners or rerun-failed jobs,
+          # `git remote add origin` fails if the dir already exists with
+          # state, and the workflow would silently end up working against
+          # stale content.
+          rm -rf /tmp/upstream
+          mkdir -p /tmp/upstream
+          cd /tmp/upstream
+          git init -q
+          git remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          # Disambiguate via ls-remote so that network failures fail loud at
+          # the probe step rather than falling through into a branch fetch
+          # (which would silently ship branch content as a "verified sync
+          # from <tag>" — exactly what the trust model promises won't happen).
+          if git ls-remote --tags --exit-code origin "${UPSTREAM_REF}" >/dev/null; then
+            git fetch --depth=1 origin "refs/tags/${UPSTREAM_REF}:refs/tags/${UPSTREAM_REF}"
+          elif git ls-remote --heads --exit-code origin "${UPSTREAM_REF}" >/dev/null; then
+            git fetch --depth=1 origin "${UPSTREAM_REF}"
+          else
+            echo "::error::UPSTREAM_REF '${UPSTREAM_REF}' is neither a tag nor a branch on ${UPSTREAM_REPO}." >&2
+            exit 1
+          fi
+          git checkout -q FETCH_HEAD
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python3 -m pip install 'pyyaml==6.0.2'
+
+      - name: Run sync engine
+        run: |
+          set -euo pipefail
+          python3 /tmp/upstream/scripts/sync-engine.py \
+            --upstream-repo /tmp/upstream \
+            --consumer-dir .
+
+      - name: Detect changes
+        id: diff
+        run: |
+          set -euo pipefail
+          # `git status --porcelain` covers staged + unstaged + untracked in
+          # one call. The earlier `git diff --quiet` + ls-files combo missed
+          # staged changes, which would silently report "in sync" while the
+          # engine had actually written files.
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Already in sync with upstream"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git status --short
+          fi
+
+      - name: Create signed commit + open / refresh sync PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y%m%d)
+          BRANCH="${SYNC_BRANCH_PREFIX}-${DATE}"
+
+          # Close any prior open sync PRs to keep history clean. `--limit 100`
+          # is deterministic; the default 30 would let stale PRs accumulate
+          # in busy repos.
+          gh pr list \
+            --state open \
+            --limit 100 \
+            --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"${SYNC_BRANCH_PREFIX}-\")) | .number" \
+          | while read -r prior; do
+              [ -z "$prior" ] && continue
+              echo "Closing prior sync PR #$prior"
+              gh pr close "$prior" --delete-branch \
+                --comment "Superseded by today's sync run."
+            done
+
+          # Create the verified commit via the GitHub Contents API. Using
+          # the API (not `git commit`+`git push`) is what makes the commit
+          # signed-by-GitHub. The App token is the actor; commits show
+          # `committer: GitHub`, `verified: true`.
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          # `--app-slug` makes the script append a Signed-off-by trailer
+          # to the commit message, so this repo's DCO check accepts the
+          # commit without a bot exemption.
+          python3 /tmp/upstream/scripts/create-signed-commit.py \
+            --owner "$OWNER" \
+            --repo "$REPO" \
+            --base-branch "${PR_BASE_BRANCH}" \
+            --new-branch "$BRANCH" \
+            --message "chore: sync from ${UPSTREAM_REPO}@${UPSTREAM_REF}" \
+            --app-slug "${{ steps.app-token.outputs.app-slug }}" \
+            --consumer-dir .
+
+          # Open the PR (or refresh title/body if it already exists for the
+          # date-stamped branch). `gh pr create` errors if a PR already
+          # exists for $BRANCH; fall through to gh pr edit on that path.
+          PR_TITLE="Sync from ${UPSTREAM_REPO}"
+          PR_BODY="Automated sync from \`${UPSTREAM_REPO}@${UPSTREAM_REF}\`. Review the diff carefully before merging — substituted content reflects current \`.platform-config.yml\`."
+          if ! gh pr create \
+                --base "${PR_BASE_BRANCH}" \
+                --head "$BRANCH" \
+                --title "$PR_TITLE" \
+                --body "$PR_BODY" 2>/tmp/pr-create-err; then
+            if grep -q "already exists" /tmp/pr-create-err; then
+              echo "PR for $BRANCH already exists — refreshing"
+              gh pr edit "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY"
+            else
+              cat /tmp/pr-create-err >&2
+              exit 1
+            fi
+          fi

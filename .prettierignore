@@ -1,0 +1,14 @@
+node_modules
+**/node_modules/**
+**/dist/**
+**/coverage/**
+**/.pnpm-store/**
+pnpm-lock.yaml
+**/*.d.ts
+
+# Synced from upstream — formatting belongs upstream at loomantix/claude-platform
+.claude/**
+.github/copilot-instructions.md
+
+# Python (leak scanner) — handled by ruff/black if/when added
+scripts/leak_scan/**

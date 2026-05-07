@@ -1,0 +1,24 @@
+packages:
+  - packages/*
+
+# Catalog: shared dep versions referenced as `catalog:` by package.json.
+# Keep this minimal — only deps actually used by packages/* belong here.
+catalog:
+  '@nestjs/common': ^11.1.18
+  '@opentelemetry/api': ^1.9.0
+  '@types/node': ^25.6.0
+  expo-crypto: ~55.0.14
+  expo-secure-store: ~55.0.13
+  fake-indexeddb: ^6.0.0
+  happy-dom: ^20.9.0
+  pino: ^10.3.1
+  pino-pretty: ^13.1.3
+  react-native: ~0.83.4
+  react-native-nitro-modules: ^0.35.4
+  react-native-quick-base64: ^2.2.2
+  react-native-quick-crypto: ^1.0.19
+  reflect-metadata: ^0.2.2
+  rxjs: ^7.8.2
+  tsup: ^8.5.1
+  typescript: ^5.9.3
+  vitest: ^4.1.4

@@ -1,0 +1,17 @@
+# Every merge to platform-oss main requires explicit approval from a code
+# owner. Combined with branch protection's `require_code_owner_reviews: true`
+# and `required_approving_review_count: 1`, this means: no PR reaches main
+# without a deliberate approval click.
+#
+# Rationale: this repo publishes infrastructure packages (mobile-crypto,
+# web-crypto, logging) consumed by Loomantix product apps and any external
+# OSS users. A merged-but-malicious commit here flows into downstream
+# install pipelines via npm, with provenance that traces back to this
+# workflow run — i.e., the supply chain trusts these merges. Requiring an
+# explicit per-PR approval is the cheapest defense against subtle
+# weaponization until the structural mitigations (signed releases, maybe
+# a multi-reviewer rule on `packages/**`) land.
+#
+# CODEOWNERS syntax: https://docs.github.com/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+
+*       @BaxterDevs
