@@ -1,0 +1,60 @@
+name: Publish @loomantix/web-crypto
+
+# Tag-driven publish to public npm via OIDC Trusted Publishing.
+# Push `web-crypto-v<semver>` from main to publish; tag must match
+# packages/web-crypto/package.json version (verification step below).
+# Auth: id-token: write mints a short-lived OIDC token; npm exchanges
+# it for a publish credential. No NPM_TOKEN. Trusted Publisher must
+# be registered for @loomantix/web-crypto on npmjs.com pointing at
+# this repo + filename. --provenance attaches an SLSA build attestation.
+
+on:
+  push:
+    tags:
+      - 'web-crypto-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-web-crypto-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@loomantix'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/web-crypto-v')
+        working-directory: packages/web-crypto
+        run: |
+          tag_version="${GITHUB_REF_NAME#web-crypto-v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Tag version ($tag_version) does not match package.json ($pkg_version)"
+            exit 1
+          fi
+          echo "Publishing @loomantix/web-crypto@$pkg_version"
+
+      - run: pnpm --filter @loomantix/web-crypto typecheck
+      - run: pnpm --filter @loomantix/web-crypto test
+      - run: pnpm --filter @loomantix/web-crypto build
+
+      - name: Publish
+        working-directory: packages/web-crypto
+        run: pnpm publish --access public --provenance --no-git-checks
