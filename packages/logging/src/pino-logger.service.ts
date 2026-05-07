@@ -86,10 +86,26 @@ export class PinoLoggerService implements LoggerService {
     // Pull an Error out of optionalParams (common NestJS pattern:
     // `logger.error('Operation failed', err)`). If the primary message
     // is itself an Error, `resolvePayload` handles it.
+    //
+    // NestJS LoggerService.error signature is `error(message, trace?, context?)`
+    // where trace and context are both strings. Without separating the two
+    // here, `formatMessage` would grab the trace string as `context`
+    // (because it picks the first string in optionalParams) and silently
+    // drop the real context name. Pre-extract any multi-line string as the
+    // trace so formatMessage only sees genuine context candidates.
     let errFromParams: Error | undefined;
+    let traceFromParams: string | undefined;
     const contextualParams = optionalParams.filter((param) => {
       if (!errFromParams && param instanceof Error) {
         errFromParams = param;
+        return false;
+      }
+      if (
+        !traceFromParams &&
+        typeof param === 'string' &&
+        param.includes('\n')
+      ) {
+        traceFromParams = param;
         return false;
       }
       return true;
@@ -101,12 +117,9 @@ export class PinoLoggerService implements LoggerService {
     if (errFromParams && !formatted['err']) {
       formatted['err'] = errFromParams;
       if (errFromParams.stack) formatted['stack'] = errFromParams.stack;
-    } else if (!formatted['stack']) {
-      // Fallback: a multi-line string in optionalParams is likely a stack.
-      const stackArg = contextualParams.find(
-        (p): p is string => typeof p === 'string' && p.includes('\n'),
-      );
-      if (stackArg) formatted['stack'] = stackArg;
+    }
+    if (!formatted['stack'] && traceFromParams) {
+      formatted['stack'] = traceFromParams;
     }
 
     this.logger.error(formatted, msg ?? '');

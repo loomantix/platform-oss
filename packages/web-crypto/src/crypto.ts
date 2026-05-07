@@ -142,6 +142,24 @@ export function createCrypto(opts: CreateCryptoOptions): WebCrypto {
 
   async function getOrCreateKey(): Promise<CryptoKey> {
     if (cachedKey) return cachedKey;
+    // Fail fast with a descriptive error in environments where WebCrypto
+    // is unavailable: SSR / Node without a polyfill, insecure HTTP origins
+    // on older browsers, restricted webviews. Without this check, the
+    // eventual `crypto.subtle.generateKey` (or `crypto.getRandomValues`
+    // in encryptString) throws a cryptic
+    // `TypeError: Cannot read properties of undefined (reading 'subtle')`
+    // far from the call site. Mirrors the IndexedDB guard in `openDB`.
+    if (
+      typeof globalThis.crypto === 'undefined' ||
+      typeof globalThis.crypto.subtle === 'undefined' ||
+      typeof globalThis.crypto.getRandomValues !== 'function'
+    ) {
+      throw new Error(
+        '@loomantix/web-crypto: WebCrypto is not available in this environment ' +
+          '(SSR/Node without polyfill, insecure HTTP origin, or restricted runtime). ' +
+          'This package requires globalThis.crypto.subtle and crypto.getRandomValues.',
+      );
+    }
     // In-flight singleton — two racing getOrCreateKey() calls on a cold
     // page load would otherwise each generate their own key and race on
     // idbPut, leaving ciphertext encrypted with a key that was
