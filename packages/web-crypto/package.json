@@ -1,6 +1,6 @@
 {
   "name": "@loomantix/web-crypto",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "At-rest AES-256-GCM encryption helpers for browsers (WebCrypto + non-extractable CryptoKey persisted in IndexedDB, factory API).",
   "repository": {
