@@ -12,9 +12,10 @@ export const MAGIC_VERSION = 1 as const;
 
 // Magic prefix: 'L','M','X',0x01 — Loomantix crypto, format version 1.
 // IDENTICAL to @loomantix/mobile-crypto. Having one wire format across
-// mobile and web means the emergency-patch playbook and the CI grep
-// check (no local reimplementation of the primitive) cover both
-// packages. The trailing byte is reserved for future key-rotation.
+// mobile and web means a single fix in this package or its mobile twin
+// covers both, and downstream tooling that detects the format by its
+// 4-byte prefix sees the same bytes everywhere. The trailing byte is
+// reserved for future key-rotation.
 const MAGIC = Uint8Array.from([0x4c, 0x4d, 0x58, MAGIC_VERSION]);
 
 // IndexedDB layout. Every `createCrypto({ keyAlias })` instance writes to
