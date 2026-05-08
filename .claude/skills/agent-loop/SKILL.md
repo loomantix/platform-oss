@@ -1,7 +1,7 @@
 ---
 name: agent-loop
 description: Autonomous Claude relay loop on top of /issues — claim a ready issue, spawn a fresh Claude session to work it, push results to a collection branch, repeat. Opens a summary PR at the end.
-argument-hint: "[iterations] [collection-branch] [--resume]"
+argument-hint: '[iterations] [collection-branch] [--resume]'
 ---
 
 # /agent-loop
@@ -16,17 +16,25 @@ Run an autonomous Claude relay over the `/issues` ready queue. Each iteration cl
 
 Defaults: 10 iterations, auto-generated collection branch (`agent-loop-<timestamp>-<rand>`), ready-queue-only.
 
-| Args | Behavior |
-|---|---|
-| `5` | 5 iterations, auto-generated branch, ready-only |
-| `5 wasm-plugins` | 5 iterations, named collection branch |
+| Args                      | Behavior                                                        |
+| ------------------------- | --------------------------------------------------------------- |
+| `5`                       | 5 iterations, auto-generated branch, ready-only                 |
+| `5 wasm-plugins`          | 5 iterations, named collection branch                           |
 | `5 wasm-plugins --resume` | also pick up issues already assigned to `@me` (orphan-recovery) |
-| `--help` | print the script header |
+| `--help`                  | print the script header                                         |
 
 ## Prerequisites (per-repo, one-time)
 
 1. **`agent-loop-instructions.md` at the repo root** — repo-specific agent instructions (codebase conventions, build commands, test invocation, deployment quirks). The Claude prompt is fixed: `Read @agent-loop-instructions.md and follow the instructions. Your assigned issue is #N. Run 'gh issue view N' to see the full description, then complete it.` If the file is missing, the script exits before claiming work.
-2. **`dev: human-only` label** in the consumer's GitHub repo — used to keep manual-testing or human-review-required issues out of the autonomous queue. The script's `pick_next_issue` filter excludes issues carrying this label.
+
+   The sync engine bootstraps this file from an upstream-only template (`agent-loop-instructions.md.template`) on first sync — the manifest entry uses `create_if_missing: true`. After first creation, customize the file for your repo; subsequent syncs leave it alone.
+
+2. **`dev: human-only` label** in the consumer's GitHub repo — used to keep manual-testing or human-review-required issues out of the autonomous queue. The script's `pick_next_issue` filter excludes issues carrying this label. Create once per repo:
+
+   ```bash
+   gh label create "dev: human-only" --description "Excluded from /agent-loop autonomous runs" --color fbca04
+   ```
+
 3. **`gh`, `jq`, `xxd`, `python3`, `claude`** on `PATH`. The script hard-fails if any are missing.
 4. **`/issues` skill synced** — the script invokes `.claude/skills/issues/scripts/ready.py --json` to enumerate the queue. Without it the script exits at startup.
 
