@@ -1,6 +1,6 @@
 # platform-oss
 
-Reusable `@loomantix/*` infrastructure packages, published to public npm under Apache 2.0.
+Reusable `@loomantix/*` infrastructure packages, published to public npm under Apache 2.0 with npm Trusted Publishing and provenance.
 
 ## Packages
 
@@ -12,6 +12,16 @@ Reusable `@loomantix/*` infrastructure packages, published to public npm under A
 
 API-compatibility note: `@loomantix/mobile-crypto` and `@loomantix/web-crypto` share the same surface (`encryptString` / `decryptString` / `hasMagic` / `deleteKey`) and the same wire format, so consumers can dispatch between the two at build time without rewriting call sites.
 
+## Install
+
+```bash
+pnpm add @loomantix/mobile-crypto
+pnpm add @loomantix/web-crypto
+pnpm add @loomantix/logging
+```
+
+Each package README documents package-specific peer dependencies and runtime assumptions.
+
 ## Releases
 
 Each package is independently versioned and tagged:
@@ -20,7 +30,7 @@ Each package is independently versioned and tagged:
 - `web-crypto-v<semver>` → publishes `@loomantix/web-crypto`
 - `logging-v<semver>` → publishes `@loomantix/logging`
 
-Tags trigger one of three publish workflows. Publishing uses npm Trusted Publishing (OIDC) — no long-lived `NPM_TOKEN` secret — and includes `--provenance` SLSA build attestations.
+Tags trigger package-specific publish workflows. Publishing uses npm Trusted Publishing (OIDC), so there is no long-lived `NPM_TOKEN` secret. Publish commands include `--provenance` to attach SLSA build attestations.
 
 ## Development
 
@@ -37,6 +47,8 @@ Each package has its own `tsconfig.json`, `tsup.config.ts`, and `vitest.config.t
 ## Contributing
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md). Every commit must be signed off (DCO).
+
+Agent sessions should also read [`AGENTS.md`](./AGENTS.md) before making changes.
 
 ## License
 
