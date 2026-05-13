@@ -61,6 +61,20 @@ describe('PHI Detector', () => {
       });
     });
 
+    describe('should detect PHI in generic clinical free-text fields', () => {
+      it('detects notes field', () => {
+        expect(detectPHI({ notes: 'Patient instructions...' })).toBe(true);
+      });
+
+      it('detects alert field', () => {
+        expect(detectPHI({ alert: 'Allergy: penicillin' })).toBe(true);
+      });
+
+      it('detects content field', () => {
+        expect(detectPHI({ content: 'Referral letter body...' })).toBe(true);
+      });
+    });
+
     describe('should detect PHI in raw data dumps', () => {
       it('detects fullData field', () => {
         expect(detectPHI({ fullData: { text: '...' } })).toBe(true);
@@ -193,6 +207,20 @@ describe('PHI Detector', () => {
       expect(fields).toContain('soapNote');
     });
 
+    it('extracts generic clinical free-text fields', () => {
+      const data = {
+        notes: 'Patient instructions...',
+        alert: 'Allergy: penicillin',
+        content: 'Letter body...',
+        encounterId: '123',
+      };
+      const fields = extractPHIFields(data);
+      expect(fields).toContain('notes');
+      expect(fields).toContain('alert');
+      expect(fields).toContain('content');
+      expect(fields).not.toContain('encounterId');
+    });
+
     it('returns empty array for non-objects', () => {
       expect(extractPHIFields(null)).toEqual([]);
       expect(extractPHIFields(undefined)).toEqual([]);
@@ -240,6 +268,23 @@ describe('PHI Detector', () => {
       const metadata = logMetadata(data);
       expect(metadata).toEqual({ soapNoteLength: 21 });
       expect(metadata).not.toHaveProperty('soapNote');
+    });
+
+    it('converts notes / alert / content to length', () => {
+      const data = {
+        notes: 'Patient instructions...',
+        alert: 'Allergy: penicillin',
+        content: 'Letter body...',
+      };
+      const metadata = logMetadata(data);
+      expect(metadata).toEqual({
+        notesLength: data.notes.length,
+        alertLength: data.alert.length,
+        contentLength: data.content.length,
+      });
+      expect(metadata).not.toHaveProperty('notes');
+      expect(metadata).not.toHaveProperty('alert');
+      expect(metadata).not.toHaveProperty('content');
     });
 
     it('preserves safe fields', () => {
