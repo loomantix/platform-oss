@@ -63,6 +63,14 @@ const PHI_FIELD_NAMES = [
   'soapNote',
   'clinicalNote',
   'patientNote',
+  // Generic clinical free-text fields commonly present in EMR DTOs.
+  // Treated as PHI by name because in a healthcare context these typically
+  // carry patient instructions, alert flags, or document bodies. Consumers
+  // logging non-PHI fields with these names should rename or convert via
+  // `logMetadata` before logging.
+  'notes',
+  'alert',
+  'content',
   'fullData',
   'rawData',
   'rawDataSample',
