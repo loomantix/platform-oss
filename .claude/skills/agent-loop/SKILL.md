@@ -25,15 +25,17 @@ Defaults: 10 iterations, auto-generated collection branch (`agent-loop-<timestam
 
 ## Prerequisites (per-repo, one-time)
 
-1. **`agent-loop-instructions.md` at the repo root** — repo-specific agent instructions (codebase conventions, build commands, test invocation, deployment quirks). The Claude prompt is fixed: `Read @agent-loop-instructions.md and follow the instructions. Your assigned issue is #N. Run 'gh issue view N' to see the full description, then complete it.` If the file is missing, the script exits before claiming work.
+1. **`agent-loop-instructions.md` at the repo root** — repo-specific agent instructions (codebase conventions, build commands, test invocation, deployment quirks). The Claude prompt that points Claude here is **consumer-owned** in `.claude/skills/agent-loop/prompt.txt`, bootstrapped from `prompt.txt.template` on first sync (`create_if_missing: true`). The default content — `Read @agent-loop-instructions.md and follow the instructions. Your assigned issue is #{ISSUE_ID}. Run 'gh issue view {ISSUE_ID}' to see the full description, then complete it.` — is the value the script falls back to when `prompt.txt` is absent, empty, or unreadable. Edit `prompt.txt` to customize what Claude is told before reading your instructions file. If `agent-loop-instructions.md` itself is missing, the script exits before claiming work.
 
-   The sync engine bootstraps this file from an upstream-only template (`agent-loop-instructions.md.template`) on first sync — the manifest entry uses `create_if_missing: true`. After first creation, customize the file for your repo; subsequent syncs leave it alone.
+   Both files are bootstrapped via `create_if_missing: true` (their respective templates live in `.claude/skills/agent-loop/`). After first creation, customize them for your repo; subsequent syncs leave them alone.
 
-2. **`dev: human-only` label** in the consumer's GitHub repo — used to keep manual-testing or human-review-required issues out of the autonomous queue. The script's `pick_next_issue` filter excludes issues carrying this label. Create once per repo:
+2. **`dev: agent` label + a triaged backlog** in the consumer's GitHub repo. The script picks **only** issues carrying `dev: agent` — without the label, an issue is invisible to the loop. This is a positive filter, not an exclusion: the operator must walk the backlog once and tag the agent-shaped subset, which keeps the loop from wandering into design / cross-repo / device-gated work. Create the label once per repo, then triage:
 
    ```bash
-   gh label create "dev: human-only" --description "Excluded from /agent-loop autonomous runs" --color fbca04
+   gh label create "dev: agent" --description "Suitable for autonomous AI agent completion" --color 8B5CF6
    ```
+
+   The rubric for tagging (used by Loomantix consumers): bounded scope; verifiable success via tests / CI / deterministic check; no design / copy / strategy decisions; no platform credential gates (Play Console, App Store Connect, EAS); no physical device gate; no unresolved upstream blocker. If an issue fails any of those, leave it untagged.
 
 3. **`gh`, `jq`, `xxd`, `python3`, `claude`** on `PATH`. The script hard-fails if any are missing.
 4. **`/issues` skill synced** — the script invokes `.claude/skills/issues/scripts/ready.py --json` to enumerate the queue. Without it the script exits at startup.
@@ -41,9 +43,9 @@ Defaults: 10 iterations, auto-generated collection branch (`agent-loop-<timestam
 ## Behavior per iteration
 
 1. Sync the worktree with `origin/<collection-branch>` — fetches and fast-forwards. If the remote was force-pushed, cherry-picks the local commits onto the new tip (with a pre-reset SHA snapshot so a failed cherry-pick restores the original chain rather than leaving partial replay). Genuine merge conflicts fail loud; the eventual push surfaces persistent ones via the `PUSH_FAILURES` counter.
-2. Pick a work item: with `--resume`, prefer any open issue already assigned to `@me`; otherwise the first dependency-free row from `ready.py --json` that isn't labeled `dev: human-only`.
+2. Pick a work item: with `--resume`, prefer any open `dev: agent` issue already assigned to `@me`; otherwise the first dependency-free row from `ready.py --agent --json`. The `dev: agent` label is required on both paths — an empty queue means the backlog hasn't been triaged yet, not that there's no work to do.
 3. Claim by adding `@me` as assignee. Re-fetch immediately afterward — if there are >1 assignees, a parallel worker raced; release and try the next row.
-4. Spawn `claude --chrome --permission-mode bypassPermissions --print "Read @agent-loop-instructions.md..." --output-format stream-json` and stream the events through `jq` for colored display. The Claude PID is tracked so `Ctrl-C` interrupts the loop cleanly.
+4. Spawn `claude --chrome --permission-mode bypassPermissions --print "$PROMPT" --output-format stream-json` and stream the events through `jq` for colored display. The Claude PID is tracked so `Ctrl-C` interrupts the loop cleanly. **Prompt source:** the prompt is read from the consumer-owned `.claude/skills/agent-loop/prompt.txt` (bootstrapped from the upstream `prompt.txt.template` on first sync via `create_if_missing: true`); the script falls back to a baked-in literal when that file is absent, empty, or unreadable. **Security posture:** the `claude` invocation block is bracketed by `# claude-cli-invocations:start` / `:end` markers and locked in `.claude/claude-cli-invocations.allowlist` (allowlist entries bind to a specific file path, not just the hash); the upstream CI lint at `.claude/lint-claude-cli-invocations.py` fails on any unrecognized hash and rejects sensitive tokens outside any marker. **Adding or rotating an allowlist entry requires byte-level review of the new locked region in the same PR** — the hash by itself is opaque, the diff is the audit trail. The prompt template itself is covered by `.claude/lint-skill-content.py`'s weaponization rules (fetch-and-execute, exfil sinks, off-allowlist URLs, etc.).
 5. Snapshot newly-closed issues since the loop started (used for the final PR body) and push to the collection branch via `push_to_collection` — retry-and-merge with up to 3 attempts.
 
 ## After the loop
