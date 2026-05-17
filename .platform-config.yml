@@ -115,3 +115,31 @@ substitutions:
 # Platform-oss consumes the full set of skills + agents synced from the
 # upstream manifest. No per-target overrides are required here.
 skip_targets: []
+
+# Sync destination allowlist (loomantix/platform#96). Every write/delete
+# the upstream `sync-targets.yml` manifest performs against this consumer
+# must match at least one pattern below. Shifts the trust boundary from
+# "upstream maintainer didn't get fooled" to "platform-oss explicitly opted
+# in to each destination path." Gitignore-flavored globs: `**` matches any
+# path tail; `*` matches a single path segment.
+#
+# Tightness rationale:
+#   - `.claude/skills/**` + `.claude/agents/**` + `.claude/hooks/**` are
+#     broad because their contents only execute when a developer invokes a
+#     skill or sub-agent — no auto-run primitive — and adding new skills /
+#     agents is expected fleet evolution.
+#   - `.github/workflows/dco.yml` is explicit (no `**`). Workflows auto-run
+#     on push, so widening to `.github/workflows/**` would let a compromised
+#     upstream drop an arbitrary CI job — a critical risk on a public OSS
+#     repo where workflows publish to npm and sign provenance.
+#   - `.claude/settings.json` and `.claude/REVIEW_WORKFLOW.md` are explicit
+#     to keep the trusted-config surface narrow.
+allowed_destinations:
+  - .claude/agents/**
+  - .claude/skills/**
+  - .claude/hooks/**
+  - .claude/settings.json
+  - .claude/REVIEW_WORKFLOW.md
+  - .github/copilot-instructions.md
+  - .github/workflows/dco.yml
+  - agent-loop-instructions.md
