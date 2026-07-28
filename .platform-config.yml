@@ -132,14 +132,17 @@ skip_targets: []
 #     on push, so widening to `.github/workflows/**` would let a compromised
 #     upstream drop an arbitrary CI job — a critical risk on a public OSS
 #     repo where workflows publish to npm and sign provenance.
-#   - `.claude/settings.json` and `.claude/REVIEW_WORKFLOW.md` are explicit
-#     to keep the trusted-config surface narrow.
+#   - `.claude/settings.json`, `.claude/REVIEW_WORKFLOW.md`,
+#     `.claude/MODEL_NOTES.md`, and `.claude/references/local-review-ledger.md`
+#     are explicit to keep the trusted-config surface narrow.
 allowed_destinations:
   - .claude/agents/**
   - .claude/skills/**
   - .claude/hooks/**
   - .claude/settings.json
   - .claude/REVIEW_WORKFLOW.md
+  - .claude/MODEL_NOTES.md
+  - .claude/references/local-review-ledger.md
   - .github/copilot-instructions.md
   - .github/workflows/dco.yml
   - agent-loop-instructions.md
