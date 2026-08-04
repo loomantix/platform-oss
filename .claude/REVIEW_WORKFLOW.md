@@ -24,14 +24,45 @@ Use this path when both local engines are available:
    and apply the comment/fix/reply/resolve contract to confirmed findings.
 4. On the resulting head, run a fresh Claude `deepgrill <pr-number>` with the
    same ledger contract.
-5. Classify fixes as `material` or `minor`. Restart at Codex when either pass
-   makes a material fix. Keep minor-only fixes without restarting.
-6. Converge after one complete Codex-then-Claude round makes no material fixes,
-   every pass that committed nothing has an attestation for the exact head it
-   reviewed, every committed pass has a structured fix disposition plus a
-   final-lane completion marker, and every local-review thread has a disposition
-   reply and is resolved.
-7. Stop after four rounds by default. Leave the PR draft and report
+5. Classify fixes as `material` or `minor` **by what the fix changes, not by how
+   severe the finding sounded**. A fix is `material` only when it changes product
+   code. Tests, fixtures, comments, and docs are `minor`. Restart at Codex when
+   either pass makes a material fix. Keep minor-only fixes without restarting.
+
+   **The chain gets cheaper as it repeats.** Two rules make that happen, and both
+   are enforced from the ledger rather than from session memory:
+   - **The refactor pass runs once per engine per PR.** A second `/simplify` over
+     an already-simplified diff returns naming and shape churn, which moves the
+     head and re-stales the other engine's attestation for nothing that ships.
+     Each engine's cleanup lane latches on a `local-review-refactor:v1` marker;
+     a docs/config-only skip does not consume it.
+   - **Rounds 1–2 are adversarial; round 3 and later are convergence rounds.**
+     Once both engines have read the change cold twice, the remaining findings
+     are mostly about the review's own artifacts. A convergence round runs only
+     the lenses that can find a reason not to deploy, changes the PR only for a
+     blocking defect, defers everything else to a linked issue, and ends the loop
+     as soon as it finds no blocker. Lenses still report everything they find —
+     the narrowing is a disposition rule applied by the orchestrator, never an
+     instruction to a review agent to withhold by severity or confidence.
+
+6. Converge after one complete Codex-then-Claude round changes no product code,
+   every pass that committed nothing has an attestation covering the current head,
+   every committed pass has a structured fix disposition plus a final-lane
+   completion marker, and every local-review thread has a disposition reply and is
+   resolved.
+
+   An attestation covers the current head when no product code changed since the
+   SHA it names — a later tests-or-docs-only commit does not invalidate it. Diff
+   the attested SHA against the head over product paths to confirm. Requiring a
+   byte-exact head match instead is what makes this loop unbounded: minor commits
+   perpetually re-stale the other engine's attestation, so the condition in step 6
+   can never be met while either engine keeps finding test work.
+
+7. **The moment a pass changes no product code, stop and recommend shipping.**
+   Name the consumer's ship step — whatever that repo uses to merge the PR.
+   Reaching this before the cap is the expected outcome, not an early exit — the
+   cap is a backstop for non-convergence, never a quota of rounds to spend.
+8. Stop after four rounds by default. Leave the PR draft and report
    non-convergence instead of continuing an unbounded cycle.
 
 Do not add hosted reviewers to this path merely as another ritual. A later
@@ -52,7 +83,8 @@ When a local Codex CLI is unavailable:
 
 1. Open a draft PR and run `deepgrill <pr-number>`.
 2. Run `reviewit <pr-number> deep`; its final local `deepgrill` receives the
-   same PR number and ledger.
+   same PR number and ledger. That tail `deepgrill` skips the refactor pass —
+   step 1 already spent this engine's cleanup latch on the PR.
 
 Use deep mode for auth, crypto, secrets, schema/data-shape work, GitHub Actions,
 sync tooling, `.claude/skills/**`, large refactors, recurring incidents, or
@@ -73,6 +105,13 @@ customer/tenant-variable behavior.
   See [`MODEL_NOTES.md`](MODEL_NOTES.md) §2–§3.
 - Fix every valid in-scope finding. Dismiss false positives with evidence in the
   thread.
+- **A round that only finds test, fixture, and comment work is the signal to
+  ship, not to keep going.** It means the product converged and the review has
+  turned to auditing its own artifacts. That surface is self-renewing — each
+  round's hardening gives the next round new assertions to mutate — so the
+  findings never run out and their existence is not evidence more review is
+  warranted. Recommend the ship step and move anything genuinely worth doing to
+  a follow-up issue.
 - Defer only genuinely large architectural work and link the tracking issue.
 - A fix without a preceding inline finding, a finding without a reply, or a
   resolved thread without a visible disposition is a failed pass.
