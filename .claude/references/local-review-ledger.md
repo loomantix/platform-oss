@@ -32,6 +32,46 @@ list for the pinned `<base-sha>..HEAD` range:
 Zero source files means skip; one or more means run the full pass. A mixed
 changeset is not a partial skip — the source files justify the spend.
 
+## Deliver the diff once
+
+Every lane that fans out to review agents must decide how the changeset reaches
+them. Left unspecified, the default improvisation is to write the whole diff to
+one file and hand that path to every agent, each of which reads all of it and
+then reads it again. The changeset is the largest single input to a review pass
+and the most duplicated one, so its delivery is part of the contract.
+
+Resolve the changed-file list once, from the pinned range, and reuse it:
+
+```bash
+git diff --name-only <base-sha>..HEAD
+git diff --stat <base-sha>..HEAD
+```
+
+Then apply these rules.
+
+1. **Scope each agent to the files it reviews.** Name the exact paths in the
+   agent's prompt. An agent that owns four files must not be handed the other
+   forty. A lens that genuinely spans the whole changeset — architectural
+   altitude, cross-file consistency — gets the `--stat` summary and pulls
+   individual files as it needs them.
+2. **Prefer a scoped command over a stored artifact.** A per-path
+   `git diff <base-sha>..HEAD -- <path>` is reproducible, needs no temp file,
+   and returns only what the agent asked for. Reach for it before writing a
+   diff to disk.
+3. **An artifact, if one exists, is pinned and read once.** State its path and
+   size in the prompt. Re-access a region with a targeted `grep -n` or a bounded
+   read, never a second full read: the file cannot have changed, so a repeat
+   read returns bytes the agent already has.
+4. **Bound any large read.** Above roughly 25k characters, read with an explicit
+   offset and limit, or narrow the range with `-- <path>`.
+
+State the changeset's size when briefing an agent, the same way agent prompts
+state an output ceiling. An agent told the diff spans 40 files reads
+differently from one handed an unlabeled path.
+
+These rules are about duplicated bytes, not about depth. Never drop a lens, skip
+a file an agent needs, or leave a finding unpursued to satisfy them.
+
 ## Rebuild context from GitHub
 
 At the start of every pass, read the PR description, changed files, current
@@ -107,9 +147,25 @@ machine-readable marker:
 
 An automated runner requires that attestation from every pass that committed
 nothing: a hook exiting successfully proves only that it ran, not that it read
-anything. Clean evidence becomes stale as soon as the PR head changes, so the
-marker's `head` must be the exact SHA reviewed, and a pass that fixed something
-attests through its thread replies instead.
+anything. The marker's `head` must be the exact SHA reviewed, and a pass that
+fixed something attests through its thread replies instead.
+
+Clean evidence goes stale when **product code** changes, not whenever the head
+moves. A later commit touching only tests, fixtures, comments, or docs leaves
+every production line the attesting engine read byte-identical, so that
+attestation still covers the new head: record it as carried forward, naming both
+the attested SHA and the current one.
+
+Do not treat every head move as invalidating. That reading is what produces an
+unbounded loop, and it is not a hypothetical — test and doc hardening is always
+available to find, so each engine's commits perpetually re-stale the other's
+attestation and no round can terminate. The loop then feels productive, because
+every round genuinely does surface findings; they are just findings about the
+review's own artifacts rather than about the product.
+
+Verify a carry-forward rather than assuming it. Diff the attested SHA against
+the current head restricted to product paths; if that diff is empty, the
+attestation holds and the round is done.
 
 A review hook that committed must also leave a final-lane completion marker
 after its last adversarial lane finishes:
@@ -125,13 +181,34 @@ cleanup commit from masking a final adversarial lane that silently declined.
 For a two-engine loop:
 
 - run one fresh Codex pass and one fresh Claude pass per round;
-- classify committed fixes as `material` or `minor`;
+- classify committed fixes as `material` or `minor` **by what the fix changes,
+  not by how severe the finding sounded**: a fix is `material` only when it
+  changes product code — the application or library source that ships. A fix
+  touching only tests, fixtures, comments, or docs is `minor` even when the
+  finding that produced it was severity-high, because the shipped behavior is
+  unchanged;
 - restart at Codex when either engine makes a material fix;
 - keep minor fixes, but do not restart solely because of them;
-- converge only after a complete Codex-then-Claude round reports no material
-  fixes and every local-review thread has a reply and is resolved;
+- converge after a complete Codex-then-Claude round in which neither engine
+  changed product code, and every local-review thread has a reply and is
+  resolved;
 - stop at the configured round cap, preserving the draft PR and reporting
   non-convergence.
+
+**When a pass changes no product code, stop and say so.** Do not open another
+round, and do not let the round cap imply the remaining rounds are owed. State
+that the pass was minor-only, that the other engine's attestation carries
+forward, and recommend this repository's ship step by name — whatever it uses to
+merge the PR. The reviewer that notices this is the one responsible for
+surfacing it; a caller watching rounds go by cannot see that the fixes stopped
+touching product code.
+
+The signal to watch for is a round whose findings are all about tests, fixtures,
+or comments. That means the product converged and the review has moved on to
+auditing its own artifacts. Those findings can be real and still not be reasons
+to keep reviewing: hardening assertions creates fresh assertions to mutate, so
+the supply never runs out and the next round is guaranteed to find more. Ship,
+and carry anything genuinely worth doing to a follow-up issue.
 
 The next reviewer must read this ledger before reviewing the new head. That is
 how prior rationale survives after local model context has been discarded.
