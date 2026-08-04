@@ -32,6 +32,110 @@ list for the pinned `<base-sha>..HEAD` range:
 Zero source files means skip; one or more means run the full pass. A mixed
 changeset is not a partial skip — the source files justify the spend.
 
+## Run the refactor pass once per engine
+
+A cleanup pass earns its cost on the first cold read of a changeset. By the
+second round the diff has already been simplified once, and a fresh pass over
+the same code mostly re-litigates naming and shape. That churn moves the head,
+re-stales the other engine's attestation, and changes nothing that ships.
+
+Each engine gets **one** refactor pass per PR. Before running one, search the PR
+for a marker naming this engine:
+
+```text
+<!-- local-review-refactor:v1 engine=<codex|claude> head=<sha> outcome=<committed|no-op> -->
+```
+
+If one exists, skip the cleanup lane, say so in the pass output, and go straight
+to the adversarial lane. If none exists, run the cleanup lane and post the
+marker as an informational PR comment when it finishes.
+
+Post the marker only for a pass that actually ran the cleanup lanes. A pass that
+exited on the docs/config-only classification has not spent its engine's refactor
+pass — leave the marker off so a later round whose changeset does contain source
+can still run one.
+
+The marker carries no `round`: it is a per-PR, per-engine latch rather than
+per-round evidence, and no automated runner parses it.
+
+## Resolve the round, then pick the stance
+
+Resolve this engine's round number before selecting lenses. Use
+`$AGENT_LOOP_REVIEW_ROUND` when the automated runner set it. Otherwise count the
+`local-review-pass:v1` and `local-review-complete:v1` markers already on the PR
+that name this engine; this pass is one past that count.
+
+- **Rounds 1–2 — adversarial.** The full stance: assume the diff is guilty, run
+  every lens whose signal is present, fix every valid finding.
+- **Round 3 and later — convergence.** Both engines have now read the change
+  cold twice. What remains is rarely a deeper defect; it is the review's own
+  surface. Shift the goal from challenging the change to landing it.
+
+A convergence round:
+
+- runs only the lenses that can find a reason not to deploy — correctness,
+  silent failure, and security when its signal is present. Drop type/API design,
+  comments/docs, test analysis, and tenant-coupling. Those found what they were
+  going to find in rounds 1–2, and they regenerate work indefinitely;
+- changes the PR only for a **blocking** defect: one that ships wrong behavior,
+  loses or corrupts data, opens a security or privacy hole, breaks a public
+  contract, or breaks deploy or rollout. Everything else becomes a follow-up
+  issue — reply `outcome=deferred` with the issue link and resolve the thread;
+- makes the smallest edit that clears the blocker. No refactors, no renames, no
+  new abstraction, no test or comment hardening;
+- ends the loop as soon as it finds no blocking defect. Post the clean-pass
+  attestation and recommend this repository's ship step by name.
+
+This is a disposition rule, not a reporting rule. Lenses still report everything
+they find with severity attached; never instruct a review agent to withhold a
+finding by severity or confidence. The narrowing happens one level up, where the
+whole set is visible and the orchestrator decides what the PR changes versus what
+a follow-up issue tracks.
+
+Convergence rounds do not extend the round cap — they are how rounds 3 and 4 are
+spent. Reaching the cap in convergence mode with open non-blocking findings means
+ship the PR and carry the issues, not open a fifth round.
+
+## Deliver the diff once
+
+Every lane that fans out to review agents must decide how the changeset reaches
+them. Left unspecified, the default improvisation is to write the whole diff to
+one file and hand that path to every agent, each of which reads all of it and
+then reads it again. The changeset is the largest single input to a review pass
+and the most duplicated one, so its delivery is part of the contract.
+
+Resolve the changed-file list once, from the pinned range, and reuse it:
+
+```bash
+git diff --name-only <base-sha>..HEAD
+git diff --stat <base-sha>..HEAD
+```
+
+Then apply these rules.
+
+1. **Scope each agent to the files it reviews.** Name the exact paths in the
+   agent's prompt. An agent that owns four files must not be handed the other
+   forty. A lens that genuinely spans the whole changeset — architectural
+   altitude, cross-file consistency — gets the `--stat` summary and pulls
+   individual files as it needs them.
+2. **Prefer a scoped command over a stored artifact.** A per-path
+   `git diff <base-sha>..HEAD -- <path>` is reproducible, needs no temp file,
+   and returns only what the agent asked for. Reach for it before writing a
+   diff to disk.
+3. **An artifact, if one exists, is pinned and read once.** State its path and
+   size in the prompt. Re-access a region with a targeted `grep -n` or a bounded
+   read, never a second full read: the file cannot have changed, so a repeat
+   read returns bytes the agent already has.
+4. **Bound any large read.** Above roughly 25k characters, read with an explicit
+   offset and limit, or narrow the range with `-- <path>`.
+
+State the changeset's size when briefing an agent, the same way agent prompts
+state an output ceiling. An agent told the diff spans 40 files reads
+differently from one handed an unlabeled path.
+
+These rules are about duplicated bytes, not about depth. Never drop a lens, skip
+a file an agent needs, or leave a finding unpursued to satisfy them.
+
 ## Rebuild context from GitHub
 
 At the start of every pass, read the PR description, changed files, current
@@ -107,9 +211,25 @@ machine-readable marker:
 
 An automated runner requires that attestation from every pass that committed
 nothing: a hook exiting successfully proves only that it ran, not that it read
-anything. Clean evidence becomes stale as soon as the PR head changes, so the
-marker's `head` must be the exact SHA reviewed, and a pass that fixed something
-attests through its thread replies instead.
+anything. The marker's `head` must be the exact SHA reviewed, and a pass that
+fixed something attests through its thread replies instead.
+
+Clean evidence goes stale when **product code** changes, not whenever the head
+moves. A later commit touching only tests, fixtures, comments, or docs leaves
+every production line the attesting engine read byte-identical, so that
+attestation still covers the new head: record it as carried forward, naming both
+the attested SHA and the current one.
+
+Do not treat every head move as invalidating. That reading is what produces an
+unbounded loop, and it is not a hypothetical — test and doc hardening is always
+available to find, so each engine's commits perpetually re-stale the other's
+attestation and no round can terminate. The loop then feels productive, because
+every round genuinely does surface findings; they are just findings about the
+review's own artifacts rather than about the product.
+
+Verify a carry-forward rather than assuming it. Diff the attested SHA against
+the current head restricted to product paths; if that diff is empty, the
+attestation holds and the round is done.
 
 A review hook that committed must also leave a final-lane completion marker
 after its last adversarial lane finishes:
@@ -125,13 +245,38 @@ cleanup commit from masking a final adversarial lane that silently declined.
 For a two-engine loop:
 
 - run one fresh Codex pass and one fresh Claude pass per round;
-- classify committed fixes as `material` or `minor`;
+- run the refactor pass only on each engine's first pass, per the once-per-engine
+  latch above;
+- run rounds 1–2 adversarially and rounds 3+ in convergence mode, per the stance
+  rules above;
+- classify committed fixes as `material` or `minor` **by what the fix changes,
+  not by how severe the finding sounded**: a fix is `material` only when it
+  changes product code — the application or library source that ships. A fix
+  touching only tests, fixtures, comments, or docs is `minor` even when the
+  finding that produced it was severity-high, because the shipped behavior is
+  unchanged;
 - restart at Codex when either engine makes a material fix;
 - keep minor fixes, but do not restart solely because of them;
-- converge only after a complete Codex-then-Claude round reports no material
-  fixes and every local-review thread has a reply and is resolved;
+- converge after a complete Codex-then-Claude round in which neither engine
+  changed product code, and every local-review thread has a reply and is
+  resolved;
 - stop at the configured round cap, preserving the draft PR and reporting
   non-convergence.
+
+**When a pass changes no product code, stop and say so.** Do not open another
+round, and do not let the round cap imply the remaining rounds are owed. State
+that the pass was minor-only, that the other engine's attestation carries
+forward, and recommend this repository's ship step by name — whatever it uses to
+merge the PR. The reviewer that notices this is the one responsible for
+surfacing it; a caller watching rounds go by cannot see that the fixes stopped
+touching product code.
+
+The signal to watch for is a round whose findings are all about tests, fixtures,
+or comments. That means the product converged and the review has moved on to
+auditing its own artifacts. Those findings can be real and still not be reasons
+to keep reviewing: hardening assertions creates fresh assertions to mutate, so
+the supply never runs out and the next round is guaranteed to find more. Ship,
+and carry anything genuinely worth doing to a follow-up issue.
 
 The next reviewer must read this ledger before reviewing the new head. That is
 how prior rationale survives after local model context has been discarded.

@@ -45,6 +45,7 @@ Codex runs **read-only by default** — it can read the tree and reason, but can
      ```
 
    - If the changeset is docs/config-only per the ledger's changeset classification, post a scoped clean-pass attestation and exit.
+   - Resolve the Codex engine's round number per the ledger: `$AGENT_LOOP_REVIEW_ROUND` when the runner set it, otherwise one past the count of `local-review-pass:v1` and `local-review-complete:v1` markers on the PR naming `engine=codex`. Rounds 1–2 are adversarial; round 3 and later are convergence rounds, and the prompt and dispositions change accordingly.
 
 ## Phase 1: Build the review prompt
 
@@ -57,6 +58,24 @@ Write a tight, scoped prompt. A vague "review this" wastes the run; name the fil
 - The tracked diff to read (`git diff <MB>`) plus the untracked paths from `git ls-files --others --exclude-standard`, and an instruction to **read the actual source, not just the diff**.
 - The 3–4 riskiest things about this specific change, phrased as **where to scrutinize hardest** — not as an attack. See the framing rules below.
 - The output contract: **only high-confidence material findings** (correctness, security, data-loss); for each, `file:line`, severity, concrete issue, concrete fix; "no material findings" if clean; be terse.
+
+### Convergence rounds (round 3 and later)
+
+Codex has already read this change cold twice. Narrow the prompt's scrutiny list
+to what could stop the deploy — correctness, data safety, security and privacy,
+broken public contracts, rollout breakage — and drop the design, docs, and test
+angles from it. Say plainly that the change is converging and the question is
+whether anything blocks shipping, not whether it could be better.
+
+Keep the terse-but-complete output contract as written. The narrowing belongs in
+what Codex is pointed at and in how you disposition what comes back, not in an
+instruction to withhold findings it already made.
+
+### Optional repo context
+
+Repo-specific knowledge — how to run the suite and the traps in doing so, which invariants are structural, which questions are already settled — lives outside this skill so the skill stays generic and portable. Before writing the prompt, check for a context file at `.claude/codex-review.local.md` in the current repo (or one the user names) and read it. If absent, build the prompt from this skill alone.
+
+That file is also where a **reusable prompt scaffold** belongs, and the reason is worth stating: a prompt written ad hoc into a scratch directory gets opened as the template for the next round, and the round after that. Lines that were true when first written — a permission sentence, a suite's pass count, a "do not re-raise" list, a defect-class tally — ride along unexamined into runs where they are false. Keep the scaffold in the repo where it can be corrected once, and keep the parts that change every round (head SHA, the delta, the ledger summary) out of it.
 
 ### Framing: write it as internal QA, not as an attack
 
@@ -128,6 +147,19 @@ If `$ARGUMENTS` contains `verify`, the user wants Codex to also **run the tests/
 
 `workspace-write` lets Codex write within the repo (run tests, build) but it cannot escape the working directory or reach arbitrary network. **Never use `--dangerously-bypass-approvals-and-sandbox` (`--yolo`, = `danger-full-access` + no approvals) for a review** — it removes the sandbox entirely (full write + network + command execution), defeating the point of a read-only reviewer. Reserve yolo for a deliberate _fix_ workflow, never this skill.
 
+**The prompt's permission sentence must move with the sandbox flag.** The sandbox is what Codex _can_ do; the prompt is what it believes it _may_ do, and the two are set in different places. A prompt reused from an earlier read-only run still says "READ-ONLY. Do not edit, write, commit, or push" — under `workspace-write` that silently cancels the reason you opened the sandbox, and Codex declines the tests or mutation checks you just paid for. Nothing errors; the pass simply comes back thinner than it should, and the omission is invisible unless you demanded evidence the check ran.
+
+Say exactly one of these, and pick it from the flag you actually passed:
+
+| Sandbox           | Permission sentence in the prompt                                                                                                                           |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read-only`       | Read-only. Do not edit, write, commit, or push. Report findings only.                                                                                       |
+| `workspace-write` | You may run tests and make temporary local edits to verify a finding. Restore every file before finishing, and leave the tree clean. Do not commit or push. |
+
+Two things make the `workspace-write` wording load-bearing. Ask for the **restore** explicitly — a reviewer that mutates a file to prove an assertion is unpinned has no other reason to put it back, and you inherit a dirty tree you then have to untangle from your own edits. And ask for the **evidence** in the output contract — "state which checks you ran and what happened" — because a silent decline and a genuine clean pass produce the same terse "no material findings".
+
+Start the run from a clean tree so anything dirty afterwards is unambiguously the reviewer's, and check `git status` before acting on the findings.
+
 ## Phase 3: Relay, verify, and record findings
 
 When the status file appears with exit code zero, read the findings file — it holds just Codex's final message, no need to dig through the stream. Treat the findings as a **second opinion, not a verdict**:
@@ -142,10 +174,23 @@ When the status file appears with exit code zero, read the findings file — it 
 - If Codex reports no new confirmed finding and makes no commit, post a
   clean-pass PR review attestation with `engine=codex` and the exact reviewed
   head. A fix pass attests through its thread replies instead.
+- Your attestation stays valid while the head moves for **tests, fixtures,
+  comments, or docs only** — those leave every production line you reviewed
+  byte-identical. It is invalidated only by a change to product code. When
+  reviewing a head that moved since your last attestation, diff the two over
+  product paths first: if that diff is empty, carry the attestation forward and
+  say so rather than re-reviewing unchanged product code as if it were new.
+- If this pass changes no product code, stop the loop and recommend this repo's
+  ship step, whatever it uses to merge the PR. A round that finds only test and
+  comment work means the product converged and the review is auditing its own
+  artifacts — a self-renewing surface, so the next round will find more and
+  still not improve what ships.
 
 ## Phase 4: Disposition
 
 Fix only **confirmed** findings (default: fix now, in this PR). Dismiss false positives by replying with evidence and resolving the thread.
+
+In a convergence round the default inverts: fix only a blocking defect — wrong shipped behavior, data loss or corruption, a security or privacy hole, a broken public contract, or broken deploy/rollout — with the smallest edit that clears it. Every other confirmed finding gets an issue, an `outcome=deferred` reply with the link, and a resolved thread. Those deferrals are usually real findings; fixing them here just moves the head and buys another round.
 
 For a finding that needs a human/scope/legal decision (risk acceptance, prod-data assumptions, an architectural rework), do not guess at the decision — but do disposition the thread, because convergence requires every marked thread to carry a reply and a resolution. File the tracking issue, reply with `outcome=deferred` plus the issue link, resolve the thread, and surface the decision to the user in the skill output. Leave the thread unresolved only when you cannot even file the issue; that is a non-converging run, so say so plainly and leave the PR in draft.
 
@@ -162,6 +207,7 @@ End with:
 ```
 ✅ /codex-review complete (mode: <read-only | verify>).
 - Scope: PR #N vs <base> at <reviewed-head>
+- Round: <n> (<adversarial | convergence>)
 - Codex findings: <total> (<confirmed>/<disputed>/<needs-human-decision>)
 - Fixed: <count>  ·  Dismissed: <count>  ·  Flagged for you: <count>
 - Threads: <posted>/<replied>/<resolved>
