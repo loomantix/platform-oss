@@ -1,7 +1,8 @@
+import { assertVersion, isValidVersion } from './version';
+
 const DEFAULT_MANIFEST_URL = '/version.json';
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60_000;
 const MAX_TIMER_INTERVAL_MS = 2_147_483_647;
-const MAX_VERSION_LENGTH = 256;
 
 interface VersionManifest {
   readonly version: string;
@@ -231,10 +232,7 @@ function buildSnapshot(
 ): VersionUpdateSnapshot {
   const updateAvailable =
     latestVersion !== null && latestVersion !== currentVersion;
-  const dismissed =
-    updateAvailable &&
-    dismissedVersion !== null &&
-    dismissedVersion === latestVersion;
+  const dismissed = updateAvailable && dismissedVersion === latestVersion;
   return Object.freeze({
     currentVersion,
     latestVersion,
@@ -270,21 +268,4 @@ function isVersionManifest(value: unknown): value is VersionManifest {
   if (typeof value !== 'object' || value === null) return false;
   const version = Reflect.get(value, 'version');
   return isValidVersion(version);
-}
-
-function assertVersion(value: unknown, name: string): asserts value is string {
-  if (!isValidVersion(value)) {
-    throw new TypeError(
-      `${name} must be a non-empty string no longer than ${MAX_VERSION_LENGTH} characters`,
-    );
-  }
-}
-
-function isValidVersion(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= MAX_VERSION_LENGTH &&
-    value.trim() === value
-  );
 }

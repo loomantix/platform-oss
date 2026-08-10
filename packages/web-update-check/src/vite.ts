@@ -1,6 +1,6 @@
 import type { Plugin } from 'vite';
 
-const MAX_VERSION_LENGTH = 256;
+import { assertVersion } from './version';
 
 /** Options for the Vite build-version manifest plugin. */
 export interface WebUpdateManifestPluginOptions {
@@ -19,7 +19,7 @@ export interface WebUpdateManifestPluginOptions {
 export function webUpdateManifestPlugin(
   options: WebUpdateManifestPluginOptions,
 ): Plugin {
-  assertVersion(options.version);
+  assertVersion(options.version, 'version');
   const version = options.version;
   const builtAt = options.builtAt;
   const fileName = options.fileName ?? 'version.json';
@@ -42,18 +42,6 @@ export function webUpdateManifestPlugin(
       });
     },
   };
-}
-
-function assertVersion(value: string): void {
-  if (
-    value.length === 0 ||
-    value.length > MAX_VERSION_LENGTH ||
-    value.trim() !== value
-  ) {
-    throw new TypeError(
-      `version must be a non-empty string no longer than ${MAX_VERSION_LENGTH} characters`,
-    );
-  }
 }
 
 function assertFileName(value: string): void {

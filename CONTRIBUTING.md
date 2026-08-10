@@ -7,7 +7,7 @@ Thank you for considering a contribution. `loomantix/platform-oss` is the public
 - [`@loomantix/logging`](./packages/logging) — pino + OpenTelemetry NestJS logging with PHI-safe redaction.
 - [`@loomantix/web-update-check`](./packages/web-update-check) — framework-neutral browser update detection with a Vite build-manifest plugin.
 
-The bar on contract clarity, security review, and contributor friction is deliberately high — these packages handle credentials, encryption keys, and PHI. Read this whole file before opening a PR.
+The bar on contract clarity, security review, and contributor friction is deliberately high — several of these packages handle credentials, encryption keys, and PHI. Read this whole file before opening a PR.
 
 ## License
 
