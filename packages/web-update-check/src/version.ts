@@ -1,9 +1,7 @@
 /** Shared version-string invariant for the monitor and the Vite plugin. */
 export const MAX_VERSION_LENGTH = 256;
 
-/**
- *
- */
+/** Whether a value is an acceptable opaque version identifier. */
 export function isValidVersion(value: unknown): value is string {
   return (
     typeof value === 'string' &&
@@ -13,9 +11,7 @@ export function isValidVersion(value: unknown): value is string {
   );
 }
 
-/**
- *
- */
+/** Throw a `TypeError` naming `name` when the value is not a valid version. */
 export function assertVersion(
   value: unknown,
   name: string,
