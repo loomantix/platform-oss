@@ -209,6 +209,86 @@ describe('createVersionUpdateMonitor', () => {
     expect(Object.isFrozen(changed)).toBe(true);
   });
 
+  it('isolates subscriber failures and reports them', async () => {
+    const listenerError = new Error('subscriber failed');
+    const onError = vi.fn();
+    const laterListener = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(jsonResponse({ version: 'deployed-v2' })),
+      onError,
+    });
+    monitor.subscribe(() => {
+      throw listenerError;
+    });
+    monitor.subscribe(laterListener);
+
+    await monitor.checkNow();
+
+    expect(laterListener).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith({
+      type: 'listener',
+      cause: listenerError,
+    });
+  });
+
+  it.each([
+    [
+      'response',
+      new Response(null, { status: 503 }),
+      { type: 'response', status: 503 },
+    ],
+    ['manifest', jsonResponse({ service: 'frontend' }), { type: 'manifest' }],
+  ])('reports a failed %s check', async (_name, response, expectedError) => {
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(response),
+      onError,
+    });
+
+    await monitor.checkNow();
+
+    expect(onError).toHaveBeenCalledWith(expectedError);
+  });
+
+  it('reports request failures without reporting intentional aborts', async () => {
+    const requestError = new TypeError('offline');
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: vi.fn<typeof fetch>().mockRejectedValue(requestError),
+      onError,
+    });
+
+    await monitor.checkNow();
+
+    expect(onError).toHaveBeenCalledWith({
+      type: 'request',
+      cause: requestError,
+    });
+  });
+
+  it('snapshots the running version at construction', async () => {
+    const options = {
+      currentVersion: 'running-v1',
+      fetch: vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(jsonResponse({ version: 'running-v2' })),
+    };
+    const monitor = createVersionUpdateMonitor(options);
+    options.currentVersion = 'running-v2';
+
+    await monitor.checkNow();
+
+    expect(monitor.getSnapshot()).toMatchObject({
+      currentVersion: 'running-v1',
+      updateAvailable: true,
+    });
+  });
+
   it('validates configuration at the boundary', () => {
     expect(() =>
       createVersionUpdateMonitor({ currentVersion: '', fetch }),
@@ -224,6 +304,20 @@ describe('createVersionUpdateMonitor', () => {
       createVersionUpdateMonitor({
         currentVersion: 'v1',
         pollIntervalMs: 0,
+        fetch,
+      }),
+    ).toThrow(/pollIntervalMs/);
+    expect(() =>
+      createVersionUpdateMonitor({
+        currentVersion: 'v1',
+        pollIntervalMs: 1.5,
+        fetch,
+      }),
+    ).toThrow(/pollIntervalMs/);
+    expect(() =>
+      createVersionUpdateMonitor({
+        currentVersion: 'v1',
+        pollIntervalMs: 2_147_483_648,
         fetch,
       }),
     ).toThrow(/pollIntervalMs/);

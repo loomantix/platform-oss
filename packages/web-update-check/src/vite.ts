@@ -20,24 +20,21 @@ export function webUpdateManifestPlugin(
   options: WebUpdateManifestPluginOptions,
 ): Plugin {
   assertVersion(options.version);
+  const version = options.version;
+  const builtAt = options.builtAt;
   const fileName = options.fileName ?? 'version.json';
   assertFileName(fileName);
 
   return {
     name: 'loomantix-web-update-manifest',
-    apply: 'build',
     config() {
       return {
-        define: {
-          'import.meta.env.VITE_APP_VERSION': JSON.stringify(options.version),
-        },
+        define: { 'import.meta.env.VITE_APP_VERSION': JSON.stringify(version) },
       };
     },
     generateBundle() {
       const manifest =
-        options.builtAt === undefined
-          ? { version: options.version }
-          : { version: options.version, builtAt: options.builtAt };
+        builtAt === undefined ? { version } : { version, builtAt };
       this.emitFile({
         type: 'asset',
         fileName,
@@ -64,7 +61,7 @@ function assertFileName(value: string): void {
     value.length === 0 ||
     value.startsWith('/') ||
     value.includes('\\') ||
-    value.split('/').includes('..')
+    value.split('/').some((segment) => segment === '.' || segment === '..')
   ) {
     throw new TypeError(
       'fileName must be a safe path relative to the build directory',

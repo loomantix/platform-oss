@@ -1,5 +1,6 @@
 const DEFAULT_MANIFEST_URL = '/version.json';
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60_000;
+const MAX_TIMER_INTERVAL_MS = 2_147_483_647;
 const MAX_VERSION_LENGTH = 256;
 
 interface VersionManifest {
@@ -28,6 +29,8 @@ export interface VersionUpdateMonitorOptions {
   readonly manifestUrl?: string;
   /** Steady-state polling interval. Defaults to five minutes. */
   readonly pollIntervalMs?: number;
+  /** Receives failed checks and subscriber errors without changing state. */
+  readonly onError?: (error: VersionUpdateMonitorError) => void;
   /** Fetch implementation, primarily for non-browser runtimes and tests. */
   readonly fetch?: typeof globalThis.fetch;
   /** Document lifecycle source. Defaults to the global document when present. */
@@ -35,6 +38,13 @@ export interface VersionUpdateMonitorOptions {
   /** Window lifecycle source. Defaults to the global window when present. */
   readonly window?: Window | null;
 }
+
+/** A recoverable monitor failure reported through the optional error callback. */
+export type VersionUpdateMonitorError =
+  | { readonly type: 'request'; readonly cause: unknown }
+  | { readonly type: 'response'; readonly status: number }
+  | { readonly type: 'manifest' }
+  | { readonly type: 'listener'; readonly cause: unknown };
 
 /** Framework-neutral monitor for detecting a deployed frontend update. */
 export interface VersionUpdateMonitor {
@@ -60,13 +70,20 @@ export function createVersionUpdateMonitor(
   options: VersionUpdateMonitorOptions,
 ): VersionUpdateMonitor {
   assertVersion(options.currentVersion, 'currentVersion');
+  const currentVersion = options.currentVersion;
   const manifestUrl = options.manifestUrl ?? DEFAULT_MANIFEST_URL;
   if (manifestUrl.length === 0) {
     throw new TypeError('manifestUrl must not be empty');
   }
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
-    throw new TypeError('pollIntervalMs must be a positive finite number');
+  if (
+    !Number.isInteger(pollIntervalMs) ||
+    pollIntervalMs <= 0 ||
+    pollIntervalMs > MAX_TIMER_INTERVAL_MS
+  ) {
+    throw new TypeError(
+      `pollIntervalMs must be a positive integer no greater than ${MAX_TIMER_INTERVAL_MS}`,
+    );
   }
 
   const fetchImpl = options.fetch ?? globalThis.fetch;
@@ -88,25 +105,32 @@ export function createVersionUpdateMonitor(
 
   let latestVersion: string | null = null;
   let dismissedVersion: string | null = null;
-  let snapshot = buildSnapshot(
-    options.currentVersion,
-    latestVersion,
-    dismissedVersion,
-  );
+  let snapshot = buildSnapshot(currentVersion, latestVersion, dismissedVersion);
   const listeners = new Set<() => void>();
   const leases = new Set<symbol>();
   let intervalId: ReturnType<typeof setInterval> | null = null;
   let inFlightController: AbortController | null = null;
+  const onError = options.onError;
+
+  const reportError = (error: VersionUpdateMonitorError): void => {
+    try {
+      onError?.(error);
+    } catch {
+      // Error reporting must not break polling or other subscribers.
+    }
+  };
 
   const publish = (): void => {
-    const next = buildSnapshot(
-      options.currentVersion,
-      latestVersion,
-      dismissedVersion,
-    );
+    const next = buildSnapshot(currentVersion, latestVersion, dismissedVersion);
     if (snapshotsEqual(snapshot, next)) return;
     snapshot = next;
-    for (const listener of listeners) listener();
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch (cause) {
+        reportError({ type: 'listener', cause });
+      }
+    }
   };
 
   const checkNow = async (): Promise<void> => {
@@ -119,15 +143,26 @@ export function createVersionUpdateMonitor(
         cache: 'no-store',
         signal: controller.signal,
       });
-      if (controller.signal.aborted || !response.ok) return;
+      if (controller.signal.aborted) return;
+      if (!response.ok) {
+        reportError({ type: 'response', status: response.status });
+        return;
+      }
       const manifest: unknown = await response.json();
-      if (controller.signal.aborted || !isVersionManifest(manifest)) return;
+      if (controller.signal.aborted) return;
+      if (!isVersionManifest(manifest)) {
+        reportError({ type: 'manifest' });
+        return;
+      }
       latestVersion = manifest.version;
       publish();
-    } catch {
+    } catch (cause) {
       // Deploys and tab resumes routinely race network availability. A failed
       // check preserves the last trustworthy state and retries on the next
       // lifecycle event or interval.
+      if (!controller.signal.aborted) {
+        reportError({ type: 'request', cause });
+      }
     } finally {
       if (inFlightController === controller) inFlightController = null;
     }

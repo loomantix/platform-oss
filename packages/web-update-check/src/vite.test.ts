@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { build } from 'vite';
+import { build, resolveConfig } from 'vite';
 import { webUpdateManifestPlugin } from './vite';
 
 const temporaryDirectories: string[] = [];
@@ -81,6 +81,53 @@ describe('webUpdateManifestPlugin', () => {
     );
   });
 
+  it('defines the running version during development', async () => {
+    const config = await resolveConfig(
+      {
+        configFile: false,
+        logLevel: 'silent',
+        plugins: [webUpdateManifestPlugin({ version: 'artifact-v1' })],
+      },
+      'serve',
+    );
+
+    expect(config.define?.['import.meta.env.VITE_APP_VERSION']).toBe(
+      JSON.stringify('artifact-v1'),
+    );
+  });
+
+  it('snapshots manifest values at plugin construction', async () => {
+    const options = {
+      version: 'artifact-v1',
+      builtAt: '2026-08-10T00:00:00.000Z',
+    };
+    const plugin = webUpdateManifestPlugin(options);
+    options.version = 'artifact-v2';
+    options.builtAt = '2026-08-11T00:00:00.000Z';
+    const emitted: unknown[] = [];
+    const generateBundle = plugin.generateBundle;
+    expect(typeof generateBundle).toBe('function');
+    if (typeof generateBundle !== 'function') return;
+
+    await generateBundle.call(
+      {
+        emitFile: (asset: unknown) => (emitted.push(asset), 'asset-id'),
+      } as never,
+      {} as never,
+      {} as never,
+      false,
+    );
+
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        source: JSON.stringify({
+          version: 'artifact-v1',
+          builtAt: '2026-08-10T00:00:00.000Z',
+        }),
+      }),
+    );
+  });
+
   it('rejects invalid versions and unsafe output paths', () => {
     expect(() => webUpdateManifestPlugin({ version: '' })).toThrow(/version/);
     expect(() =>
@@ -88,6 +135,9 @@ describe('webUpdateManifestPlugin', () => {
     ).toThrow(/fileName/);
     expect(() =>
       webUpdateManifestPlugin({ version: 'v1', fileName: '/version.json' }),
+    ).toThrow(/fileName/);
+    expect(() =>
+      webUpdateManifestPlugin({ version: 'v1', fileName: './version.json' }),
     ).toThrow(/fileName/);
   });
 });

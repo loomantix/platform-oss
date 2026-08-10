@@ -27,6 +27,9 @@ Supply a non-empty identifier unique to the exact frontend artifact. A package
 version or backend version is insufficient when frontend-only rebuilds and
 deployments are possible.
 
+The optional `/vite` entry point supports Vite 7. The runtime monitor itself
+has no Vite dependency.
+
 ```typescript
 import { defineConfig } from 'vite';
 import { webUpdateManifestPlugin } from '@loomantix/web-update-check/vite';
