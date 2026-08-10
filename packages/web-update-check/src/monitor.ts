@@ -1,13 +1,9 @@
-import { assertVersion, isValidVersion } from './version';
+import { assertVersion, isValidVersion, type VersionManifest } from './version';
 
 const DEFAULT_MANIFEST_URL = '/version.json';
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_TIMER_INTERVAL_MS = 2_147_483_647;
-
-interface VersionManifest {
-  readonly version: string;
-}
 
 /** Immutable state exposed by a version update monitor. */
 export interface VersionUpdateSnapshot {
@@ -50,7 +46,8 @@ export type VersionUpdateMonitorError =
   | { readonly type: 'response'; readonly status: number }
   | { readonly type: 'parse'; readonly cause: unknown }
   | { readonly type: 'manifest' }
-  | { readonly type: 'listener'; readonly cause: unknown };
+  | { readonly type: 'listener'; readonly cause: unknown }
+  | { readonly type: 'internal'; readonly cause: unknown };
 
 /** Framework-neutral monitor for detecting a deployed frontend update. */
 export interface VersionUpdateMonitor {
@@ -133,8 +130,12 @@ export function createVersionUpdateMonitor(
   const reportError = (error: VersionUpdateMonitorError): void => {
     try {
       onError?.(error);
-    } catch {
-      // Error reporting must not break polling or other subscribers.
+    } catch (cause) {
+      // Error reporting must not break polling or other subscribers. It must
+      // also not disappear: onError is the only channel telling a consumer that
+      // update detection is broken, so a handler that throws would otherwise
+      // silence every arm permanently and look exactly like a healthy monitor.
+      console.error('[web-update-check] onError threw', cause);
     }
   };
 
@@ -228,9 +229,17 @@ export function createVersionUpdateMonitor(
     // every interval tick or visibility change would starve a manifest slower
     // than the poll interval, and the aborted path reports nothing.
     if (pendingCheck !== null) return pendingCheck;
-    const pending = runCheck().finally(() => {
-      if (pendingCheck === pending) pendingCheck = null;
-    });
+    // A fault outside the fetch and parse guards — an injected fetch that does
+    // not resolve to a Response is the reachable case — would otherwise reject
+    // a promise every internal caller discards with `void`, surfacing as an
+    // unhandledrejection in the host app instead of a typed error.
+    const pending = runCheck()
+      .catch((cause: unknown) => {
+        reportError({ type: 'internal', cause });
+      })
+      .finally(() => {
+        if (pendingCheck === pending) pendingCheck = null;
+      });
     pendingCheck = pending;
     return pending;
   };

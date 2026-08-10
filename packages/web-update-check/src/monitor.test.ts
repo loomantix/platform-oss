@@ -320,7 +320,92 @@ describe('createVersionUpdateMonitor', () => {
       expect(monitor.getSnapshot().latestVersion).toBe('deployed-v4'),
     );
     expect(fetchMock).toHaveBeenCalledTimes(3);
+
     release();
+    setVisibilityState('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    const afterRelease = new Event('pageshow');
+    Object.defineProperty(afterRelease, 'persisted', { value: true });
+    window.dispatchEvent(afterRelease);
+    await Promise.resolve();
+
+    // The released monitor must detach its listeners, not merely stop its
+    // timer: an unmounted component that still fetches on every tab focus
+    // leaks for the life of the page.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('reports an internal fault instead of rejecting the shared check', async () => {
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      // An injected fetch that does not resolve to a Response: reading
+      // `.ok` throws outside the fetch and parse guards.
+      fetch: vi.fn(async () => undefined) as unknown as typeof fetch,
+      onError,
+    });
+
+    await expect(monitor.checkNow()).resolves.toBeUndefined();
+
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'internal' }),
+    );
+    expect(monitor.getSnapshot().latestVersion).toBeNull();
+
+    // The dedupe slot is released, so the monitor keeps checking.
+    await monitor.checkNow();
+    expect(onError).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps polling and surfaces the loss when onError itself throws', async () => {
+    const consoleError = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response('nope', { status: 500 }));
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: fetchMock,
+      onError: () => {
+        throw new Error('reporter is down');
+      },
+    });
+
+    await monitor.checkNow();
+    await monitor.checkNow();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consoleError).toHaveBeenCalledWith(
+      '[web-update-check] onError threw',
+      expect.any(Error),
+    );
+  });
+
+  it('notifies the listeners registered at publish time despite re-entrancy', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ version: 'deployed-v2' }));
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: fetchMock,
+    });
+
+    const lateListener = vi.fn();
+    const second = vi.fn();
+    const first = vi.fn(() => {
+      // Mutating the set mid-publish must not change what this pass delivers.
+      unsubscribeFirst();
+      monitor.subscribe(lateListener);
+    });
+    const unsubscribeFirst = monitor.subscribe(first);
+    monitor.subscribe(second);
+
+    await monitor.checkNow();
+
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(lateListener).not.toHaveBeenCalled();
   });
 
   it('ignores hidden-tab and non-bfcache lifecycle events', async () => {

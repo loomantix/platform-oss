@@ -1,6 +1,6 @@
 import type { Plugin } from 'vite';
 
-import { assertVersion } from './version';
+import { assertVersion, type VersionManifest } from './version';
 
 /** Options for the Vite build-version manifest plugin. */
 export interface WebUpdateManifestPluginOptions {
@@ -25,7 +25,8 @@ export function webUpdateManifestPlugin(
   const fileName = options.fileName ?? 'version.json';
   assertFileName(fileName);
 
-  const manifest = builtAt === undefined ? { version } : { version, builtAt };
+  const manifest: VersionManifest =
+    builtAt === undefined ? { version } : { version, builtAt };
   const source = JSON.stringify(manifest);
 
   return {

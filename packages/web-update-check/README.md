@@ -80,11 +80,18 @@ Checks time out after 30 seconds by default; customize the deadline with
 
 ## Error and data contract
 
-`onError` receives `request`, `timeout`, `response`, `parse`, `manifest`, and
-`listener` failures. Treat its payload as untrusted: `cause` on a `listener`
-error is whatever a subscriber threw and may contain application text, so
-sanitize it before it reaches logging or an error tracker. `latestVersion`
-comes from the deployed manifest — render it as text, never as HTML.
+`onError` receives `request`, `timeout`, `response`, `parse`, `manifest`,
+`listener`, and `internal` failures. Treat its payload as untrusted: `cause` on
+a `listener` error is whatever a subscriber threw and may contain application
+text, so sanitize it before it reaches logging or an error tracker.
+`latestVersion` comes from the deployed manifest — render it as text, never as
+HTML. A handler that throws is swallowed so polling survives, but the throw is
+reported to `console.error` so the loss of the reporting channel stays visible.
+
+`VersionManifest` describes the deployed manifest's wire format, and
+`isValidVersion` / `MAX_VERSION_LENGTH` expose the version invariant, so a build
+that does not use the Vite plugin can produce a conforming file and a caller can
+validate an identifier before construction rather than catching a `TypeError`.
 
 In development the Vite plugin serves the manifest from the dev server, so a
 monitor pointed at the same path works under `vite dev` as well as a build.

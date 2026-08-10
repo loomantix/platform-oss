@@ -17,6 +17,12 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    # A tag-triggered run executes the workflow definition from the tagged ref,
+    # so every check below can be deleted by the same commit that pushes the
+    # tag. The environment's protection rules live in repository settings,
+    # outside the ref's reach, and are what actually gates the publish; scope
+    # the npm Trusted Publisher to this environment so the gate is unavoidable.
+    environment: npm-publish
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -35,7 +41,12 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           scope: '@loomantix'
 
-      - run: pnpm install --frozen-lockfile
+      # --ignore-scripts is explicit, not incidental: this job holds
+      # id-token: write, so a dependency lifecycle script here could mint an npm
+      # token or rewrite dist/ before the publish step. pnpm 10 blocks unlisted
+      # build scripts by default, but that default is one allowlist entry away
+      # from being reversed.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Verify tag matches package.json version
         working-directory: packages/web-update-check

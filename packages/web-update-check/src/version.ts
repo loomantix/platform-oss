@@ -1,6 +1,18 @@
 /** Shared version-string invariant for the monitor and the Vite plugin. */
 export const MAX_VERSION_LENGTH = 256;
 
+/**
+ * Wire format of the deployed manifest the monitor polls. Exported so a build
+ * that does not use the Vite plugin — webpack, a CI script, a server route —
+ * has a typed contract for the file it must serve.
+ */
+export interface VersionManifest {
+  /** Opaque identifier of the deployed artifact. */
+  readonly version: string;
+  /** Optional build timestamp. Ignored by the monitor. */
+  readonly builtAt?: string;
+}
+
 /** Whether a value is an acceptable opaque version identifier. */
 export function isValidVersion(value: unknown): value is string {
   return (
