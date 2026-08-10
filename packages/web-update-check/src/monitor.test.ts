@@ -208,6 +208,60 @@ describe('createVersionUpdateMonitor', () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
+  it('starts a fresh opening check after an immediate stop and restart', async () => {
+    const pending: Array<{
+      readonly signal: AbortSignal | null;
+      readonly resolve: (response: Response) => void;
+    }> = [];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+      (_input, init) =>
+        new Promise<Response>((resolve) => {
+          pending.push({ signal: init?.signal ?? null, resolve });
+        }),
+    );
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: fetchMock,
+    });
+
+    const release = monitor.start();
+    release();
+    monitor.start();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(pending[0]?.signal?.aborted).toBe(true);
+    pending[0]?.resolve(jsonResponse({ version: 'stale-v0' }));
+    pending[1]?.resolve(jsonResponse({ version: 'deployed-v2' }));
+    await vi.waitFor(() =>
+      expect(monitor.getSnapshot().latestVersion).toBe('deployed-v2'),
+    );
+    monitor.stop();
+  });
+
+  it('times out a hung request and releases the dedupe slot', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementationOnce(() => new Promise<Response>(() => undefined))
+      .mockResolvedValueOnce(jsonResponse({ version: 'deployed-v2' }));
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: fetchMock,
+      requestTimeoutMs: 1_000,
+      onError,
+    });
+
+    const first = monitor.checkNow();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await first;
+    await monitor.checkNow();
+
+    expect(onError).toHaveBeenCalledWith({ type: 'timeout' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(monitor.getSnapshot().latestVersion).toBe('deployed-v2');
+  });
+
   it('notifies again when a dismissed version is rolled back and redeployed', async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
@@ -497,6 +551,13 @@ describe('createVersionUpdateMonitor', () => {
         fetch,
       }),
     ).toThrow(/pollIntervalMs/);
+    expect(() =>
+      createVersionUpdateMonitor({
+        currentVersion: 'v1',
+        requestTimeoutMs: 0,
+        fetch,
+      }),
+    ).toThrow(/requestTimeoutMs/);
     expect(() =>
       createVersionUpdateMonitor({
         currentVersion: 'v1',

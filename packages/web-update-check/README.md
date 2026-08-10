@@ -75,14 +75,16 @@ release();
 last caller releases its lease. `checkNow()` can be used independently for an
 explicit check; concurrent calls share the in-flight request, and it resolves
 whether or not the check succeeded — `onError` is the only failure signal.
+Checks time out after 30 seconds by default; customize the deadline with
+`requestTimeoutMs`.
 
 ## Error and data contract
 
-`onError` receives `request`, `response`, `parse`, `manifest`, and `listener`
-failures. Treat its payload as untrusted: `cause` on a `listener` error is
-whatever a subscriber threw and may contain application text, so sanitize it
-before it reaches logging or an error tracker. `latestVersion` comes from the
-deployed manifest — render it as text, never as HTML.
+`onError` receives `request`, `timeout`, `response`, `parse`, `manifest`, and
+`listener` failures. Treat its payload as untrusted: `cause` on a `listener`
+error is whatever a subscriber threw and may contain application text, so
+sanitize it before it reaches logging or an error tracker. `latestVersion`
+comes from the deployed manifest — render it as text, never as HTML.
 
 In development the Vite plugin serves the manifest from the dev server, so a
 monitor pointed at the same path works under `vite dev` as well as a build.

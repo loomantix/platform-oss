@@ -2,6 +2,7 @@ import { assertVersion, isValidVersion } from './version';
 
 const DEFAULT_MANIFEST_URL = '/version.json';
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_TIMER_INTERVAL_MS = 2_147_483_647;
 
 interface VersionManifest {
@@ -30,6 +31,8 @@ export interface VersionUpdateMonitorOptions {
   readonly manifestUrl?: string;
   /** Steady-state polling interval. Defaults to five minutes. */
   readonly pollIntervalMs?: number;
+  /** Per-check deadline. Defaults to 30 seconds. */
+  readonly requestTimeoutMs?: number;
   /** Receives failed checks and subscriber errors without changing state. */
   readonly onError?: (error: VersionUpdateMonitorError) => void;
   /** Fetch implementation, primarily for non-browser runtimes and tests. */
@@ -43,6 +46,7 @@ export interface VersionUpdateMonitorOptions {
 /** A recoverable monitor failure reported through the optional error callback. */
 export type VersionUpdateMonitorError =
   | { readonly type: 'request'; readonly cause: unknown }
+  | { readonly type: 'timeout' }
   | { readonly type: 'response'; readonly status: number }
   | { readonly type: 'parse'; readonly cause: unknown }
   | { readonly type: 'manifest' }
@@ -85,6 +89,17 @@ export function createVersionUpdateMonitor(
   ) {
     throw new TypeError(
       `pollIntervalMs must be a positive integer no greater than ${MAX_TIMER_INTERVAL_MS}`,
+    );
+  }
+  const requestTimeoutMs =
+    options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  if (
+    !Number.isInteger(requestTimeoutMs) ||
+    requestTimeoutMs <= 0 ||
+    requestTimeoutMs > MAX_TIMER_INTERVAL_MS
+  ) {
+    throw new TypeError(
+      `requestTimeoutMs must be a positive integer no greater than ${MAX_TIMER_INTERVAL_MS}`,
     );
   }
 
@@ -181,8 +196,18 @@ export function createVersionUpdateMonitor(
   const runCheck = async (): Promise<void> => {
     const controller = new AbortController();
     inFlightController = controller;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<null>((resolve) => {
+      timeoutId = setTimeout(() => {
+        if (!controller.signal.aborted) {
+          controller.abort();
+          reportError({ type: 'timeout' });
+        }
+        resolve(null);
+      }, requestTimeoutMs);
+    });
     try {
-      const observed = await readManifest(controller);
+      const observed = await Promise.race([readManifest(controller), timeout]);
       if (observed === null) return;
       latestVersion = observed;
       // A version the user dismissed is only dismissed while it is the deployed
@@ -192,6 +217,7 @@ export function createVersionUpdateMonitor(
         dismissedVersion = null;
       }
     } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
       if (inFlightController === controller) inFlightController = null;
     }
     publish();
@@ -232,6 +258,9 @@ export function createVersionUpdateMonitor(
     windowRef?.removeEventListener('pageshow', onPageShow);
     inFlightController?.abort();
     inFlightController = null;
+    // A new lifecycle must not inherit the aborted lifecycle's dedupe slot.
+    // The old promise's identity guard prevents it from clearing a newer one.
+    pendingCheck = null;
   };
 
   return {

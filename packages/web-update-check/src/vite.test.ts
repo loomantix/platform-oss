@@ -2,12 +2,16 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { build, resolveConfig } from 'vite';
+import { build, createServer, resolveConfig, type ViteDevServer } from 'vite';
 import { webUpdateManifestPlugin } from './vite';
 
 const temporaryDirectories: string[] = [];
+const developmentServers: ViteDevServer[] = [];
 
 afterEach(async () => {
+  await Promise.all(
+    developmentServers.splice(0).map((server) => server.close()),
+  );
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -160,6 +164,7 @@ describe('webUpdateManifestPlugin', () => {
             handler = fn;
           },
         },
+        config: { base: '/' },
       } as never,
     );
     expect(handler).toBeDefined();
@@ -192,6 +197,37 @@ describe('webUpdateManifestPlugin', () => {
       ] as never[]),
     );
     expect(body).toBe('__next__');
+  });
+
+  it('serves the manifest beneath a non-root Vite base', async () => {
+    const root = await temporaryDirectory();
+    await writeFile(path.join(root, 'index.html'), '<main>test</main>');
+    const server = await createServer({
+      root,
+      base: '/app/',
+      configFile: false,
+      logLevel: 'silent',
+      plugins: [webUpdateManifestPlugin({ version: 'artifact-v1' })],
+      server: { host: '127.0.0.1', port: 0 },
+    });
+    developmentServers.push(server);
+    await server.listen();
+    const address = server.httpServer?.address();
+    if (
+      address === null ||
+      typeof address === 'string' ||
+      address === undefined
+    ) {
+      throw new Error('Vite development server did not expose a TCP port');
+    }
+
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/app/version.json`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(await response.json()).toEqual({ version: 'artifact-v1' });
   });
 
   it('rejects invalid versions and unsafe output paths', () => {

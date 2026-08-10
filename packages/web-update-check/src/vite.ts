@@ -38,7 +38,7 @@ export function webUpdateManifestPlugin(
     configureServer(server) {
       // Without this the manifest exists only after a build, so a monitor
       // running under `vite dev` 404s on every poll.
-      const devPath = `/${fileName}`;
+      const devPath = devManifestPath(server.config.base, fileName);
       server.middlewares.use((req, res, next) => {
         if (req.url === undefined || req.url.split('?')[0] !== devPath) {
           next();
@@ -53,6 +53,12 @@ export function webUpdateManifestPlugin(
       this.emitFile({ type: 'asset', fileName, source });
     },
   };
+}
+
+function devManifestPath(base: string, fileName: string): string {
+  const basePath = /^https?:\/\//.test(base) ? new URL(base).pathname : base;
+  const normalizedBase = basePath === './' ? '/' : basePath;
+  return `${normalizedBase.endsWith('/') ? normalizedBase : `${normalizedBase}/`}${fileName}`;
 }
 
 /**
