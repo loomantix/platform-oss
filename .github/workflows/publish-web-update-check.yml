@@ -95,4 +95,4 @@ jobs:
             echo "::error::Expected exactly one package tarball"
             exit 1
           fi
-          npm publish "$1" --access public --provenance
+          npm publish "$1" --access public --provenance --ignore-scripts
