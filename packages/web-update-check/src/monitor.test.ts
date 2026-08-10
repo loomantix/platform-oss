@@ -1,10 +1,30 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createVersionUpdateMonitor } from './monitor';
 
+const originalVisibilityState = Object.getOwnPropertyDescriptor(
+  Document.prototype,
+  'visibilityState',
+);
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  Reflect.deleteProperty(document, 'visibilityState');
+  if (originalVisibilityState !== undefined) {
+    Object.defineProperty(
+      Document.prototype,
+      'visibilityState',
+      originalVisibilityState,
+    );
+  }
 });
+
+function setVisibilityState(value: DocumentVisibilityState): void {
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
 
 describe('createVersionUpdateMonitor', () => {
   it('compares the first manifest response with the running bundle', async () => {
@@ -110,36 +130,115 @@ describe('createVersionUpdateMonitor', () => {
     expect(monitor.getSnapshot()).toBe(before);
   });
 
-  it('aborts a superseded request so an older response cannot win', async () => {
+  it('shares one request between concurrent checks instead of cancelling', async () => {
     let resolveFirst: ((response: Response) => void) | undefined;
-    let firstSignal: AbortSignal | undefined;
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockImplementationOnce((_input, init) => {
-        firstSignal = init?.signal ?? undefined;
-        return new Promise<Response>((resolve) => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
           resolveFirst = resolve;
-        });
-      })
-      .mockResolvedValueOnce(jsonResponse({ version: 'deployed-v3' }));
+        }),
+    );
     const monitor = createVersionUpdateMonitor({
       currentVersion: 'running-v1',
       fetch: fetchMock,
     });
 
     const first = monitor.checkNow();
-    await monitor.checkNow();
-    expect(firstSignal?.aborted).toBe(true);
-    resolveFirst?.(jsonResponse({ version: 'deployed-v2' }));
-    await first;
+    const second = monitor.checkNow();
+    expect(fetchMock).toHaveBeenCalledOnce();
 
-    expect(monitor.getSnapshot().latestVersion).toBe('deployed-v3');
+    resolveFirst?.(jsonResponse({ version: 'deployed-v2' }));
+    await Promise.all([first, second]);
+
+    expect(monitor.getSnapshot().latestVersion).toBe('deployed-v2');
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('keeps polling when the manifest is slower than the poll interval', async () => {
+    vi.useFakeTimers();
+    const pending: ((response: Response) => void)[] = [];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: fetchMock,
+      pollIntervalMs: 1_000,
+      onError,
+    });
+    monitor.start();
+
+    // Three interval ticks elapse while the first request is still open.
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    pending[0]?.(jsonResponse({ version: 'deployed-v2' }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(monitor.getSnapshot().latestVersion).toBe('deployed-v2');
+    expect(onError).not.toHaveBeenCalled();
+    monitor.stop();
+  });
+
+  it('does not report an abort caused by stopping mid-check', async () => {
+    let signal: AbortSignal | undefined;
+    let rejectFetch: ((cause: unknown) => void) | undefined;
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: vi.fn<typeof fetch>().mockImplementation((_input, init) => {
+        signal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => {
+          rejectFetch = reject;
+        });
+      }),
+      onError,
+    });
+
+    const check = monitor.checkNow();
+    monitor.stop();
+    expect(signal?.aborted).toBe(true);
+    rejectFetch?.(new DOMException('The operation was aborted.', 'AbortError'));
+    await check;
+
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('notifies again when a dismissed version is rolled back and redeployed', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ version: 'deployed-v2' }))
+      .mockResolvedValueOnce(jsonResponse({ version: 'running-v1' }))
+      .mockResolvedValueOnce(jsonResponse({ version: 'deployed-v2' }));
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: fetchMock,
+    });
+
+    await monitor.checkNow();
+    monitor.dismiss();
+    expect(monitor.getSnapshot().shouldNotify).toBe(false);
+
+    await monitor.checkNow(); // rollback to the running artifact
+    await monitor.checkNow(); // the same update deployed again
+
+    expect(monitor.getSnapshot()).toMatchObject({
+      latestVersion: 'deployed-v2',
+      dismissed: false,
+      shouldNotify: true,
+    });
   });
 
   it('checks on visible-tab and bfcache resume events', async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
-      .mockResolvedValue(jsonResponse({ version: 'running-v1' }));
+      .mockResolvedValueOnce(jsonResponse({ version: 'deployed-v2' }))
+      .mockResolvedValueOnce(jsonResponse({ version: 'deployed-v3' }))
+      .mockResolvedValueOnce(jsonResponse({ version: 'deployed-v4' }));
     const monitor = createVersionUpdateMonitor({
       currentVersion: 'running-v1',
       fetch: fetchMock,
@@ -148,19 +247,53 @@ describe('createVersionUpdateMonitor', () => {
       window,
     });
     const release = monitor.start();
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    // Wait for the opening check to settle: concurrent checks share a request.
+    await vi.waitFor(() =>
+      expect(monitor.getSnapshot().latestVersion).toBe('deployed-v2'),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    Object.defineProperty(document, 'visibilityState', {
-      configurable: true,
-      value: 'visible',
-    });
+    setVisibilityState('visible');
     document.dispatchEvent(new Event('visibilitychange'));
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(monitor.getSnapshot().latestVersion).toBe('deployed-v3'),
+    );
 
     const pageShow = new Event('pageshow');
     Object.defineProperty(pageShow, 'persisted', { value: true });
     window.dispatchEvent(pageShow);
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() =>
+      expect(monitor.getSnapshot().latestVersion).toBe('deployed-v4'),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    release();
+  });
+
+  it('ignores hidden-tab and non-bfcache lifecycle events', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ version: 'deployed-v2' }));
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: fetchMock,
+      pollIntervalMs: 60_000,
+      document,
+      window,
+    });
+    const release = monitor.start();
+    await vi.waitFor(() =>
+      expect(monitor.getSnapshot().latestVersion).toBe('deployed-v2'),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    setVisibilityState('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    const pageShow = new Event('pageshow');
+    Object.defineProperty(pageShow, 'persisted', { value: false });
+    window.dispatchEvent(pageShow);
+    await Promise.resolve();
+
+    expect(fetchMock).toHaveBeenCalledOnce();
     release();
   });
 
@@ -271,6 +404,63 @@ describe('createVersionUpdateMonitor', () => {
     });
   });
 
+  it('reports an unparseable manifest body as a deployment fault', async () => {
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(
+          new Response('<!doctype html><html></html>', {
+            headers: { 'content-type': 'text/html' },
+          }),
+        ),
+      onError,
+    });
+
+    await monitor.checkNow();
+
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'parse' }),
+    );
+    expect(monitor.getSnapshot().latestVersion).toBeNull();
+  });
+
+  it('rejects a manifest version that is padded or over-long', async () => {
+    const onError = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(jsonResponse({ version: ' deployed-v2 ' }))
+        .mockResolvedValueOnce(jsonResponse({ version: 'v'.repeat(257) })),
+      onError,
+    });
+
+    await monitor.checkNow();
+    await monitor.checkNow();
+
+    expect(onError).toHaveBeenNthCalledWith(1, { type: 'manifest' });
+    expect(onError).toHaveBeenNthCalledWith(2, { type: 'manifest' });
+    expect(monitor.getSnapshot().latestVersion).toBeNull();
+  });
+
+  it('stops notifying subscribers after unsubscribe', async () => {
+    const listener = vi.fn();
+    const monitor = createVersionUpdateMonitor({
+      currentVersion: 'running-v1',
+      fetch: vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(jsonResponse({ version: 'deployed-v2' })),
+    });
+    const unsubscribe = monitor.subscribe(listener);
+    unsubscribe();
+
+    await monitor.checkNow();
+
+    expect(listener).not.toHaveBeenCalled();
+  });
+
   it('snapshots the running version at construction', async () => {
     const options = {
       currentVersion: 'running-v1',
@@ -321,6 +511,22 @@ describe('createVersionUpdateMonitor', () => {
         fetch,
       }),
     ).toThrow(/pollIntervalMs/);
+    expect(() =>
+      createVersionUpdateMonitor({ currentVersion: ' v1 ', fetch }),
+    ).toThrow(/currentVersion/);
+    expect(() =>
+      createVersionUpdateMonitor({
+        currentVersion: 'v1',
+        fetch: 'not-a-function' as unknown as typeof fetch,
+      }),
+    ).toThrow(/fetch/);
+    expect(() =>
+      createVersionUpdateMonitor({
+        currentVersion: 'v'.repeat(256),
+        pollIntervalMs: 2_147_483_647,
+        fetch,
+      }),
+    ).not.toThrow();
   });
 
   it('preserves manifest query parameters and fragments when cache busting', async () => {

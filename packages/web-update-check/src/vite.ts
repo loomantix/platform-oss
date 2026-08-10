@@ -25,23 +25,42 @@ export function webUpdateManifestPlugin(
   const fileName = options.fileName ?? 'version.json';
   assertFileName(fileName);
 
+  const manifest = builtAt === undefined ? { version } : { version, builtAt };
+  const source = JSON.stringify(manifest);
+
   return {
     name: 'loomantix-web-update-manifest',
     config() {
       return {
-        define: { 'import.meta.env.VITE_APP_VERSION': JSON.stringify(version) },
+        define: { 'import.meta.env.VITE_APP_VERSION': defineLiteral(version) },
       };
     },
-    generateBundle() {
-      const manifest =
-        builtAt === undefined ? { version } : { version, builtAt };
-      this.emitFile({
-        type: 'asset',
-        fileName,
-        source: JSON.stringify(manifest),
+    configureServer(server) {
+      // Without this the manifest exists only after a build, so a monitor
+      // running under `vite dev` 404s on every poll.
+      const devPath = `/${fileName}`;
+      server.middlewares.use((req, res, next) => {
+        if (req.url === undefined || req.url.split('?')[0] !== devPath) {
+          next();
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(source);
       });
     },
+    generateBundle() {
+      this.emitFile({ type: 'asset', fileName, source });
+    },
   };
+}
+
+/**
+ * Serialize the version for `define`. `JSON.stringify` alone leaves `<` intact,
+ * which breaks out of an inlined `<script>` in bundles served inside HTML.
+ */
+function defineLiteral(value: string): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c');
 }
 
 function assertFileName(value: string): void {
@@ -49,7 +68,13 @@ function assertFileName(value: string): void {
     value.length === 0 ||
     value.startsWith('/') ||
     value.includes('\\') ||
-    value.split('/').some((segment) => segment === '.' || segment === '..')
+    /^[A-Za-z]:/.test(value) ||
+    value
+      .split('/')
+      .some(
+        (segment) =>
+          segment.length === 0 || segment === '.' || segment === '..',
+      )
   ) {
     throw new TypeError(
       'fileName must be a safe path relative to the build directory',

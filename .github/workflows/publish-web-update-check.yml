@@ -22,6 +22,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Verify tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -43,15 +48,12 @@ jobs:
           fi
           echo "Publishing @loomantix/web-update-check@$pkg_version"
 
-      - name: Verify tagged commit is on main
-        run: |
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-
       - run: pnpm --filter @loomantix/web-update-check typecheck
       - run: pnpm --filter @loomantix/web-update-check test
       - run: pnpm --filter @loomantix/web-update-check build
 
+      # pnpm is required: the package's resolvable entry points come from
+      # publishConfig.main/types/exports, which npm publish does not apply.
       - name: Publish
         working-directory: packages/web-update-check
         run: pnpm publish --access public --provenance --no-git-checks

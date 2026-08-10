@@ -128,8 +128,92 @@ describe('webUpdateManifestPlugin', () => {
     );
   });
 
+  it('escapes a version that could close an inlined script element', async () => {
+    const config = await resolveConfig(
+      {
+        configFile: false,
+        logLevel: 'silent',
+        plugins: [
+          webUpdateManifestPlugin({ version: 'v1</script><script>x()' }),
+        ],
+      },
+      'serve',
+    );
+
+    const defined = config.define?.['import.meta.env.VITE_APP_VERSION'];
+    expect(defined).not.toContain('</script>');
+    expect(JSON.parse(String(defined))).toBe('v1</script><script>x()');
+  });
+
+  it('serves the manifest from the dev server', async () => {
+    const plugin = webUpdateManifestPlugin({ version: 'artifact-v1' });
+    const configureServer = plugin.configureServer;
+    expect(typeof configureServer).toBe('function');
+    if (typeof configureServer !== 'function') return;
+
+    let handler: ((...args: never[]) => void) | undefined;
+    await configureServer.call(
+      {} as never,
+      {
+        middlewares: {
+          use: (fn: (...args: never[]) => void) => {
+            handler = fn;
+          },
+        },
+      } as never,
+    );
+    expect(handler).toBeDefined();
+
+    const headers: Record<string, string> = {};
+    let body: string | undefined;
+    const next = () => {
+      body = '__next__';
+    };
+    handler?.(
+      ...([
+        { url: '/version.json?t=1' },
+        {
+          setHeader: (key: string, value: string) => (headers[key] = value),
+          end: (chunk: string) => (body = chunk),
+        },
+        next,
+      ] as never[]),
+    );
+
+    expect(body).toBe(JSON.stringify({ version: 'artifact-v1' }));
+    expect(headers['Cache-Control']).toBe('no-store');
+
+    body = undefined;
+    handler?.(
+      ...([
+        { url: '/index.html' },
+        { setHeader: () => undefined, end: () => undefined },
+        next,
+      ] as never[]),
+    );
+    expect(body).toBe('__next__');
+  });
+
   it('rejects invalid versions and unsafe output paths', () => {
     expect(() => webUpdateManifestPlugin({ version: '' })).toThrow(/version/);
+    expect(() => webUpdateManifestPlugin({ version: ' v1 ' })).toThrow(
+      /version/,
+    );
+    expect(() =>
+      webUpdateManifestPlugin({ version: 'v1', fileName: 'a\\b.json' }),
+    ).toThrow(/fileName/);
+    expect(() =>
+      webUpdateManifestPlugin({ version: 'v1', fileName: 'C:/version.json' }),
+    ).toThrow(/fileName/);
+    expect(() =>
+      webUpdateManifestPlugin({ version: 'v1', fileName: 'assets//v.json' }),
+    ).toThrow(/fileName/);
+    expect(() =>
+      webUpdateManifestPlugin({
+        version: 'v1',
+        fileName: 'assets/../../x.json',
+      }),
+    ).toThrow(/fileName/);
     expect(() =>
       webUpdateManifestPlugin({ version: 'v1', fileName: '../version.json' }),
     ).toThrow(/fileName/);

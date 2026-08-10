@@ -44,6 +44,7 @@ export interface VersionUpdateMonitorOptions {
 export type VersionUpdateMonitorError =
   | { readonly type: 'request'; readonly cause: unknown }
   | { readonly type: 'response'; readonly status: number }
+  | { readonly type: 'parse'; readonly cause: unknown }
   | { readonly type: 'manifest' }
   | { readonly type: 'listener'; readonly cause: unknown };
 
@@ -111,6 +112,7 @@ export function createVersionUpdateMonitor(
   const leases = new Set<symbol>();
   let intervalId: ReturnType<typeof setInterval> | null = null;
   let inFlightController: AbortController | null = null;
+  let pendingCheck: Promise<void> | null = null;
   const onError = options.onError;
 
   const reportError = (error: VersionUpdateMonitorError): void => {
@@ -125,7 +127,8 @@ export function createVersionUpdateMonitor(
     const next = buildSnapshot(currentVersion, latestVersion, dismissedVersion);
     if (snapshotsEqual(snapshot, next)) return;
     snapshot = next;
-    for (const listener of listeners) {
+    // Copy first: a listener may subscribe, unsubscribe, or dismiss re-entrantly.
+    for (const listener of [...listeners]) {
       try {
         listener();
       } catch (cause) {
@@ -134,39 +137,76 @@ export function createVersionUpdateMonitor(
     }
   };
 
-  const checkNow = async (): Promise<void> => {
-    inFlightController?.abort();
-    const controller = new AbortController();
-    inFlightController = controller;
-
+  /** Read the manifest once. Returns the observed version, or null on failure. */
+  const readManifest = async (
+    controller: AbortController,
+  ): Promise<string | null> => {
+    let response: Response;
     try {
-      const response = await fetchImpl(cacheBustedUrl(manifestUrl), {
+      response = await fetchImpl(cacheBustedUrl(manifestUrl), {
         cache: 'no-store',
         signal: controller.signal,
       });
-      if (controller.signal.aborted) return;
-      if (!response.ok) {
-        reportError({ type: 'response', status: response.status });
-        return;
-      }
-      const manifest: unknown = await response.json();
-      if (controller.signal.aborted) return;
-      if (!isVersionManifest(manifest)) {
-        reportError({ type: 'manifest' });
-        return;
-      }
-      latestVersion = manifest.version;
-      publish();
     } catch (cause) {
       // Deploys and tab resumes routinely race network availability. A failed
       // check preserves the last trustworthy state and retries on the next
       // lifecycle event or interval.
-      if (!controller.signal.aborted) {
-        reportError({ type: 'request', cause });
+      if (!controller.signal.aborted) reportError({ type: 'request', cause });
+      return null;
+    }
+    if (controller.signal.aborted) return null;
+    if (!response.ok) {
+      reportError({ type: 'response', status: response.status });
+      return null;
+    }
+
+    let manifest: unknown;
+    try {
+      manifest = await response.json();
+    } catch (cause) {
+      // A body that is not JSON usually means the origin served an SPA history
+      // fallback for the manifest path, which is a deployment fault rather
+      // than a network fault and must not be reported as one.
+      if (!controller.signal.aborted) reportError({ type: 'parse', cause });
+      return null;
+    }
+    if (controller.signal.aborted) return null;
+    if (!isVersionManifest(manifest)) {
+      reportError({ type: 'manifest' });
+      return null;
+    }
+    return manifest.version;
+  };
+
+  const runCheck = async (): Promise<void> => {
+    const controller = new AbortController();
+    inFlightController = controller;
+    try {
+      const observed = await readManifest(controller);
+      if (observed === null) return;
+      latestVersion = observed;
+      // A version the user dismissed is only dismissed while it is the deployed
+      // one. Clearing on any move means a rollback followed by a redeploy of
+      // the same artifact notifies again instead of staying silently dismissed.
+      if (dismissedVersion !== null && dismissedVersion !== observed) {
+        dismissedVersion = null;
       }
     } finally {
       if (inFlightController === controller) inFlightController = null;
     }
+    publish();
+  };
+
+  const checkNow = (): Promise<void> => {
+    // Concurrent callers share one request. Aborting the in-flight check on
+    // every interval tick or visibility change would starve a manifest slower
+    // than the poll interval, and the aborted path reports nothing.
+    if (pendingCheck !== null) return pendingCheck;
+    const pending = runCheck().finally(() => {
+      if (pendingCheck === pending) pendingCheck = null;
+    });
+    pendingCheck = pending;
+    return pending;
   };
 
   const onVisibilityChange = (): void => {
