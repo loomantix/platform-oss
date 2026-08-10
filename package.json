@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "packageManager": "pnpm@10.29.3",
-  "description": "Reusable @loomantix/* infrastructure packages: mobile-crypto, web-crypto, logging.",
+  "description": "Reusable @loomantix/* infrastructure packages for browser, mobile, and backend runtimes.",
   "repository": {
     "type": "git",
     "url": "https://github.com/loomantix/platform-oss.git"
