@@ -61,7 +61,7 @@ jobs:
           name: web-update-check-package
           path: ${{ runner.temp }}/web-update-check-package/*.tgz
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
           compression-level: 0
 
   publish:

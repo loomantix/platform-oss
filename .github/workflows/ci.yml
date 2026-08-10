@@ -59,3 +59,53 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r --if-present run build
+      - name: Verify web-update-check publish artifact
+        env:
+          PACKAGE_ROOT: ${{ runner.temp }}/web-update-check-package/package
+        run: |
+          package_dir="$RUNNER_TEMP/web-update-check-package"
+          mkdir -p "$package_dir"
+          pnpm --filter @loomantix/web-update-check pack \
+            --pack-destination "$package_dir"
+
+          set -- "$package_dir"/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::Expected exactly one package tarball"
+            exit 1
+          fi
+
+          tar -xzf "$1" -C "$package_dir"
+          node --input-type=module <<'NODE'
+          import { existsSync, readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const manifest = JSON.parse(
+            readFileSync(join(process.env.PACKAGE_ROOT, 'package.json'), 'utf8'),
+          );
+          const entries = {
+            main: manifest.main,
+            types: manifest.types,
+            defaultExport: manifest.exports?.['.']?.default,
+            defaultTypes: manifest.exports?.['.']?.types,
+            viteExport: manifest.exports?.['./vite']?.default,
+            viteTypes: manifest.exports?.['./vite']?.types,
+          };
+          const expected = {
+            main: './dist/index.js',
+            types: './dist/index.d.ts',
+            defaultExport: './dist/index.js',
+            defaultTypes: './dist/index.d.ts',
+            viteExport: './dist/vite.js',
+            viteTypes: './dist/vite.d.ts',
+          };
+
+          for (const [name, expectedPath] of Object.entries(expected)) {
+            if (entries[name] !== expectedPath) {
+              throw new Error(`${name} is ${String(entries[name])}, expected ${expectedPath}`);
+            }
+            if (!existsSync(join(process.env.PACKAGE_ROOT, expectedPath))) {
+              throw new Error(`${name} target is missing: ${expectedPath}`);
+            }
+          }
+          NODE
+          npm publish "$1" --access public --dry-run --ignore-scripts
