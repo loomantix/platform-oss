@@ -61,14 +61,15 @@ jobs:
       - run: pnpm -r --if-present run build
       - name: Verify web-update-check publish artifact
         env:
-          PACKAGE_ROOT: ${{ runner.temp }}/web-update-check-package/package
+          PACKAGE_ROOT: ${{ runner.temp }}/package/package
         run: |
-          package_dir="$RUNNER_TEMP/web-update-check-package"
+          package_dir="$RUNNER_TEMP/package"
           mkdir -p "$package_dir"
           pnpm --filter @loomantix/web-update-check pack \
             --pack-destination "$package_dir"
 
-          set -- "$package_dir"/*.tgz
+          cd "$RUNNER_TEMP"
+          set -- ./package/*.tgz
           if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
             echo "::error::Expected exactly one package tarball"
             exit 1

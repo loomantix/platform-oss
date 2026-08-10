@@ -90,7 +90,7 @@ jobs:
 
       - name: Publish
         run: |
-          set -- package/*.tgz
+          set -- ./package/*.tgz
           if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
             echo "::error::Expected exactly one package tarball"
             exit 1
