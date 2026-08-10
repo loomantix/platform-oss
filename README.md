@@ -24,6 +24,19 @@ pnpm add @loomantix/web-update-check
 
 Each package README documents package-specific peer dependencies and runtime assumptions.
 
+## When to add a shared package
+
+Create a shared module when the same generic behavior is needed by multiple
+applications and independent implementations are beginning to diverge. Extract
+the smallest stable, product-neutral contract; keep framework presentation,
+product wording, deployment policy, and consumer-specific recovery behavior in
+the consuming applications.
+
+Public-safe reusable `@loomantix/*` contracts belong in this repository.
+Product-private contracts and internal orchestration do not. A one-off helper or
+behavior whose differences cannot be isolated behind consumer adapters has not
+yet earned a shared package.
+
 ## Releases
 
 Each package is independently versioned and tagged:
