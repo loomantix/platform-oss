@@ -7,27 +7,21 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: publish-web-update-check-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish to npm
+  build:
+    name: Build package
     runs-on: ubuntu-latest
-    # A tag-triggered run executes the workflow definition from the tagged ref,
-    # so every check below can be deleted by the same commit that pushes the
-    # tag. The environment's protection rules live in repository settings,
-    # outside the ref's reach, and are what actually gates the publish; scope
-    # the npm Trusted Publisher to this environment so the gate is unavoidable.
-    environment: npm-publish
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify tagged commit is on main
         run: |
           git fetch --no-tags origin main
@@ -38,14 +32,7 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
-          scope: '@loomantix'
 
-      # --ignore-scripts is explicit, not incidental: this job holds
-      # id-token: write, so a dependency lifecycle script here could mint an npm
-      # token or rewrite dist/ before the publish step. pnpm 10 blocks unlisted
-      # build scripts by default, but that default is one allowlist entry away
-      # from being reversed.
       - run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Verify tag matches package.json version
@@ -57,14 +44,55 @@ jobs:
             echo "::error::Tag version ($tag_version) does not match package.json ($pkg_version)"
             exit 1
           fi
-          echo "Publishing @loomantix/web-update-check@$pkg_version"
+          echo "Preparing @loomantix/web-update-check@$pkg_version"
 
       - run: pnpm --filter @loomantix/web-update-check typecheck
       - run: pnpm --filter @loomantix/web-update-check test
       - run: pnpm --filter @loomantix/web-update-check build
 
-      # pnpm is required: the package's resolvable entry points come from
-      # publishConfig.main/types/exports, which npm publish does not apply.
+      - name: Pack publish artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/web-update-check-package"
+          pnpm --filter @loomantix/web-update-check pack \
+            --pack-destination "$RUNNER_TEMP/web-update-check-package"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-update-check-package
+          path: ${{ runner.temp }}/web-update-check-package/*.tgz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # A tag-triggered run executes the workflow definition from the tagged ref.
+    # The environment's protection rules live in repository settings, outside
+    # the ref's reach, and are what actually gate publication; scope the npm
+    # Trusted Publisher to this environment so the gate is unavoidable.
+    environment: npm-publish
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-update-check-package
+          path: package
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@loomantix'
+
       - name: Publish
-        working-directory: packages/web-update-check
-        run: pnpm publish --access public --provenance --no-git-checks
+        run: |
+          set -- ./package/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::Expected exactly one package tarball"
+            exit 1
+          fi
+          npm publish "$1" --access public --provenance --ignore-scripts
