@@ -1,12 +1,13 @@
 # Contributing to platform-oss
 
-Thank you for considering a contribution. `loomantix/platform-oss` is the public home of three infrastructure packages we run in production:
+Thank you for considering a contribution. `loomantix/platform-oss` is the public home of reusable infrastructure packages we run in production:
 
 - [`@loomantix/mobile-crypto`](./packages/mobile-crypto) — at-rest AES-256-GCM helpers for React Native + Expo.
 - [`@loomantix/web-crypto`](./packages/web-crypto) — at-rest AES-256-GCM helpers for browsers (WebCrypto + IndexedDB).
 - [`@loomantix/logging`](./packages/logging) — pino + OpenTelemetry NestJS logging with PHI-safe redaction.
+- [`@loomantix/web-update-check`](./packages/web-update-check) — framework-neutral browser update detection with a Vite build-manifest plugin.
 
-The bar on contract clarity, security review, and contributor friction is deliberately high — these packages handle credentials, encryption keys, and PHI. Read this whole file before opening a PR.
+The bar on contract clarity, security review, and contributor friction is deliberately high — several of these packages handle credentials, encryption keys, and PHI. Read this whole file before opening a PR.
 
 ## License
 
@@ -28,7 +29,7 @@ Use `git commit -s` to add the trailer automatically. CI rejects PRs with unsign
 
 **In scope:**
 
-- Bug fixes in any of the three packages.
+- Bug fixes in any package.
 - Performance improvements with measurable benchmarks.
 - Documentation, examples, threat-model clarifications.
 - CI, build, type-system, or testing improvements.
