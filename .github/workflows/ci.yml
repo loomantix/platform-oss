@@ -109,4 +109,4 @@ jobs:
             }
           }
           NODE
-          npm publish "$1" --access public --dry-run --ignore-scripts
+          npm publish "$1" --access public --dry-run --ignore-scripts --force
