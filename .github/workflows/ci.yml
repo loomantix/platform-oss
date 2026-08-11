@@ -109,10 +109,30 @@ jobs:
             }
           }
           NODE
-          # --dry-run is what keeps this a verification step: without it this line
-          # would really publish the tarball from CI, bypassing
-          # publish-web-update-check.yml's tag check, pinned registry, and
-          # provenance signing. Nothing enforces that, so never separate the two.
-          # --force is only here so the check can still run once the current
-          # version is on the registry.
-          npm publish "$1" --access public --dry-run --ignore-scripts --force
+          # This job must never publish, and today it cannot: it sets no
+          # registry-url, no NODE_AUTH_TOKEN, and no id-token: write, so a real
+          # publish fails ENEEDAUTH. Keep it that way — that credential absence
+          # is the actual guard, and --dry-run is the local, reviewable one.
+          # Publication belongs to publish-web-update-check.yml, which gates on
+          # the npm-publish environment and adds the tag-on-main and
+          # tag/version checks, the pinned registry, and the provenance signing
+          # that this line has none of.
+          #
+          # Tolerate only the already-published-version conflict. Passing
+          # --force to swallow it would also disable npm's
+          # prerelease-needs-a-tag and implicit-latest guards and skip the
+          # registry lookup entirely, leaving a step that verifies nothing the
+          # assertions above have not already checked.
+          if ! publish_output=$(npm publish "$1" --access public --dry-run --ignore-scripts 2>&1); then
+            printf '%s\n' "$publish_output"
+            case "$publish_output" in
+              *"cannot publish over the previously published versions"*)
+                echo "::notice::Version already published; artifact checks passed."
+                ;;
+              *)
+                exit 1
+                ;;
+            esac
+          else
+            printf '%s\n' "$publish_output"
+          fi
