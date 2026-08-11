@@ -109,5 +109,5 @@ jobs:
             }
           }
           NODE
-          # Keep --force coupled to --dry-run: it bypasses the existing-version guard only.
+          # --force permits checking the already-published current version; keep it coupled to --dry-run.
           npm publish "$1" --access public --dry-run --ignore-scripts --force
