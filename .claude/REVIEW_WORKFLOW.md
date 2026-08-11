@@ -12,7 +12,7 @@ with the fix and validation, then resolve the thread. Every pass reads resolved
 as well as unresolved threads before reviewing the current head.
 
 Load [the local review ledger](references/local-review-ledger.md) before running
-`refactorpass`, `grill`, `deepgrill`, `codex-review`, or local review hooks.
+`refactorpass`, `critique`, `deepcritique`, `codex-review`, or local review hooks.
 
 ## Local Convergence Path
 
@@ -22,12 +22,13 @@ Use this path when both local engines are available:
 2. Pin the exact base SHA for the round and give it to both reviewers.
 3. Run `codex-review <pr-number>` as a fresh local Codex pass. Read the ledger
    and apply the comment/fix/reply/resolve contract to confirmed findings.
-4. On the resulting head, run a fresh Claude `deepgrill <pr-number>` with the
+4. On the resulting head, run a fresh Claude `deepcritique <pr-number>` with the
    same ledger contract.
-5. Classify fixes as `material` or `minor` **by what the fix changes, not by how
-   severe the finding sounded**. A fix is `material` only when it changes product
-   code. Tests, fixtures, comments, and docs are `minor`. Restart at Codex when
-   either pass makes a material fix. Keep minor-only fixes without restarting.
+5. Classify fixes by effect, not path or finding severity. `material` includes
+   substantive correctness, security/privacy, data-safety, compatibility,
+   deployment/sync, or review-integrity changes, including tests or workflows
+   needed to prevent a false green. `minor` is low-risk non-behavioral cleanup
+   or polish. Restart at Codex after a material fix; retain minor fixes.
 
    **The chain gets cheaper as it repeats.** Two rules make that happen, and both
    are enforced from the ledger rather than from session memory:
@@ -45,23 +46,13 @@ Use this path when both local engines are available:
      the narrowing is a disposition rule applied by the orchestrator, never an
      instruction to a review agent to withhold by severity or confidence.
 
-6. Converge after one complete Codex-then-Claude round changes no product code,
-   every pass that committed nothing has an attestation covering the current head,
-   every committed pass has a structured fix disposition plus a final-lane
-   completion marker, and every local-review thread has a disposition reply and is
-   resolved.
-
-   An attestation covers the current head when no product code changed since the
-   SHA it names — a later tests-or-docs-only commit does not invalidate it. Diff
-   the attested SHA against the head over product paths to confirm. Requiring a
-   byte-exact head match instead is what makes this loop unbounded: minor commits
-   perpetually re-stale the other engine's attestation, so the condition in step 6
-   can never be met while either engine keeps finding test work.
-
-7. **The moment a pass changes no product code, stop and recommend shipping.**
-   Name the consumer's ship step — whatever that repo uses to merge the PR.
-   Reaching this before the cap is the expected outcome, not an early exit — the
-   cap is a backstop for non-convergence, never a quota of rounds to spend.
+6. Converge after one complete Codex-then-Claude round has no material
+   transition, every pass has a validated v3 result for its exact reviewed head,
+   and every local-review thread has a disposition reply and is resolved. A
+   minor A-to-B transition can complete the round without pretending the first
+   engine reviewed B; its exact-head attestation remains historical evidence.
+7. The wrapper, not review hooks, posts canonical pass/completion attestations
+   after validating structured results and the GitHub ledger.
 8. Stop after four rounds by default. Leave the PR draft and report
    non-convergence instead of continuing an unbounded cycle.
 
@@ -76,14 +67,14 @@ When a local Codex CLI is unavailable:
 ### Lean
 
 1. Open a draft PR.
-2. Run `refactorpass <pr-number>`, then `grill <pr-number>`.
+2. Run `refactorpass <pr-number>`, then `critique <pr-number>`.
 3. Run `reviewit <pr-number>` for the bounded Gemini Flash and Copilot loop.
 
 ### Deep
 
-1. Open a draft PR and run `deepgrill <pr-number>`.
-2. Run `reviewit <pr-number> deep`; its final local `deepgrill` receives the
-   same PR number and ledger. That tail `deepgrill` skips the refactor pass —
+1. Open a draft PR and run `deepcritique <pr-number>`.
+2. Run `reviewit <pr-number> deep`; its final local `deepcritique` receives the
+   same PR number and ledger. That tail `deepcritique` skips the refactor pass —
    step 1 already spent this engine's cleanup latch on the PR.
 
 Use deep mode for auth, crypto, secrets, schema/data-shape work, GitHub Actions,
@@ -94,7 +85,7 @@ customer/tenant-variable behavior.
 
 - Treat generated findings as hypotheses; verify against source before posting.
 - **No reviewer in this chain pre-filters by severity or confidence.** Not a
-  `grill` sub-agent, not `codex-review`, not an inline `Agent(...)` prompt you
+  `critique` sub-agent, not `codex-review`, not an inline `Agent(...)` prompt you
   write yourself. Each reports everything with a severity and confidence
   attached; the filtering happens one level up, where every lens is visible at
   once and each claim can be checked against the diff. A finding suppressed
@@ -105,13 +96,11 @@ customer/tenant-variable behavior.
   See [`MODEL_NOTES.md`](MODEL_NOTES.md) §2–§3.
 - Fix every valid in-scope finding. Dismiss false positives with evidence in the
   thread.
-- **A round that only finds test, fixture, and comment work is the signal to
-  ship, not to keep going.** It means the product converged and the review has
-  turned to auditing its own artifacts. That surface is self-renewing — each
-  round's hardening gives the next round new assertions to mutate — so the
-  findings never run out and their existence is not evidence more review is
-  warranted. Recommend the ship step and move anything genuinely worth doing to
-  a follow-up issue.
+- **A round that only finds non-material test, fixture, comment, or docs polish
+  is the signal to ship, not to keep going.** It means the product converged and
+  the review has turned to auditing its own artifacts. A test or workflow fix
+  needed to prevent a false green remains material and restarts at Codex under
+  step 5. Move genuinely useful non-material polish to a follow-up issue.
 - Defer only genuinely large architectural work and link the tracking issue.
 - A fix without a preceding inline finding, a finding without a reply, or a
   resolved thread without a visible disposition is a failed pass.
@@ -127,8 +116,8 @@ customer/tenant-variable behavior.
   PR-thread ledger contract, including the shared docs/config-only changeset
   classification every skill skips on.
 - [`skills/refactorpass/SKILL.md`](skills/refactorpass/SKILL.md) ·
-  [`skills/grill/SKILL.md`](skills/grill/SKILL.md) ·
-  [`skills/deepgrill/SKILL.md`](skills/deepgrill/SKILL.md) ·
+  [`skills/critique/SKILL.md`](skills/critique/SKILL.md) ·
+  [`skills/deepcritique/SKILL.md`](skills/deepcritique/SKILL.md) ·
   [`skills/codex-review/SKILL.md`](skills/codex-review/SKILL.md) — the local
   convergence lanes.
 - [`skills/reviewit/SKILL.md`](skills/reviewit/SKILL.md) — the hosted fallback,
