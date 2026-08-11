@@ -133,8 +133,9 @@ skip_targets: []
 #     upstream drop an arbitrary CI job — a critical risk on a public OSS
 #     repo where workflows publish to npm and sign provenance.
 #   - `.claude/settings.json`, `.claude/REVIEW_WORKFLOW.md`,
-#     `.claude/MODEL_NOTES.md`, and `.claude/references/local-review-ledger.md`
-#     are explicit to keep the trusted-config surface narrow.
+#     `.claude/MODEL_NOTES.md`, `.claude/SKILL_AUTHORING.md`, and
+#     `.claude/references/local-review-ledger.md` are explicit to keep the
+#     trusted-config surface narrow.
 allowed_destinations:
   - .claude/agents/**
   - .claude/skills/**
