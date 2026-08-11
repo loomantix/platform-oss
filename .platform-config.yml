@@ -142,6 +142,7 @@ allowed_destinations:
   - .claude/settings.json
   - .claude/REVIEW_WORKFLOW.md
   - .claude/MODEL_NOTES.md
+  - .claude/SKILL_AUTHORING.md
   - .claude/references/local-review-ledger.md
   - .github/copilot-instructions.md
   - .github/workflows/dco.yml
