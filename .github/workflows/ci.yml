@@ -109,5 +109,10 @@ jobs:
             }
           }
           NODE
-          # --force permits checking the already-published current version; keep it coupled to --dry-run.
+          # --dry-run is what keeps this a verification step: without it this line
+          # would really publish the tarball from CI, bypassing
+          # publish-web-update-check.yml's tag check, pinned registry, and
+          # provenance signing. Nothing enforces that, so never separate the two.
+          # --force is only here so the check can still run once the current
+          # version is on the registry.
           npm publish "$1" --access public --dry-run --ignore-scripts --force
