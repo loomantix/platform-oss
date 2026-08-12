@@ -145,6 +145,7 @@ allowed_destinations:
   - .claude/MODEL_NOTES.md
   - .claude/SKILL_AUTHORING.md
   - .claude/references/local-review-ledger.md
+  - .claude/references/house-tokens.css
   - .github/copilot-instructions.md
   - .github/workflows/dco.yml
   - agent-loop-instructions.md
