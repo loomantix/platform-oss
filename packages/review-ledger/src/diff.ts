@@ -2,7 +2,7 @@ import { HUNK_WITH_LEFT_RE } from './constants.js';
 import { fail } from './errors.js';
 
 /**
- *
+ * The line numbers a unified diff touches, split by side.
  */
 export interface DiffLines {
   leftLines: Set<number>;

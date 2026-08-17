@@ -24,7 +24,7 @@ import type {
 } from './types.js';
 
 /**
- *
+ * Read a review-result file as raw bytes.
  */
 export function readResultBytes(pathValue: string): Buffer {
   try {
@@ -40,7 +40,7 @@ export function readResultBytes(pathValue: string): Buffer {
 }
 
 /**
- *
+ * Return the head the result describes, defaulting to the acting head.
  */
 export function resultHead(args: {
   head: string;
@@ -50,7 +50,7 @@ export function resultHead(args: {
 }
 
 /**
- *
+ * Parse a review-result file and assert it is internally consistent.
  */
 export function validateResultData(
   args: {
@@ -194,7 +194,7 @@ export function validateResultData(
 }
 
 /**
- *
+ * Serialise a review result to disk deterministically.
  */
 export function writeResultFile(
   pathValue: string,
@@ -249,7 +249,7 @@ export function writeResultFile(
 }
 
 /**
- *
+ * Read and validate a review-result file.
  */
 export function readResult(resultFile: string): LedgerResult {
   const raw = readResultBytes(resultFile);
@@ -259,7 +259,7 @@ export function readResult(resultFile: string): LedgerResult {
 }
 
 /**
- *
+ * Validate a review-result file without touching GitHub.
  */
 export function validateResult(
   params: ValidateResultParams,
@@ -270,7 +270,7 @@ export function validateResult(
 }
 
 /**
- *
+ * Write a blocked review result recording why the round could not proceed.
  */
 export function writeBlockedResult(params: WriteBlockedParams): LedgerResult {
   let blocker: string;
