@@ -136,3 +136,70 @@ jobs:
           else
             printf '%s\n' "$publish_output"
           fi
+
+      - name: Verify review-ledger publish artifact
+        env:
+          PACKAGE_ROOT: ${{ runner.temp }}/review-ledger-package/package
+        run: |
+          package_dir="$RUNNER_TEMP/review-ledger-package"
+          mkdir -p "$package_dir"
+          pnpm --filter @loomantix/review-ledger pack \
+            --pack-destination "$package_dir"
+
+          cd "$RUNNER_TEMP"
+          set -- ./review-ledger-package/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::Expected exactly one package tarball"
+            exit 1
+          fi
+
+          tar -xzf "$1" -C "$package_dir"
+          node --input-type=module <<'NODE'
+          import { existsSync, readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const manifest = JSON.parse(
+            readFileSync(join(process.env.PACKAGE_ROOT, 'package.json'), 'utf8'),
+          );
+          const entries = {
+            main: manifest.main,
+            types: manifest.types,
+            bin: manifest.bin?.['review-ledger'],
+            defaultExport: manifest.exports?.['.']?.default,
+            defaultTypes: manifest.exports?.['.']?.types,
+            importExport: manifest.exports?.['.']?.import,
+            requireExport: manifest.exports?.['.']?.require,
+          };
+          const expected = {
+            main: './dist/index.js',
+            types: './dist/index.d.ts',
+            bin: './dist/cli.js',
+            defaultExport: './dist/index.js',
+            defaultTypes: './dist/index.d.ts',
+            importExport: './dist/index.js',
+            requireExport: './dist/index.cjs',
+          };
+
+          for (const [name, expectedPath] of Object.entries(expected)) {
+            if (entries[name] !== expectedPath) {
+              throw new Error(`${name} is ${String(entries[name])}, expected ${expectedPath}`);
+            }
+            if (!existsSync(join(process.env.PACKAGE_ROOT, expectedPath))) {
+              throw new Error(`${name} target is missing: ${expectedPath}`);
+            }
+          }
+          NODE
+
+          if ! publish_output=$(npm publish "$1" --access public --dry-run --ignore-scripts 2>&1); then
+            printf '%s\n' "$publish_output"
+            case "$publish_output" in
+              *"cannot publish over the previously published versions"*)
+                echo "::notice::Version already published; artifact checks passed."
+                ;;
+              *)
+                exit 1
+                ;;
+            esac
+          else
+            printf '%s\n' "$publish_output"
+          fi
