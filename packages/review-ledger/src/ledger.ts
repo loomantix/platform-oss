@@ -4,13 +4,16 @@ import {
   DISPOSITION_V1_RE,
   FINDING_V1,
   FINDING_V1_RE,
+  LEGACY_THREAD_MARKER_RE,
+  PROTOCOL_THREAD_MARKER_RE,
   PR_V1_MARKERS,
   PROTOCOL_VERSION,
 } from './constants.js';
 import { fail, LedgerError } from './errors.js';
 import {
+  assertActor,
+  assertThreadScope,
   currentActor,
-  fetchReviewThreads,
   findMatchingBody,
   getGitHubRunner,
   getIssueComments,
@@ -20,14 +23,16 @@ import {
   jsonOutput,
   loadAllowedHeads,
   loadHistoricalCommentIds,
-  loadReviewThreads,
   postReviewComment,
+  reviewThreads,
   rowsHavePseudoV3,
   setThreadState,
   verifyComment,
+  verifyGitTransition,
   verifyHead,
   verifyIssueComment,
   verifyPseudoV3History,
+  verifyReviewBase,
 } from './github.js';
 import { sha256Bytes, sha256Text } from './hash.js';
 import { validateAnchor } from './diff.js';
@@ -40,6 +45,7 @@ import {
   readContent,
   readLegacyBody,
   validateContentString,
+  verifyV1Marker,
 } from './protocol.js';
 import {
   readResultBytes,
@@ -78,11 +84,15 @@ import type {
 } from './types.js';
 
 /**
+ * Extract every actor-owned protocol record from a review thread.
  *
+ * A comment that presents itself as a local-review record but does not parse as
+ * one is fatal, never skipped: silently ignoring an unparsable marker is how a
+ * mangled or forged record disappears from the ledger instead of failing it.
  */
 export function threadProtocolRecords(
   thread: GitHubReviewThreadNode,
-  historicalCommentIds?: Set<number>,
+  historicalCommentIds?: Set<number> | undefined,
 ): {
   findingsV3: Array<[number, FindingV3Match]>;
   dispositionsV3: Array<[number, DispositionV3Match]>;
@@ -102,23 +112,57 @@ export function threadProtocolRecords(
     const row = comments[index]!;
     const body = String(row.body ?? '');
     const author = row.author ?? row.user;
-    if (!author || author.login !== actor) {
+    if (!author || typeof author.login !== 'string') {
+      if (body.includes('<!-- local-review')) {
+        fail('could not establish local-review comment ownership');
+      }
       continue;
     }
-    if (matchPseudoV3(body) !== null) {
+    if (author.login !== actor) {
       continue;
     }
+
+    const firstLine = body.split('\n', 1)[0]!.replace(/\r$/, '');
+    const pseudo = matchPseudoV3(body);
     const findingV3 = matchFinding(body);
     const dispositionV3 = matchDisposition(body);
-    if (findingV3 !== null) {
-      findingsV3.push([index, findingV3]);
+    if (body.includes('<!-- local-review:v3') && !findingV3 && !pseudo) {
+      fail('actor-owned local-review:v3 marker is malformed or unsupported');
     }
-    if (dispositionV3 !== null) {
-      dispositionsV3.push([index, dispositionV3]);
-    }
+
     const findingV1 = FINDING_V1_RE.exec(body);
     const dispositionV1 = DISPOSITION_V1_RE.exec(body);
+
+    if (
+      PROTOCOL_THREAD_MARKER_RE.test(firstLine) &&
+      !findingV3 &&
+      !dispositionV3 &&
+      !findingV1 &&
+      !dispositionV1
+    ) {
+      fail('actor-owned local-review marker is malformed or unsupported');
+    }
+
+    if (findingV3) {
+      findingsV3.push([index, findingV3]);
+    }
+    if (dispositionV3) {
+      dispositionsV3.push([index, dispositionV3]);
+    }
+
+    const legacyMarker = LEGACY_THREAD_MARKER_RE.test(firstLine);
+    if (
+      (body.includes(FINDING_V1) ||
+        body.includes(DISPOSITION_V1) ||
+        legacyMarker) &&
+      !findingV1 &&
+      !dispositionV1
+    ) {
+      fail('actor-owned legacy local-review marker is malformed');
+    }
+
     if (findingV1?.groups) {
+      verifyV1Marker(body, findingV1, 'finding');
       findingsV1.push([
         index,
         {
@@ -130,6 +174,7 @@ export function threadProtocolRecords(
       ]);
     }
     if (dispositionV1?.groups) {
+      verifyV1Marker(body, dispositionV1, 'disposition');
       dispositionsV1.push([
         index,
         {
@@ -146,11 +191,101 @@ export function threadProtocolRecords(
     }
   }
 
+  if (findingsV1.length > 0 || dispositionsV1.length > 0) {
+    if (thread.isResolved !== true) {
+      fail('legacy local-review finding thread is unresolved');
+    }
+    const used = new Set<number>();
+    for (const [findingIndex, finding] of findingsV1) {
+      const matches = dispositionsV1.filter(
+        ([index, disposition]) =>
+          index > findingIndex &&
+          disposition.engine === finding.engine &&
+          disposition.round === finding.round &&
+          disposition.fingerprint === finding.fingerprint,
+      );
+      if (matches.length !== 1) {
+        fail(
+          'legacy local-review finding lacks exactly one matching disposition',
+        );
+      }
+      const dispositionIndex = matches[0]![0];
+      if (used.has(dispositionIndex)) {
+        fail('legacy local-review disposition matches multiple findings');
+      }
+      used.add(dispositionIndex);
+    }
+    if (used.size !== dispositionsV1.length) {
+      fail('legacy local-review ledger contains an orphan disposition');
+    }
+  }
+
   return { findingsV3, dispositionsV3, findingsV1, dispositionsV1 };
 }
 
 /**
+ * Pair every finding in a thread with its single matching disposition.
  *
+ * Enforces the three cardinality rules the ledger depends on: exactly one
+ * disposition per finding, no disposition claimed by two findings, and no
+ * disposition left over. A recurrence may not be opened before the prior
+ * occurrence was disposed.
+ */
+export function pairDispositions<
+  F extends FindingV3Match | FindingV1Match,
+  D extends DispositionV3Match | DispositionV1Match,
+>(
+  findings: Array<[number, F]>,
+  dispositions: Array<[number, D]>,
+): Array<[F, D]> {
+  const matched: Array<[F, D]> = [];
+  const used = new Set<number>();
+
+  for (const [findingIndex, finding] of findings) {
+    const candidates = dispositions.filter(([index, disposition]) => {
+      if (index <= findingIndex) return false;
+      if (disposition.engine !== finding.engine) return false;
+      if (disposition.round !== finding.round) return false;
+      if (disposition.fingerprint !== finding.fingerprint) return false;
+      if ('occurrence' in finding && 'occurrence' in disposition) {
+        if (finding.occurrence !== disposition.occurrence) return false;
+      }
+      return true;
+    });
+    if (candidates.length !== 1) {
+      fail('local-review finding lacks exactly one matching disposition');
+    }
+    const [dispositionIndex, disposition] = candidates[0]!;
+
+    const nextFindingIndexes = findings
+      .filter(
+        ([nextIndex, nextFinding]) =>
+          nextIndex > findingIndex &&
+          nextFinding.fingerprint === finding.fingerprint,
+      )
+      .map(([nextIndex]) => nextIndex);
+    if (
+      nextFindingIndexes.length > 0 &&
+      dispositionIndex >= Math.min(...nextFindingIndexes)
+    ) {
+      fail('local-review recurrence was opened before the prior disposition');
+    }
+
+    if (used.has(dispositionIndex)) {
+      fail('local-review disposition matches multiple findings');
+    }
+    used.add(dispositionIndex);
+    matched.push([finding, disposition]);
+  }
+
+  if (used.size !== dispositions.length) {
+    fail('local-review ledger contains an orphan disposition');
+  }
+  return matched;
+}
+
+/**
+ * Return the dispositions that could close a given finding.
  */
 export function matchingDispositions<
   T extends FindingV3Match | FindingV1Match,
@@ -179,7 +314,38 @@ export function matchingDispositions<
 }
 
 /**
- *
+ * Assert `after` is strictly ahead of `before` with `before` as the merge base.
+ */
+export function verifyForwardTransitionOrFail(
+  repo: string,
+  before: string,
+  after: string,
+  message: string,
+): void {
+  const runner = getGitHubRunner();
+  const comparison = runner.gitCompare
+    ? (runner.gitCompare(repo, before, after) as Record<string, unknown>)
+    : jsonOutput<Record<string, unknown>>([
+        'api',
+        `repos/${repo}/compare/${before}...${after}`,
+      ]);
+  const mergeBase = comparison?.['merge_base_commit'] as
+    | { sha?: string }
+    | undefined;
+  if (
+    typeof comparison !== 'object' ||
+    comparison === null ||
+    comparison['status'] !== 'ahead' ||
+    typeof mergeBase !== 'object' ||
+    mergeBase === null ||
+    mergeBase.sha !== before
+  ) {
+    fail(message);
+  }
+}
+
+/**
+ * Assert `after` is strictly ahead of `before` with `before` as merge base.
  */
 export function verifyForwardTransition(
   repo: string,
@@ -212,309 +378,307 @@ export function verifyForwardTransition(
 }
 
 /**
+ * Walk every thread on the PR for malformed or unattributable protocol records.
  *
+ * Used before writing a new record: a thread that already fails the protocol
+ * must stop the pass rather than have a fresh record appended to it.
  */
-export function verifyThreadDispositions(
-  threads: GitHubReviewThreadNode[],
-  historicalCommentIds?: Set<number>,
-  options?: { repo?: string | undefined },
-): number {
-  let verified = 0;
-  const fingerprintThreads = new Map<string, number>();
-
-  for (let threadIndex = 0; threadIndex < threads.length; threadIndex++) {
-    const thread = threads[threadIndex]!;
-    const { findingsV3, dispositionsV3, findingsV1, dispositionsV1 } =
-      threadProtocolRecords(thread, historicalCommentIds);
-
-    const groupedV3 = new Map<string, Array<[number, FindingV3Match]>>();
-    for (const [findingIndex, finding] of findingsV3) {
-      const fingerprint = finding.fingerprint;
-      const priorThread = fingerprintThreads.get(fingerprint);
-      if (priorThread !== undefined && priorThread !== threadIndex) {
-        fail('local-review fingerprint has duplicated root threads');
-      }
-      fingerprintThreads.set(fingerprint, threadIndex);
-      const list = groupedV3.get(fingerprint) ?? [];
-      list.push([findingIndex, finding]);
-      groupedV3.set(fingerprint, list);
-    }
-
-    for (const [fingerprint, occurrences] of groupedV3.entries()) {
-      const numbers = occurrences.map(([, finding]) => finding.occurrence);
-      const expectedNumbers = Array.from(
-        { length: numbers.length },
-        (_, i) => i + 1,
-      );
-      const isSequential =
-        numbers.length === expectedNumbers.length &&
-        numbers.every((v, i) => v === expectedNumbers[i]);
-      if (!isSequential) {
-        fail(
-          `local-review fingerprint ${fingerprint} occurrences are not sequential`,
-        );
-      }
-
-      for (let position = 0; position < occurrences.length - 1; position++) {
-        const [findingIndex, finding] = occurrences[position]!;
-        const matches = dispositionsV3.filter(
-          ([index, disposition]) =>
-            index > findingIndex &&
-            disposition.engine === finding.engine &&
-            disposition.round === finding.round &&
-            disposition.fingerprint === finding.fingerprint &&
-            disposition.occurrence === finding.occurrence,
-        );
-        const nextFindingIndex = occurrences[position + 1]![0];
-        if (matches.length !== 1 || matches[0]![0] >= nextFindingIndex) {
-          fail(
-            `local-review fingerprint ${fingerprint} recurrence is not sequentially disposed`,
-          );
-        }
-      }
-
-      const matchedOccurrences: Array<[FindingV3Match, DispositionV3Match]> =
-        [];
-      for (const [findingIndex, finding] of occurrences) {
-        const occurrenceMatches = matchingDispositions(
-          findingIndex,
-          finding,
-          dispositionsV3,
-        );
-        if (occurrenceMatches.length !== 1) {
-          fail('local-review finding lacks exactly one matching disposition');
-        }
-        matchedOccurrences.push([finding, occurrenceMatches[0]!]);
-      }
-
-      const [, latestDisposition] =
-        matchedOccurrences[matchedOccurrences.length - 1]!;
-      const [latestFinding] =
-        matchedOccurrences[matchedOccurrences.length - 1]!;
-      if (
-        latestFinding.severity === 'blocking' &&
-        latestDisposition.outcome !== 'fixed'
-      ) {
-        fail('blocking local-review findings must be fixed');
-      }
-
-      const priorUnfixedBlockers: number[] = [];
-      for (let pos = 0; pos < matchedOccurrences.length - 1; pos++) {
-        const [f, d] = matchedOccurrences[pos]!;
-        if (f.severity === 'blocking' && d.outcome !== 'fixed') {
-          priorUnfixedBlockers.push(pos);
-        }
-      }
-
-      if (priorUnfixedBlockers.length > 0) {
-        if (latestDisposition.outcome !== 'fixed') {
-          fail(
-            'an unfixed blocker must be cleared by a later fixed occurrence',
-          );
-        }
-        if (options?.repo) {
-          const start = priorUnfixedBlockers[priorUnfixedBlockers.length - 1]!;
-          for (let i = start; i < matchedOccurrences.length - 1; i++) {
-            verifyForwardTransition(
-              options.repo,
-              matchedOccurrences[i]![1].head,
-              matchedOccurrences[i + 1]![0].head,
-            );
-          }
-          verifyForwardTransition(
-            options.repo,
-            latestFinding.head,
-            latestDisposition.head,
-          );
-        }
-      }
-    }
-
-    const allFindings: Array<
-      [
-        number,
-        FindingV3Match | FindingV1Match,
-        Array<[number, DispositionV3Match | DispositionV1Match]>,
-      ]
-    > = [
-      ...findingsV3.map(
-        ([idx, f]) =>
-          [idx, f, dispositionsV3] as [
-            number,
-            FindingV3Match,
-            Array<[number, DispositionV3Match]>,
-          ],
-      ),
-      ...findingsV1.map(
-        ([idx, f]) =>
-          [idx, f, dispositionsV1] as [
-            number,
-            FindingV1Match,
-            Array<[number, DispositionV1Match]>,
-          ],
-      ),
-    ];
-
-    if (allFindings.length === 0) {
-      continue;
-    }
-    if (thread.isResolved !== true) {
-      fail('local-review thread is not resolved');
-    }
-
-    for (const [findingIndex, finding, disps] of allFindings) {
-      const findingMatches = matchingDispositions(findingIndex, finding, disps);
-      if (findingMatches.length !== 1) {
-        fail('local-review finding lacks exactly one matching disposition');
-      }
-    }
-
-    verified += 1;
+export function verifyHistoricalThreads(repo: string, pr: number): void {
+  for (const thread of reviewThreads(repo, pr)) {
+    threadProtocolRecords(thread);
   }
-
-  return verified;
 }
 
 /**
+ * Enforce the blocking rule on the latest occurrence of each fingerprint.
  *
+ * A fingerprint's occurrences are a sequential history of one root cause, so
+ * the highest occurrence is its current state. A blocking finding may not end
+ * deferred; when a later occurrence clears an earlier blocking deferral, the
+ * recurrence and its fix must form strict forward Git transitions.
  */
-export function sameRoundDispositions(
-  args: { engine: SupportedEngine; round: number; repo?: string | undefined },
-  threads: GitHubReviewThreadNode[],
-  allowedHeads: Record<string, number>,
-  historicalCommentIds?: Set<number>,
-): Array<[string, boolean, boolean, boolean]> {
-  const evidence = new Map<string, [boolean, boolean, boolean]>();
-  const fingerprintThreads = new Map<string, number>();
+export function verifyBlockingNotDeferred(
+  repo: string | undefined,
+  matched: Array<[FindingV3Match, DispositionV3Match]>,
+): void {
+  const grouped = new Map<
+    string,
+    Array<[number, FindingV3Match, DispositionV3Match]>
+  >();
+  for (const [finding, disposition] of matched) {
+    const list = grouped.get(finding.fingerprint) ?? [];
+    list.push([finding.occurrence, finding, disposition]);
+    grouped.set(finding.fingerprint, list);
+  }
 
-  for (let threadIndex = 0; threadIndex < threads.length; threadIndex++) {
-    const thread = threads[threadIndex]!;
+  for (const records of grouped.values()) {
+    records.sort((a, b) => a[0] - b[0]);
+    const [, finding, disposition] = records[records.length - 1]!;
+    if (finding.severity === 'blocking' && disposition.outcome === 'deferred') {
+      fail('blocking local-review findings cannot be deferred');
+    }
+
+    const priorBlockingDeferrals: number[] = [];
+    for (let index = 0; index < records.length - 1; index++) {
+      const [, priorFinding, priorDisposition] = records[index]!;
+      if (
+        priorFinding.severity === 'blocking' &&
+        priorDisposition.outcome === 'deferred'
+      ) {
+        priorBlockingDeferrals.push(index);
+      }
+    }
+    if (priorBlockingDeferrals.length === 0) {
+      continue;
+    }
+    if (disposition.outcome !== 'fixed') {
+      fail('a blocking deferral must be cleared by a later fixed occurrence');
+    }
+    if (repo === undefined) {
+      fail(
+        'clearing a blocking deferral requires a repository to verify against',
+      );
+    }
+    const start = priorBlockingDeferrals[priorBlockingDeferrals.length - 1]!;
+    for (let index = start; index < records.length - 1; index++) {
+      verifyForwardTransition(
+        repo,
+        records[index]![2].head,
+        records[index + 1]![1].head,
+      );
+    }
+    verifyForwardTransition(repo, finding.head, disposition.head);
+  }
+}
+
+/**
+ * Verify that every actor-owned finding thread on the PR is complete: scoped to
+ * this PR, resolved, topologically sound, and fully disposed.
+ *
+ * Returns the matched finding/disposition pairs.
+ */
+export function verifyThreadDispositions(
+  threads: GitHubReviewThreadNode[],
+  historicalCommentIds?: Set<number> | undefined,
+  options?: { repo?: string | undefined; pr?: number | undefined },
+): Array<[FindingV3Match, DispositionV3Match]> {
+  if (options?.repo !== undefined && options.pr !== undefined) {
+    assertThreadScope(threads, options.repo, options.pr);
+  }
+
+  const matched: Array<[FindingV3Match, DispositionV3Match]> = [];
+  const topology = new Map<
+    string,
+    Array<{ threadId: string; findingIndex: number; finding: FindingV3Match }>
+  >();
+
+  for (const thread of threads) {
     const { findingsV3, dispositionsV3 } = threadProtocolRecords(
       thread,
       historicalCommentIds,
     );
-
+    if (findingsV3.length === 0 && dispositionsV3.length === 0) {
+      continue;
+    }
+    if (findingsV3.length === 0) {
+      fail('local-review ledger contains a disposition without a finding');
+    }
+    if (typeof thread.id !== 'string' || !thread.id) {
+      fail('local-review finding thread has no stable identity');
+    }
     for (const [findingIndex, finding] of findingsV3) {
-      if (finding.engine !== args.engine || finding.round !== args.round) {
-        continue;
-      }
-      const fingerprint = finding.fingerprint;
-      const findingHead = finding.head;
-      const priorThread = fingerprintThreads.get(fingerprint);
-      if (priorThread !== undefined && priorThread !== threadIndex) {
-        fail('same-round finding fingerprint has duplicate root threads');
-      }
-      fingerprintThreads.set(fingerprint, threadIndex);
+      const list = topology.get(finding.fingerprint) ?? [];
+      list.push({ threadId: thread.id, findingIndex, finding });
+      topology.set(finding.fingerprint, list);
+    }
+    if (thread.isResolved !== true) {
+      fail(`local-review finding thread ${thread.id} is unresolved`);
+    }
+    matched.push(...pairDispositions(findingsV3, dispositionsV3));
+  }
 
-      if (!(findingHead in allowedHeads)) {
-        const historicalMatches = matchingDispositions(
-          findingIndex,
-          finding,
-          dispositionsV3,
-        );
-        if (thread.isResolved !== true || historicalMatches.length !== 1) {
-          fail(
-            'same-round finding outside the observed transition is not settled',
-          );
-        }
-        if (
-          finding.severity === 'blocking' &&
-          historicalMatches[0]!.outcome !== 'fixed'
-        ) {
-          fail('blocking local-review findings must be fixed');
-        }
-        const historicalDisposition = historicalMatches[0]!;
-        if (historicalDisposition.outcome === 'fixed') {
-          const dispositionHead = historicalDisposition.head;
-          if (dispositionHead === findingHead || !args.repo) {
-            fail('historical fixed disposition is not a forward transition');
-          }
-          const runner = getGitHubRunner();
-          const comparison = runner.gitCompare
-            ? (runner.gitCompare(
-                args.repo,
-                findingHead,
-                dispositionHead,
-              ) as Record<string, unknown>)
-            : jsonOutput<Record<string, unknown>>([
-                'api',
-                `repos/${args.repo}/compare/${findingHead}...${dispositionHead}`,
-              ]);
-          const mergeBase = comparison?.['merge_base_commit'] as
-            | { sha?: string }
-            | undefined;
-          if (
-            typeof comparison !== 'object' ||
-            comparison === null ||
-            comparison['status'] !== 'ahead' ||
-            typeof mergeBase !== 'object' ||
-            mergeBase === null ||
-            mergeBase.sha !== findingHead
-          ) {
-            fail('historical fixed disposition is not a forward transition');
-          }
-        }
-        continue;
-      }
-
-      const matches = dispositionsV3
-        .filter(([index, disposition]) => {
-          if (index <= findingIndex) return false;
-          if (disposition.engine !== finding.engine) return false;
-          if (disposition.round !== finding.round) return false;
-          if (disposition.fingerprint !== finding.fingerprint) return false;
-          if (disposition.occurrence !== finding.occurrence) return false;
-          if (!(disposition.head in allowedHeads)) return false;
-          const dispRank = allowedHeads[disposition.head]!;
-          const findRank = allowedHeads[findingHead]!;
-          if (dispRank < findRank) return false;
-          if (disposition.outcome === 'fixed' && dispRank <= findRank) {
-            return false;
-          }
-          return true;
-        })
-        .map(([, disposition]) => disposition);
-
-      if (thread.isResolved !== true || matches.length !== 1) {
-        fail('same-round finding lacks one resolved matching disposition');
-      }
-
-      const disposition = matches[0]!;
-      if (finding.severity === 'blocking' && disposition.outcome !== 'fixed') {
-        fail('blocking local-review findings must be fixed');
-      }
-
-      const fixed = disposition.outcome === 'fixed';
-      const fixedMajor =
-        fixed &&
-        (finding.severity === 'blocking' || finding.severity === 'major');
-      const fixedNonblocking = fixed && finding.severity !== 'blocking';
-
-      const prev = evidence.get(fingerprint) ?? [false, false, false];
-      evidence.set(fingerprint, [
-        prev[0] || fixed,
-        prev[1] || fixedMajor,
-        prev[2] || fixedNonblocking,
-      ]);
+  for (const records of topology.values()) {
+    const threadIds = new Set(records.map((record) => record.threadId));
+    const occurrences = records.map((record) => record.finding.occurrence);
+    const expected = records.map((_, index) => index + 1);
+    const roots = records.filter((record) => record.finding.occurrence === 1);
+    if (
+      threadIds.size !== 1 ||
+      occurrences.length !== expected.length ||
+      occurrences.some((value, index) => value !== expected[index]) ||
+      roots.length !== 1 ||
+      roots[0]!.findingIndex !== 0
+    ) {
+      fail('local-review fingerprint topology is invalid');
     }
   }
 
-  const sortedFingerprints = Array.from(evidence.keys()).sort();
-  return sortedFingerprints.map((fp) => [fp, ...evidence.get(fp)!]);
+  verifyBlockingNotDeferred(options?.repo, matched);
+  return matched;
 }
 
 /**
+ * Derive this round's fix evidence from the verified finding/disposition pairs.
  *
+ * Returns `[fingerprint, hasFix, hasMajorFix]` per fingerprint, sorted.
+ */
+export function sameRoundDispositions(
+  args: { engine: SupportedEngine; round: number; repo?: string | undefined },
+  matched: Array<[FindingV3Match, DispositionV3Match]>,
+  allowedHeads: Record<string, number>,
+): Array<[string, boolean, boolean]> {
+  const evidence = new Map<string, [boolean, boolean]>();
+
+  for (const [finding, disposition] of matched) {
+    if (finding.engine !== args.engine || finding.round !== args.round) {
+      continue;
+    }
+    const findingHead = finding.head;
+    const dispositionHead = disposition.head;
+    let findingPosition = Object.prototype.hasOwnProperty.call(
+      allowedHeads,
+      findingHead,
+    )
+      ? allowedHeads[findingHead]!
+      : undefined;
+
+    if (findingPosition === undefined) {
+      // A finding posted before the observed transition still counts if it was
+      // fixed inside it; anything else predates this round and is not evidence.
+      if (disposition.outcome !== 'fixed') {
+        continue;
+      }
+      if (dispositionHead === findingHead) {
+        fail('historical fixed disposition is not a forward transition');
+      }
+      if (args.repo === undefined) {
+        fail('historical fixed disposition is not a forward transition');
+      }
+      verifyForwardTransitionOrFail(
+        args.repo,
+        findingHead,
+        dispositionHead,
+        'historical fixed disposition is not a forward transition',
+      );
+      if (
+        !Object.prototype.hasOwnProperty.call(allowedHeads, dispositionHead)
+      ) {
+        continue;
+      }
+      findingPosition = -1;
+    }
+
+    if (disposition.outcome === 'fixed' && dispositionHead === findingHead) {
+      fail('fixed finding was not posted before its disposition head');
+    }
+    const dispositionPosition = Object.prototype.hasOwnProperty.call(
+      allowedHeads,
+      dispositionHead,
+    )
+      ? allowedHeads[dispositionHead]!
+      : undefined;
+    if (
+      dispositionPosition === undefined ||
+      dispositionPosition < findingPosition ||
+      (disposition.outcome === 'fixed' &&
+        dispositionPosition === findingPosition)
+    ) {
+      fail('same-round finding disposition is outside the observed transition');
+    }
+    if (finding.severity === 'blocking' && disposition.outcome !== 'fixed') {
+      fail('blocking local-review findings must be fixed');
+    }
+
+    const fixed = disposition.outcome === 'fixed';
+    const fixedMajor =
+      fixed &&
+      (finding.severity === 'blocking' || finding.severity === 'major');
+    const previous = evidence.get(finding.fingerprint) ?? [false, false];
+    evidence.set(finding.fingerprint, [
+      previous[0] || fixed,
+      previous[1] || fixedMajor,
+    ]);
+  }
+
+  return Array.from(evidence.keys())
+    .sort()
+    .map(
+      (fingerprint) =>
+        [fingerprint, ...evidence.get(fingerprint)!] as [
+          string,
+          boolean,
+          boolean,
+        ],
+    );
+}
+
+/**
+ * Derive the ordered set of heads the review transition is allowed to span.
+ */
+export function transitionHeads(params: {
+  repo: string;
+  before: string;
+  head: string;
+  resultHead?: string | undefined;
+  allowedHeadsFile?: string | undefined;
+}): Record<string, number> {
+  const target = resultHead(params);
+  if (params.allowedHeadsFile !== undefined) {
+    return loadAllowedHeads(
+      params.allowedHeadsFile,
+      params.before,
+      target,
+      params.repo,
+    );
+  }
+  if (params.before === target) {
+    return { [params.before]: 0 };
+  }
+  const runner = getGitHubRunner();
+  const list = runner.gitRevList
+    ? runner.gitRevList(params.before, target)
+    : execFileSync(
+        'git',
+        [
+          'rev-list',
+          '--reverse',
+          '--ancestry-path',
+          `${params.before}..${target}`,
+        ],
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+      )
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean);
+
+  const values = [params.before, ...list];
+  if (
+    values[values.length - 1] !== target ||
+    new Set(values).size !== values.length
+  ) {
+    fail('review result transition is not forward-only');
+  }
+  const heads: Record<string, number> = {};
+  values.forEach((value, index) => {
+    heads[value] = index;
+  });
+  return heads;
+}
+
+/**
+ * Verify that a review result is exactly backed by this round's ledger evidence.
  */
 export function verifyResultEvidence(
   args: {
+    repo: string;
+    pr: number;
     head: string;
     engine: SupportedEngine;
     round: number;
     base: string;
     before: string;
     resultHead?: string | undefined;
-    repo?: string | undefined;
+    allowedHeadsFile?: string | undefined;
   },
   threads: GitHubReviewThreadNode[],
   options?: {
@@ -525,33 +689,28 @@ export function verifyResultEvidence(
 ): LedgerResult {
   const data = options?.data ?? validateResultData(args);
   if (data.status !== 'clean' && data.status !== 'changed') {
-    fail('ledger result evidence requires a changed review result');
+    fail('ledger result evidence requires a clean or changed review result');
   }
 
-  const allowedHeads =
-    options?.allowedHeads ??
-    loadAllowedHeads(
-      (args as unknown as { allowedHeadsFile: string }).allowedHeadsFile,
-      args.before,
-      resultHead(args),
-      args.repo ?? '',
-    );
+  verifyReviewBase(args.repo, args.pr, args.base, args.before);
+  verifyGitTransition(args.before, resultHead(args), args.head);
 
-  const evidence = sameRoundDispositions(
-    args,
+  const matched = verifyThreadDispositions(
     threads,
-    allowedHeads,
     options?.historicalCommentIds,
+    { repo: args.repo, pr: args.pr },
   );
+  const allowedHeads = options?.allowedHeads ?? transitionHeads(args);
+  const evidence = sameRoundDispositions(args, matched, allowedHeads);
 
-  const evidenceFp = evidence.map(([fp]) => fp);
-  const dataFp = [...data.findingFingerprints].sort();
-  const fpsMatch =
-    evidenceFp.length === dataFp.length &&
-    evidenceFp.every((v, i) => v === dataFp[i]);
-  if (!fpsMatch) {
+  const evidenceFingerprints = evidence.map(([fingerprint]) => fingerprint);
+  const expected = [...data.findingFingerprints].sort();
+  if (
+    evidenceFingerprints.length !== expected.length ||
+    evidenceFingerprints.some((value, index) => value !== expected[index])
+  ) {
     fail(
-      'review result fingerprints do not exactly match same-round ledger evidence',
+      'review result fingerprints do not equal the complete same-round disposition set',
     );
   }
 
@@ -562,94 +721,49 @@ export function verifyResultEvidence(
     return data;
   }
 
-  if (args.round >= 3 && data.classification !== 'material') {
-    fail('round 3+ changed review results require material classification');
-  }
-
   if (evidence.length === 0) {
     fail('changed review results require ledger evidence');
   }
-
+  if (
+    evidence.some(([, , hasMajorFix]) => hasMajorFix) &&
+    data.classification !== 'material'
+  ) {
+    fail('fixed blocking or major findings require material classification');
+  }
   if (!evidence.some(([, hasFix]) => hasFix)) {
     fail('changed review results require a fixed ledger finding');
-  }
-
-  if (
-    args.round >= 3 &&
-    evidence.some(([, , , hasNonblockingFix]) => hasNonblockingFix)
-  ) {
-    fail('convergence review results cannot fix non-blocking findings');
-  }
-
-  const fixedMajor = evidence.some(([, , hasMajorFix]) => hasMajorFix);
-  if (fixedMajor && data.classification !== 'material') {
-    fail('fixed blocking or major findings require material classification');
   }
 
   return data;
 }
 
 /**
- *
+ * Derive and persist a review result from the verified ledger state.
  */
 export function writeResult(params: WriteResultParams): LedgerResult {
-  const threads = params.threadsFile
-    ? loadReviewThreads(params.threadsFile)
-    : fetchReviewThreads(params.repo ?? '', params.pr ?? 0);
-
+  const threads = reviewThreads(
+    params.repo,
+    params.pr,
+    params.threadsFile,
+    params.expectedThreadsSha256,
+  );
   const historicalCommentIds = loadHistoricalCommentIds(
     params.historicalCommentIdsFile,
   );
 
-  verifyThreadDispositions(threads, historicalCommentIds, {
+  const matched = verifyThreadDispositions(threads, historicalCommentIds, {
     repo: params.repo,
+    pr: params.pr,
   });
 
-  let allowedHeads: Record<string, number>;
-  if (params.allowedHeadsFile) {
-    allowedHeads = loadAllowedHeads(
-      params.allowedHeadsFile,
-      params.before,
-      params.head,
-      params.repo ?? '',
-    );
-  } else {
-    const runner = getGitHubRunner();
-    const list = runner.gitRevList
-      ? runner.gitRevList(params.before, params.head)
-      : execFileSync(
-          'git',
-          [
-            'rev-list',
-            '--reverse',
-            '--ancestry-path',
-            `${params.before}..${params.head}`,
-          ],
-          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
-        )
-          .trim()
-          .split(/\r?\n/)
-          .filter(Boolean);
+  const allowedHeads = transitionHeads({
+    repo: params.repo,
+    before: params.before,
+    head: params.head,
+    allowedHeadsFile: params.allowedHeadsFile,
+  });
 
-    const values = [params.before, ...list];
-    if (
-      values[values.length - 1] !== params.head ||
-      new Set(values).size !== values.length
-    ) {
-      fail('review result transition is not forward-only');
-    }
-    allowedHeads = {};
-    values.forEach((v, idx) => {
-      allowedHeads[v] = idx;
-    });
-  }
-
-  const dispositions = sameRoundDispositions(
-    params,
-    threads,
-    allowedHeads,
-    historicalCommentIds,
-  );
+  const dispositions = sameRoundDispositions(params, matched, allowedHeads);
 
   const changed = params.before !== params.head;
   if (!changed && dispositions.some(([, hasFix]) => hasFix)) {
@@ -676,13 +790,6 @@ export function writeResult(params: WriteResultParams): LedgerResult {
   }
   if (
     changed &&
-    params.round >= 3 &&
-    dispositions.some(([, , , hasNonblockingFix]) => hasNonblockingFix)
-  ) {
-    fail('convergence review results cannot fix non-blocking findings');
-  }
-  if (
-    changed &&
     params.classification !== 'material' &&
     dispositions.some(([, , hasMajorFix]) => hasMajorFix)
   ) {
@@ -698,7 +805,7 @@ export function writeResult(params: WriteResultParams): LedgerResult {
     beforeSha: params.before,
     afterSha: params.head,
     classification: changed ? params.classification : null,
-    findingFingerprints: dispositions.map(([fp]) => fp),
+    findingFingerprints: dispositions.map(([fingerprint]) => fingerprint),
     finalLaneComplete: true,
   };
 
@@ -710,7 +817,7 @@ export function writeResult(params: WriteResultParams): LedgerResult {
 }
 
 /**
- *
+ * Assert a finding anchor lands on a real line of the PR diff.
  */
 export function preflightAnchor(
   params: PreflightAnchorParams,
@@ -730,7 +837,7 @@ export function preflightAnchor(
 }
 
 /**
- *
+ * Post a new finding and verify it landed as written.
  */
 export function postFinding(params: PostFindingParams): PostFindingResult {
   let content = params.content;
@@ -784,7 +891,7 @@ export function postFinding(params: PostFindingParams): PostFindingResult {
   if (isV3) {
     const comments = getReviewComments(params.repo, params.pr);
     if (rowsHavePseudoV3(comments)) {
-      verifyPseudoV3History(fetchReviewThreads(params.repo, params.pr));
+      verifyHistoricalThreads(params.repo, params.pr);
     }
     const existing = findMatchingBody(
       comments as unknown as Array<Record<string, unknown>>,
@@ -847,7 +954,7 @@ export function postFinding(params: PostFindingParams): PostFindingResult {
 }
 
 /**
- *
+ * Reopen a fingerprint as a new occurrence on an existing thread.
  */
 export function reopenOccurrence(
   params: ReopenOccurrenceParams,
@@ -875,7 +982,7 @@ export function reopenOccurrence(
   verifyHead(params.repo, params.pr, params.head);
   const comments = getReviewComments(params.repo, params.pr);
   if (rowsHavePseudoV3(comments)) {
-    verifyPseudoV3History(fetchReviewThreads(params.repo, params.pr));
+    verifyHistoricalThreads(params.repo, params.pr);
   }
 
   const records = comments.filter((row) => {
@@ -967,7 +1074,7 @@ export function reopenOccurrence(
 }
 
 /**
- *
+ * Record the outcome of a finding and resolve its thread.
  */
 export function dispose(params: DisposeParams): DisposeResult {
   let content = params.content;
@@ -993,7 +1100,7 @@ export function dispose(params: DisposeParams): DisposeResult {
   verifyHead(params.repo, params.pr, params.head);
   const comments = getReviewComments(params.repo, params.pr);
   if (rowsHavePseudoV3(comments)) {
-    verifyPseudoV3History(fetchReviewThreads(params.repo, params.pr));
+    verifyHistoricalThreads(params.repo, params.pr);
   }
 
   const records = comments.filter((row) => {
@@ -1077,7 +1184,7 @@ export function dispose(params: DisposeParams): DisposeResult {
 }
 
 /**
- *
+ * Post a plain reply to an existing review comment.
  */
 export function reply(params: ReplyParams): {
   comment_id: number;
@@ -1105,7 +1212,7 @@ export function reply(params: ReplyParams): {
 }
 
 /**
- *
+ * Post a plain conversation comment on the PR.
  */
 export function postPrComment(params: PostPrCommentParams): {
   comment_id: number;
@@ -1128,11 +1235,12 @@ export function postPrComment(params: PostPrCommentParams): {
 }
 
 /**
- *
+ * Publish the round's completion marker once the ledger backs the result.
  */
 export function attest(params: AttestParams): AttestResult {
   const raw = readResultBytes(params.resultFile);
   const data = validateResultData(params, raw);
+  assertActor(params.actor);
   const resultHash = sha256Bytes(raw);
 
   if (
@@ -1146,24 +1254,17 @@ export function attest(params: AttestParams): AttestResult {
     fail('blocked review results cannot be attested as complete');
   }
 
-  const threads = loadReviewThreads(params.threadsFile!);
+  const threads = reviewThreads(
+    params.repo,
+    params.pr,
+    params.threadsFile,
+    params.expectedThreadsSha256,
+  );
   const historicalCommentIds = loadHistoricalCommentIds(
     params.historicalCommentIdsFile,
   );
 
-  verifyThreadDispositions(threads, historicalCommentIds, {
-    repo: params.repo,
-  });
-  verifyResultEvidence(params, threads, {
-    data,
-    historicalCommentIds,
-    allowedHeads: loadAllowedHeads(
-      params.allowedHeadsFile!,
-      params.before,
-      params.head,
-      params.repo,
-    ),
-  });
+  verifyResultEvidence(params, threads, { data, historicalCommentIds });
 
   let content: string;
   if (params.content !== undefined) {
@@ -1238,7 +1339,7 @@ export function attest(params: AttestParams): AttestResult {
 }
 
 /**
- *
+ * Resolve a single review thread.
  */
 export function resolve(params: ResolveParams): ResolveResult {
   verifyHead(params.repo, params.pr, params.head);
@@ -1248,7 +1349,7 @@ export function resolve(params: ResolveParams): ResolveResult {
 }
 
 /**
- *
+ * Resolve several review threads and report what changed.
  */
 export function resolveThreads(params: {
   repo: string;
@@ -1265,13 +1366,13 @@ export function resolveThreads(params: {
 }
 
 /**
- *
+ * Report the ledger state of one fingerprint and the next valid action.
  */
 export function reconcile(params: ReconcileParams): ReconcileResult {
   verifyHead(params.repo, params.pr, params.head);
   const comments = getReviewComments(params.repo, params.pr);
   if (rowsHavePseudoV3(comments)) {
-    verifyPseudoV3History(fetchReviewThreads(params.repo, params.pr));
+    verifyHistoricalThreads(params.repo, params.pr);
   }
 
   const findingRows: Array<Record<string, unknown>> = [];
@@ -1325,57 +1426,57 @@ export function reconcile(params: ReconcileParams): ReconcileResult {
 }
 
 /**
- *
+ * Verify the complete ledger state of a PR, optionally against a review result.
  */
 export function verifyLedger(params: VerifyLedgerParams): VerifyLedgerResult {
+  const actor = assertActor(params.actor);
   verifyHead(params.repo, params.pr, params.head);
-  const threads = loadReviewThreads(params.threadsFile!);
+
+  const threads = reviewThreads(
+    params.repo,
+    params.pr,
+    params.threadsFile,
+    params.expectedThreadsSha256,
+  );
   const historicalCommentIds = loadHistoricalCommentIds(
     params.historicalCommentIdsFile,
   );
-  const threadCount = verifyThreadDispositions(threads, historicalCommentIds, {
+  const matched = verifyThreadDispositions(threads, historicalCommentIds, {
     repo: params.repo,
+    pr: params.pr,
   });
 
-  let data: LedgerResult | null = null;
   if (params.resultFile !== undefined) {
     if (
       !params.engine ||
       params.round === undefined ||
       !params.base ||
-      !params.before ||
-      !params.allowedHeadsFile
+      !params.before
     ) {
       fail(
-        'verify-ledger result evidence requires --engine, --round, --base, --before, --result-file, and --allowed-heads-file',
+        'verify-ledger result evidence requires --engine, --round, --base, --before, and --result-file',
       );
     }
-    data = verifyResultEvidence(
+    verifyResultEvidence(
       {
+        repo: params.repo,
+        pr: params.pr,
         head: params.head,
         engine: params.engine,
         round: params.round,
         base: params.base,
         before: params.before,
         resultHead: params.resultHead,
-        repo: params.repo,
+        allowedHeadsFile: params.allowedHeadsFile,
       },
       threads,
-      {
-        allowedHeads: loadAllowedHeads(
-          params.allowedHeadsFile,
-          params.before,
-          resultHead({ head: params.head, resultHead: params.resultHead }),
-          params.repo,
-        ),
-        historicalCommentIds,
-      },
+      { historicalCommentIds },
     );
   }
 
-  return {
-    resultStatus: data ? data.status : null,
-    threadsVerified: threadCount,
-    verified: true,
-  };
+  // Re-check the head after verification: a head that moved mid-verification
+  // means the state just verified is no longer the state on the PR.
+  verifyHead(params.repo, params.pr, params.head);
+
+  return { actor, dispositions: matched.length, verified: true };
 }

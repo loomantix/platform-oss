@@ -129,6 +129,10 @@ export function buildDispositionBody(params: {
 
 /**
  * Match a protocol marker at the start of a body string and verify its content hash.
+ *
+ * The marker must be the first complete line of the body. Anything ahead of it
+ * would sit outside `content-sha256`, so accepting a marker at a later offset
+ * would leave part of an authenticated comment unhashed.
  */
 export function matchProtocol(
   body: string,
@@ -143,14 +147,34 @@ export function matchProtocol(
     fail(`authenticated ${marker} record is malformed`);
   }
   const matchEnd = match.index + match[0].length;
-  if (!body.slice(matchEnd).startsWith('\n')) {
-    fail(`authenticated ${marker} record is malformed`);
+  if (match.index !== 0 || !body.slice(matchEnd).startsWith('\n')) {
+    fail(`authenticated ${marker} record is not the first complete line`);
   }
   const content = body.slice(matchEnd + 1);
+  if (!content.trim()) {
+    fail(`authenticated ${marker} content is empty`);
+  }
   if (sha256Text(content) !== match.groups['content_sha']) {
     fail(`authenticated ${marker} record has an invalid content hash`);
   }
   return match;
+}
+
+/**
+ * Enforce the legacy v1 marker layout: first complete line, non-empty content.
+ */
+export function verifyV1Marker(
+  body: string,
+  match: RegExpExecArray,
+  label: string,
+): void {
+  const matchEnd = match.index + match[0].length;
+  if (match.index !== 0 || !body.slice(matchEnd).startsWith('\n')) {
+    fail(`actor-owned v1 ${label} marker is malformed`);
+  }
+  if (!body.slice(matchEnd + 1).trim()) {
+    fail(`actor-owned v1 ${label} content is empty`);
+  }
 }
 
 /**

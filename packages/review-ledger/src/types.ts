@@ -4,32 +4,32 @@
 export const PROTOCOL_VERSION = 3 as const;
 
 /**
- *
+ * A review engine that may own ledger records.
  */
 export type SupportedEngine = 'codex' | 'claude' | 'gemini' | 'antigravity';
 /**
- *
+ * How serious a finding is.
  */
 export type SupportedSeverity = 'blocking' | 'major' | 'minor' | 'nit';
 /**
- *
+ * How a finding was closed.
  */
 export type SupportedOutcome = 'fixed' | 'dismissed' | 'deferred';
 /**
- *
+ * The overall outcome of a review round.
  */
 export type SupportedStatus = 'clean' | 'changed' | 'blocked';
 /**
- *
+ * Whether a changed round counts as a material change.
  */
 export type SupportedClassification = 'minor' | 'material';
 /**
- *
+ * Which side of the diff an anchor refers to.
  */
 export type SupportedSide = 'RIGHT' | 'LEFT';
 
 /**
- *
+ * A finding as callers describe it, before it becomes a ledger record.
  */
 export interface ReviewFinding {
   path: string;
@@ -51,7 +51,7 @@ export interface ReviewFinding {
 }
 
 /**
- *
+ * The fields parsed out of a v3 finding marker.
  */
 export interface FindingV3Match {
   engine: SupportedEngine;
@@ -65,7 +65,7 @@ export interface FindingV3Match {
 }
 
 /**
- *
+ * The fields parsed out of a v3 disposition marker.
  */
 export interface DispositionV3Match {
   engine: SupportedEngine;
@@ -78,7 +78,7 @@ export interface DispositionV3Match {
 }
 
 /**
- *
+ * The fields parsed out of a legacy v1 finding marker.
  */
 export interface FindingV1Match {
   engine: SupportedEngine;
@@ -88,7 +88,7 @@ export interface FindingV1Match {
 }
 
 /**
- *
+ * The fields parsed out of a legacy v1 disposition marker.
  */
 export interface DispositionV1Match {
   engine: SupportedEngine;
@@ -99,7 +99,7 @@ export interface DispositionV1Match {
 }
 
 /**
- *
+ * The fields parsed out of a historical pseudo-v3 marker.
  */
 export interface PseudoV3Match {
   fingerprint: string;
@@ -107,7 +107,7 @@ export interface PseudoV3Match {
 }
 
 /**
- *
+ * The serialised outcome of one review round.
  */
 export interface LedgerResult {
   version: number;
@@ -126,7 +126,7 @@ export interface LedgerResult {
 }
 
 /**
- *
+ * The identity every result-producing command shares.
  */
 export interface BaseResultParams {
   head: string;
@@ -138,20 +138,21 @@ export interface BaseResultParams {
 }
 
 /**
- *
+ * Parameters for `writeResult`.
  */
 export interface WriteResultParams extends BaseResultParams {
-  repo?: string | undefined;
-  pr?: number | undefined;
+  repo: string;
+  pr: number;
   threadsFile?: string | undefined;
   allowedHeadsFile?: string | undefined;
+  expectedThreadsSha256?: string | undefined;
   actor?: string | undefined;
   historicalCommentIdsFile?: string | undefined;
   classification?: SupportedClassification | undefined;
 }
 
 /**
- *
+ * Parameters for `writeBlocked`.
  */
 export interface WriteBlockedParams extends BaseResultParams {
   blockerFile?: string | undefined;
@@ -159,14 +160,14 @@ export interface WriteBlockedParams extends BaseResultParams {
 }
 
 /**
- *
+ * Parameters for `validateResult`.
  */
 export interface ValidateResultParams extends BaseResultParams {
   resultHead?: string | undefined;
 }
 
 /**
- *
+ * Parameters for `preflightAnchor`.
  */
 export interface PreflightAnchorParams {
   repo: string;
@@ -179,7 +180,7 @@ export interface PreflightAnchorParams {
 }
 
 /**
- *
+ * The result of `preflightAnchor`.
  */
 export interface PreflightAnchorResult {
   anchor: string;
@@ -188,7 +189,7 @@ export interface PreflightAnchorResult {
 }
 
 /**
- *
+ * Parameters for `postFinding`.
  */
 export interface PostFindingParams {
   repo: string;
@@ -210,7 +211,7 @@ export interface PostFindingParams {
 }
 
 /**
- *
+ * The result of `postFinding`.
  */
 export interface PostFindingResult {
   comment_id: number;
@@ -219,7 +220,7 @@ export interface PostFindingResult {
 }
 
 /**
- *
+ * Parameters for `reopenOccurrence`.
  */
 export interface ReopenOccurrenceParams {
   repo: string;
@@ -238,7 +239,7 @@ export interface ReopenOccurrenceParams {
 }
 
 /**
- *
+ * The result of `reopenOccurrence`.
  */
 export interface ReopenOccurrenceResult {
   comment_id: number;
@@ -249,7 +250,7 @@ export interface ReopenOccurrenceResult {
 }
 
 /**
- *
+ * Parameters for `dispose`.
  */
 export interface DisposeParams {
   repo: string;
@@ -267,7 +268,7 @@ export interface DisposeParams {
 }
 
 /**
- *
+ * The result of `dispose`.
  */
 export interface DisposeResult {
   comment_id: number;
@@ -278,7 +279,7 @@ export interface DisposeResult {
 }
 
 /**
- *
+ * Parameters for `reply`.
  */
 export interface ReplyParams {
   repo: string;
@@ -290,7 +291,7 @@ export interface ReplyParams {
 }
 
 /**
- *
+ * Parameters for `postPrComment`.
  */
 export interface PostPrCommentParams {
   repo: string;
@@ -301,7 +302,7 @@ export interface PostPrCommentParams {
 }
 
 /**
- *
+ * Parameters for `attest`.
  */
 export interface AttestParams extends BaseResultParams {
   repo: string;
@@ -317,7 +318,7 @@ export interface AttestParams extends BaseResultParams {
 }
 
 /**
- *
+ * The result of `attest`.
  */
 export interface AttestResult {
   comment_id: number;
@@ -327,7 +328,7 @@ export interface AttestResult {
 }
 
 /**
- *
+ * Parameters for `resolve`.
  */
 export interface ResolveParams {
   repo: string;
@@ -337,7 +338,7 @@ export interface ResolveParams {
 }
 
 /**
- *
+ * The result of `resolve`.
  */
 export interface ResolveResult {
   thread_id: string;
@@ -345,7 +346,7 @@ export interface ResolveResult {
 }
 
 /**
- *
+ * Parameters for `reconcile`.
  */
 export interface ReconcileParams {
   repo: string;
@@ -355,7 +356,7 @@ export interface ReconcileParams {
 }
 
 /**
- *
+ * The result of `reconcile`.
  */
 export interface ReconcileResult {
   findings: Array<Record<string, unknown>>;
@@ -373,7 +374,7 @@ export interface ReconcileResult {
 }
 
 /**
- *
+ * Parameters for `verifyLedger`.
  */
 export interface VerifyLedgerParams {
   repo: string;
@@ -393,16 +394,16 @@ export interface VerifyLedgerParams {
 }
 
 /**
- *
+ * The result of `verifyLedger`.
  */
 export interface VerifyLedgerResult {
-  resultStatus: SupportedStatus | null;
-  threadsVerified: number;
+  actor: string;
+  dispositions: number;
   verified: true;
 }
 
 /**
- *
+ * The report returned by `threadResolution`.
  */
 export interface ThreadResolutionReport {
   verified: boolean;
@@ -411,14 +412,14 @@ export interface ThreadResolutionReport {
 }
 
 /**
- *
+ * The author identity GitHub returns on a comment.
  */
 export interface GitHubCommentAuthor {
   login: string;
 }
 
 /**
- *
+ * One comment inside a review thread.
  */
 export interface GitHubReviewCommentNode extends Record<string, unknown> {
   databaseId?: number | undefined;
@@ -433,11 +434,13 @@ export interface GitHubReviewCommentNode extends Record<string, unknown> {
 }
 
 /**
- *
+ * One review thread, with its PR scope and full comment list.
  */
 export interface GitHubReviewThreadNode {
   id: string;
   isResolved: boolean;
+  repository?: { nameWithOwner?: string } | null | undefined;
+  pullRequest?: { number?: number } | null | undefined;
   comments: {
     nodes: GitHubReviewCommentNode[];
     pageInfo: { hasNextPage: boolean; endCursor?: string | null | undefined };
@@ -445,11 +448,13 @@ export interface GitHubReviewThreadNode {
 }
 
 /**
- *
+ * The seam all GitHub and git access flows through.
  */
 export interface GitHubRunner {
   runGh(args: string[], payload?: unknown): string;
   currentActor?(): string;
   gitCompare?(repo: string, before: string, after: string): unknown;
   gitRevList?(before: string, head: string): string[];
+  runGit?(args: string[]): string;
+  isAncestor?(ancestor: string, descendant: string): boolean;
 }

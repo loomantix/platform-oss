@@ -120,9 +120,28 @@ review-ledger write-blocked-result \
 # Reconcile finding state
 review-ledger reconcile --repo owner/repo --pr 123 --head <sha> --fingerprint auth-token-leak
 
-# Verify complete thread ledger
-review-ledger verify-ledger --repo owner/repo --pr 123 --head <sha> --threads-file ./threads.json
+# Verify the complete thread ledger against live GitHub state
+review-ledger verify-ledger --repo owner/repo --pr 123 --head <sha>
+
+# ...or against a snapshot, which must be sealed by its own SHA-256 digest
+review-ledger verify-ledger --repo owner/repo --pr 123 --head <sha> \
+  --threads-file ./threads.json \
+  --expected-threads-sha256 "$(sha256sum ./threads.json | cut -d' ' -f1)"
 ```
+
+### Trust model
+
+Three inputs are assertions the ledger checks, never values it takes on trust:
+
+- `--actor` asserts who the authenticated GitHub session belongs to. It is
+  compared against the live `gh api user` login and fails on mismatch; it cannot
+  select whose comments count as actor-owned. `AGENT_LOOP_REVIEW_ACTOR` pins the
+  same identity for a whole relay.
+- `--threads-file` is offline evidence, so it must be sealed: pass
+  `--expected-threads-sha256` (or set `AGENT_LOOP_REVIEW_THREADS_SHA256`). An
+  unsealed snapshot is refused rather than read.
+- Every thread must carry the repository and PR number it came from, and must
+  match the `--repo` / `--pr` under review.
 
 ## Programmatic API
 
@@ -132,16 +151,9 @@ import {
   writeBlockedResult,
   readResult,
   formatFindings,
-  computeFindingFingerprint,
+  verifyLedger,
   reconcile,
 } from '@loomantix/review-ledger';
-
-// Generate a deterministic finding fingerprint
-const fingerprint = computeFindingFingerprint({
-  path: 'packages/logging/src/index.ts',
-  rootCause: 'Missing redaction on tenant ID',
-  lens: 'security-reviewer',
-});
 
 // Format findings table
 const markdown = formatFindings([
@@ -157,9 +169,24 @@ const markdown = formatFindings([
 
 ## Migration from `review-ledger.py`
 
-1. **Commands & Options**: All CLI flags match `review-ledger.py` exactly (`--repo`, `--pr`, `--head`, `--engine`, `--round`, `--fingerprint`, etc.).
-2. **Execution**: Replace `python3 .agents/skills/critique/scripts/review-ledger.py ...` with `review-ledger ...` or `npx @loomantix/review-ledger ...`.
-3. **No Python Runtime**: Node.js 18+ / 20+ / 22+ runtime is sufficient; zero external Python or pip dependencies required.
+The subcommands and flags mirror `review-ledger.py`, and the wire format —
+marker layout, content hashing, and every verification rule — is a direct port,
+so a ledger written by either implementation verifies under the other.
+
+1. **Execution**: replace `python3 <skill>/scripts/review-ledger.py ...` with
+   `review-ledger ...` or `npx @loomantix/review-ledger ...`. No Python runtime
+   is needed; Node.js 18+ is sufficient and there are no runtime dependencies.
+2. **Fingerprints are supplied, not derived.** As in the Python, a fingerprint
+   is a caller-chosen stable token for one root cause, passed as
+   `--fingerprint`. This package deliberately ships no fingerprint generator: an
+   engine-local hashing scheme would drift from the tokens already recorded on
+   open PRs and would not agree across engines.
+3. **Engine set.** This package accepts `codex`, `claude`, `gemini`, and
+   `antigravity`. `claude-platform`'s Python copy still accepts only `codex` and
+   `claude`, so a `gemini` or `antigravity` marker written here will not verify
+   there until that copy is updated. Sequence adoption accordingly.
+4. **`formatFindings` is additive**, with no counterpart in the Python. It is a
+   presentation helper and no verification path depends on its output.
 
 ## License
 

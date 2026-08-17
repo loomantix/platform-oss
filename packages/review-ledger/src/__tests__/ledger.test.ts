@@ -223,6 +223,8 @@ describe('ledger operations and workflow verification', () => {
       {
         id: threadId,
         isResolved: false,
+        repository: { nameWithOwner: 'loomantix/platform-oss' },
+        pullRequest: { number: 10 },
         comments: {
           nodes: [
             {
@@ -287,6 +289,8 @@ describe('ledger operations and workflow verification', () => {
       {
         id: 'PRRT_test',
         isResolved: false,
+        repository: { nameWithOwner: 'loomantix/platform-oss' },
+        pullRequest: { number: 10 },
         comments: { nodes: [], pageInfo: { hasNextPage: false } },
       },
     ];

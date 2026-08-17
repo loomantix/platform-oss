@@ -9,6 +9,14 @@ import type {
 
 export const PROTOCOL_VERSION = 3;
 
+/** Pins the authenticated GitHub actor for the lifetime of a review relay. */
+export const EXPECTED_ACTOR_ENV = 'AGENT_LOOP_REVIEW_ACTOR';
+/** Seals a review-thread snapshot so it cannot be edited after capture. */
+export const EXPECTED_THREADS_SHA256_ENV = 'AGENT_LOOP_REVIEW_THREADS_SHA256';
+/** Bounds the pseudo-v3 history a pass is allowed to treat as pre-existing. */
+export const HISTORICAL_COMMENT_IDS_ENV =
+  'AGENT_LOOP_REVIEW_HISTORICAL_COMMENT_IDS_FILE';
+
 export const SUPPORTED_ENGINES: readonly SupportedEngine[] = [
   'codex',
   'claude',
@@ -51,6 +59,15 @@ export const HUNK_WITH_LEFT_RE =
 export const SHA_RE = /^[0-9a-f]{40}$/;
 export const SHA_64_RE = /^[0-9a-f]{64}$/;
 export const TOKEN_RE = /^[A-Za-z0-9._:/-]+$/;
+
+/**
+ * Matches the first line of any comment that presents itself as a local-review
+ * record. Used to reject markers that are malformed or from an unsupported
+ * protocol version rather than silently ignoring them.
+ */
+export const PROTOCOL_THREAD_MARKER_RE = /^<!--[ \t]*local-review(?=[: \t-])/;
+export const LEGACY_THREAD_MARKER_RE =
+  /^<!--[ \t]*local-review(?:-disposition)?:v1(?=[ \t]|-->)/;
 
 export const FINDING_V1 = '<!-- local-review:v1 ';
 export const DISPOSITION_V1 = '<!-- local-review-disposition:v1 ';

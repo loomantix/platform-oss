@@ -18,17 +18,16 @@ export {
   DISPOSITION_V3_RE,
   FINDING_V1_RE,
   DISPOSITION_V1_RE,
+  PROTOCOL_THREAD_MARKER_RE,
+  LEGACY_THREAD_MARKER_RE,
+  EXPECTED_ACTOR_ENV,
+  EXPECTED_THREADS_SHA256_ENV,
+  HISTORICAL_COMMENT_IDS_ENV,
 } from './constants.js';
 
 export { LedgerError, fail } from './errors.js';
 
-export {
-  sha256Text,
-  sha256Bytes,
-  requireToken,
-  requireSha,
-  computeFindingFingerprint,
-} from './hash.js';
+export { sha256Text, sha256Bytes, requireToken, requireSha } from './hash.js';
 
 export { parseDiffLines, validateAnchor, type DiffLines } from './diff.js';
 
@@ -39,6 +38,7 @@ export {
   buildFindingBody,
   buildDispositionBody,
   matchProtocol,
+  verifyV1Marker,
   matchPseudoV3,
   matchFinding,
   matchDisposition,
@@ -57,9 +57,14 @@ export {
 export {
   threadProtocolRecords,
   matchingDispositions,
+  pairDispositions,
   verifyForwardTransition,
+  verifyForwardTransitionOrFail,
+  verifyHistoricalThreads,
+  verifyBlockingNotDeferred,
   verifyThreadDispositions,
   sameRoundDispositions,
+  transitionHeads,
   verifyResultEvidence,
   writeResult,
   preflightAnchor,
@@ -83,6 +88,7 @@ export {
   runGh,
   jsonOutput,
   currentActor,
+  assertActor,
   setCurrentActor,
   authenticatedRows,
   verifyHead,
@@ -97,7 +103,14 @@ export {
   getThreadState,
   setThreadState,
   loadReviewThreads,
+  parseReviewThreadPages,
   fetchReviewThreads,
+  reviewThreads,
+  assertThreadScope,
+  runGit,
+  isAncestor,
+  verifyReviewBase,
+  verifyGitTransition,
   loadHistoricalCommentIds,
   verifyPseudoV3History,
   loadAllowedHeads,

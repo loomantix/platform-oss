@@ -173,7 +173,7 @@ jobs:
           const expected = {
             main: './dist/index.js',
             types: './dist/index.d.ts',
-            bin: './dist/cli.js',
+            bin: './dist/bin.js',
             defaultExport: './dist/index.js',
             defaultTypes: './dist/index.d.ts',
             importExport: './dist/index.js',

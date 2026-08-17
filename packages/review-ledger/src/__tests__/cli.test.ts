@@ -17,19 +17,13 @@ describe('CLI command parser and execution', () => {
     expect(() => runCli([])).toThrowError(/subcommand required/);
   });
 
-  it('computes fingerprint via CLI', () => {
-    const stdoutSpy = vi
-      .spyOn(process.stdout, 'write')
-      .mockImplementation(() => true);
-    const code = runCli([
-      'compute-fingerprint',
-      '--path',
-      'src/index.ts',
-      '--message',
-      'test issue',
-    ]);
-    expect(code).toBe(0);
-    expect(stdoutSpy).toHaveBeenCalled();
-    stdoutSpy.mockRestore();
+  it('rejects an unknown subcommand', () => {
+    expect(() => runCli(['not-a-command'])).toThrowError(/unknown command/);
+  });
+
+  it('rejects verify-ledger without its required arguments', () => {
+    expect(() => runCli(['verify-ledger', '--repo', 'a/b'])).toThrowError(
+      /verify-ledger requires --repo, --pr, and --head/,
+    );
   });
 });

@@ -35,28 +35,3 @@ export function requireSha(value: string, name: string): string {
   }
   return value;
 }
-
-/**
- * Compute a deterministic SHA-256 finding fingerprint from normalized path and root cause / message.
- *
- * Normalizes repository-relative path (forward slashes, no leading/trailing slashes)
- * and defect description, excluding round, engine, line number, or commit SHA.
- */
-export function computeFindingFingerprint(params: {
-  path: string;
-  rootCause?: string | undefined;
-  message?: string | undefined;
-  lens?: string | undefined;
-  rule?: string | undefined;
-}): string {
-  const normalizedPath = params.path
-    .trim()
-    .replace(/\\/g, '/')
-    .replace(/^\/+/, '');
-  const description = (params.rootCause ?? params.message ?? params.rule ?? '')
-    .trim()
-    .replace(/\s+/g, ' ');
-  const lens = params.lens ? params.lens.trim() : '';
-  const payload = [normalizedPath, lens, description].filter(Boolean).join(':');
-  return sha256Text(payload);
-}

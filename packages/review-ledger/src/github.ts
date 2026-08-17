@@ -2,8 +2,16 @@ import { execFileSync } from 'node:child_process';
 import { lstatSync, readFileSync } from 'node:fs';
 import { fail, LedgerError } from './errors.js';
 import { matchFinding, matchProtocol, matchPseudoV3 } from './protocol.js';
-import { FINDING_V3_RE, PSEUDO_V3_RE, SHA_RE } from './constants.js';
-import { requireToken } from './hash.js';
+import {
+  EXPECTED_ACTOR_ENV,
+  EXPECTED_THREADS_SHA256_ENV,
+  HISTORICAL_COMMENT_IDS_ENV,
+  FINDING_V3_RE,
+  PSEUDO_V3_RE,
+  SHA_64_RE,
+  SHA_RE,
+} from './constants.js';
+import { requireToken, sha256Bytes } from './hash.js';
 import type {
   GitHubReviewCommentNode,
   GitHubReviewThreadNode,
@@ -13,7 +21,7 @@ import type {
 let defaultActor: string | null = null;
 
 /**
- *
+ * Default runner: shells out to `gh` and `git`.
  */
 export class DefaultGitHubRunner implements GitHubRunner {
   private actor: string | null = null;
@@ -86,26 +94,58 @@ export class DefaultGitHubRunner implements GitHubRunner {
       fail('could not derive the forward review transition');
     }
   }
+
+  runGit(args: string[]): string {
+    try {
+      return execFileSync('git', args, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error: unknown) {
+      const execError = error as { stderr?: string };
+      const detail = execError.stderr?.trim() || 'no diagnostic returned';
+      fail(`Git operation failed: ${detail}`);
+    }
+  }
+
+  isAncestor(ancestor: string, descendant: string): boolean {
+    try {
+      execFileSync(
+        'git',
+        ['merge-base', '--is-ancestor', ancestor, descendant],
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      return true;
+    } catch (error: unknown) {
+      // git exits 1 for "not an ancestor" and >1 for a real failure.
+      const execError = error as { status?: number; stderr?: string };
+      if (execError.status === 1) {
+        return false;
+      }
+      const detail = execError.stderr?.trim() || 'no diagnostic returned';
+      fail(`Git ancestry check failed: ${detail}`);
+    }
+  }
 }
 
 let activeRunner: GitHubRunner = new DefaultGitHubRunner();
 
 /**
- *
+ * Return the runner all GitHub and git access flows through.
  */
 export function getGitHubRunner(): GitHubRunner {
   return activeRunner;
 }
 
 /**
- *
+ * Replace the active runner. Test seam.
  */
 export function setGitHubRunner(runner: GitHubRunner): void {
   activeRunner = runner;
 }
 
 /**
- *
+ * Restore the default runner and clear any cached actor.
  */
 export function resetGitHubRunner(actor?: string): void {
   defaultActor = actor ?? null;
@@ -113,14 +153,14 @@ export function resetGitHubRunner(actor?: string): void {
 }
 
 /**
- *
+ * Invoke `gh` through the active runner, optionally with a JSON body.
  */
 export function runGh(args: string[], payload?: unknown): string {
   return activeRunner.runGh(args, payload);
 }
 
 /**
- *
+ * Invoke `gh` and parse its stdout as JSON.
  */
 export function jsonOutput<T = unknown>(args: string[], payload?: unknown): T {
   const raw = runGh(args, payload);
@@ -132,24 +172,54 @@ export function jsonOutput<T = unknown>(args: string[], payload?: unknown): T {
 }
 
 /**
- *
+ * Resolve the authenticated GitHub login, honouring the actor pin.
  */
 export function currentActor(): string {
+  let login: string;
   if (activeRunner.currentActor) {
-    return activeRunner.currentActor();
-  }
-  if (defaultActor === null) {
-    const actor = runGh(['api', 'user', '--jq', '.login']).trim();
-    if (!actor) {
-      fail('could not resolve the authenticated GitHub actor');
+    login = activeRunner.currentActor();
+  } else {
+    if (defaultActor === null) {
+      const actor = runGh(['api', 'user', '--jq', '.login']).trim();
+      if (!actor) {
+        fail('could not resolve the authenticated GitHub actor');
+      }
+      defaultActor = actor;
     }
-    defaultActor = actor;
+    login = defaultActor;
   }
-  return defaultActor;
+  if (!login) {
+    fail('GitHub returned an empty authenticated user');
+  }
+  const expected = process.env[EXPECTED_ACTOR_ENV];
+  if (expected && login !== expected) {
+    fail(
+      `authenticated GitHub actor changed: expected ${expected}, found ${login}`,
+    );
+  }
+  return login;
 }
 
 /**
+ * Resolve the live authenticated actor and assert it is the one the caller expected.
  *
+ * `expected` is an assertion, never an override: comment ownership is the root
+ * of the protocol's trust, so it is always resolved from the authenticated
+ * GitHub session and a caller-supplied value can only narrow it, never set it.
+ */
+export function assertActor(expected?: string | undefined): string {
+  const actor = currentActor();
+  if (expected !== undefined && requireToken(expected, 'actor') !== actor) {
+    fail(
+      `authenticated GitHub actor changed: expected ${expected}, found ${actor}`,
+    );
+  }
+  return actor;
+}
+
+/**
+ * Seed the actor cache. Test seam only — callers must not use this to choose
+ * whose comments count as actor-owned.
  */
 export function setCurrentActor(actor: string | null): void {
   defaultActor = actor ? requireToken(actor, 'actor') : null;
@@ -159,7 +229,7 @@ export function setCurrentActor(actor: string | null): void {
 }
 
 /**
- *
+ * Keep only the rows authored by the authenticated actor.
  */
 export function authenticatedRows<T extends Record<string, unknown>>(
   rows: T[],
@@ -179,7 +249,7 @@ export function authenticatedRows<T extends Record<string, unknown>>(
 }
 
 /**
- *
+ * Assert the PR's live head is the commit the caller is acting on.
  */
 export function verifyHead(
   repo: string,
@@ -204,6 +274,82 @@ export function verifyHead(
   }
 }
 
+/**
+ * Run a local git command through the active runner.
+ */
+export function runGit(args: string[]): string {
+  const runner = getGitHubRunner();
+  if (!runner.runGit) {
+    fail('Git operations are unavailable in the active runner');
+  }
+  return runner.runGit(args);
+}
+
+/**
+ * Report whether `ancestor` is an ancestor of `descendant` in the local clone.
+ */
+export function isAncestor(ancestor: string, descendant: string): boolean {
+  const runner = getGitHubRunner();
+  if (!runner.isAncestor) {
+    fail('Git operations are unavailable in the active runner');
+  }
+  return runner.isAncestor(ancestor, descendant);
+}
+
+/**
+ * Bind the attested review base to the PR's real base and to local history.
+ */
+export function verifyReviewBase(
+  repo: string,
+  pr: number,
+  base: string,
+  before: string,
+): void {
+  const resolved = runGit(['rev-parse', '--verify', `${base}^{commit}`]).trim();
+  if (resolved !== base) {
+    fail('review base did not resolve to the supplied commit');
+  }
+  if (!isAncestor(base, before)) {
+    fail('review base is not an ancestor of beforeSha');
+  }
+  const prBase = runGh([
+    'pr',
+    'view',
+    String(pr),
+    '--repo',
+    repo,
+    '--json',
+    'baseRefOid',
+    '--jq',
+    '.baseRefOid',
+  ]).trim();
+  if (prBase !== base) {
+    fail(`PR base mismatch: expected ${base}, found ${prBase || '<empty>'}`);
+  }
+}
+
+/**
+ * Bind the attested transition to the local checkout and the live PR head.
+ */
+export function verifyGitTransition(
+  before: string,
+  resultHead: string,
+  liveHead: string,
+): void {
+  const localHead = runGit(['rev-parse', 'HEAD']).trim();
+  if (localHead !== liveHead) {
+    fail(
+      `local HEAD mismatch: expected ${liveHead}, found ${localHead || '<empty>'}`,
+    );
+  }
+  if (!isAncestor(before, resultHead)) {
+    fail('review result rewrites or does not descend from beforeSha');
+  }
+  if (!isAncestor(resultHead, liveHead)) {
+    fail('review result head is not an ancestor of the live head');
+  }
+}
+
 function flattenPages<T>(value: unknown, label: string): T[] {
   if (!Array.isArray(value)) {
     fail(`GitHub ${label} response has an unexpected shape`);
@@ -224,7 +370,7 @@ function flattenPages<T>(value: unknown, label: string): T[] {
 }
 
 /**
- *
+ * Fetch every changed file on the PR with its unified diff patch.
  */
 export function getPrFiles(
   repo: string,
@@ -251,7 +397,7 @@ export function getPrFiles(
 }
 
 /**
- *
+ * Fetch every review (inline) comment on the PR.
  */
 export function getReviewComments(
   repo: string,
@@ -268,7 +414,7 @@ export function getReviewComments(
 }
 
 /**
- *
+ * Fetch every issue (conversation) comment on the PR.
  */
 export function getIssueComments(
   repo: string,
@@ -285,7 +431,7 @@ export function getIssueComments(
 }
 
 /**
- *
+ * Assert a review comment still has the expected author and body.
  */
 export function verifyComment(
   repo: string,
@@ -312,7 +458,7 @@ export function verifyComment(
 }
 
 /**
- *
+ * Assert an issue comment still has the expected author and body.
  */
 export function verifyIssueComment(
   repo: string,
@@ -339,7 +485,7 @@ export function verifyIssueComment(
 }
 
 /**
- *
+ * Extract the comment id from a create-comment response.
  */
 export function getPostedCommentId(response: unknown): number {
   if (
@@ -353,7 +499,7 @@ export function getPostedCommentId(response: unknown): number {
 }
 
 /**
- *
+ * Find an existing comment with an identical marker and body.
  */
 export function findMatchingBody(
   rows: Array<Record<string, unknown>>,
@@ -377,7 +523,7 @@ export function findMatchingBody(
 }
 
 /**
- *
+ * Post an inline review comment, recovering an identical prior post.
  */
 export function postReviewComment(
   repo: string,
@@ -450,7 +596,7 @@ export function postReviewComment(
 }
 
 /**
- *
+ * Report whether a review thread is currently resolved.
  */
 export function getThreadState(threadId: string, commentId?: number): boolean {
   const query = `
@@ -516,7 +662,7 @@ query($threadId: ID!) {
 }
 
 /**
- *
+ * Resolve or unresolve a review thread and confirm the new state.
  */
 export function setThreadState(
   threadId: string,
@@ -583,57 +729,54 @@ mutation($threadId: ID!) {
 }
 
 /**
- *
+ * Validate a paginated review-thread response and flatten it to threads.
  */
-export function loadReviewThreads(pathValue: string): GitHubReviewThreadNode[] {
-  try {
-    const stat = lstatSync(pathValue);
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      fail('review threads must be a regular non-symlink file');
-    }
-  } catch (err) {
-    if (err instanceof LedgerError) throw err;
-    fail('review threads must be a regular non-symlink file');
+export function parseReviewThreadPages(
+  pages: unknown,
+): GitHubReviewThreadNode[] {
+  if (!Array.isArray(pages)) {
+    fail('GitHub review-thread response has an unexpected shape');
   }
-
-  let pages: unknown;
-  try {
-    pages = JSON.parse(readFileSync(pathValue, 'utf8'));
-  } catch (error) {
-    throw new LedgerError('review threads must contain valid UTF-8 JSON', {
-      cause: error,
-    });
-  }
-
-  if (!Array.isArray(pages) || pages.length === 0) {
-    fail('review threads response has an unexpected shape');
+  if (pages.length === 0) {
+    fail('GitHub review-thread response is empty');
   }
 
   const threads: GitHubReviewThreadNode[] = [];
-  for (const page of pages as Array<{
-    errors?: unknown;
-    data?: {
-      repository?: {
-        pullRequest?: {
-          reviewThreads?: {
-            nodes?: unknown;
-            pageInfo?: { hasNextPage?: unknown };
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+    const page = pages[pageIndex] as {
+      errors?: unknown;
+      data?: {
+        repository?: {
+          pullRequest?: {
+            reviewThreads?: {
+              nodes?: unknown;
+              pageInfo?: { hasNextPage?: unknown; endCursor?: unknown };
+            };
           };
         };
       };
     };
-  }>) {
     if (typeof page !== 'object' || page === null || page.errors) {
-      fail('GitHub review threads response contains errors');
+      fail('GitHub review-thread response is incomplete');
     }
     const connection = page.data?.repository?.pullRequest?.reviewThreads;
     if (
       !connection ||
       !Array.isArray(connection.nodes) ||
       typeof connection.pageInfo !== 'object' ||
-      typeof connection.pageInfo.hasNextPage !== 'boolean'
+      connection.pageInfo === null
     ) {
-      fail('GitHub review threads response has an unexpected shape');
+      fail('GitHub review-thread nodes have an unexpected shape');
+    }
+    // Every page but the last must declare a further page, and the last must
+    // declare none: that is what proves the capture is the complete thread set
+    // rather than a truncated prefix of it.
+    const expectedMore = pageIndex < pages.length - 1;
+    if (connection.pageInfo.hasNextPage !== expectedMore) {
+      fail('GitHub review-thread pagination is incomplete');
+    }
+    if (expectedMore && typeof connection.pageInfo.endCursor !== 'string') {
+      fail('GitHub review-thread pagination omitted its cursor');
     }
     for (const thread of connection.nodes as Array<{
       comments?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown } };
@@ -646,35 +789,106 @@ export function loadReviewThreads(pathValue: string): GitHubReviewThreadNode[] {
         !comments ||
         !Array.isArray(comments.nodes) ||
         typeof comments.pageInfo !== 'object' ||
+        comments.pageInfo === null ||
         comments.pageInfo.hasNextPage !== false
       ) {
-        fail('GitHub review thread comments are incomplete');
+        fail('GitHub review-thread comments are incomplete');
       }
       threads.push(thread as unknown as GitHubReviewThreadNode);
     }
-  }
-
-  const lastPage = pages[pages.length - 1] as {
-    data?: {
-      repository?: {
-        pullRequest?: {
-          reviewThreads?: { pageInfo?: { hasNextPage?: unknown } };
-        };
-      };
-    };
-  };
-  if (
-    lastPage?.data?.repository?.pullRequest?.reviewThreads?.pageInfo
-      ?.hasNextPage !== false
-  ) {
-    fail('GitHub review thread pages are incomplete');
   }
 
   return threads;
 }
 
 /**
+ * Load a review-thread snapshot from disk, refusing any snapshot that is not
+ * sealed by a SHA-256 digest supplied out of band.
  *
+ * A snapshot is offline evidence: without the seal, anything that reads one is
+ * trusting a file the caller could have written itself.
+ */
+export function loadReviewThreads(
+  pathValue: string,
+  expectedDigest?: string | undefined,
+): GitHubReviewThreadNode[] {
+  try {
+    const stat = lstatSync(pathValue);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      fail('review-thread snapshot must be a regular non-symlink file');
+    }
+  } catch (err) {
+    if (err instanceof LedgerError) throw err;
+    fail('review-thread snapshot must be a regular non-symlink file');
+  }
+
+  const digest = expectedDigest ?? process.env[EXPECTED_THREADS_SHA256_ENV];
+  if (digest === undefined || !SHA_64_RE.test(digest)) {
+    fail('review-thread snapshot requires a sealed SHA-256 digest');
+  }
+
+  const raw = readFileSync(pathValue);
+  if (sha256Bytes(raw) !== digest) {
+    fail('review-thread snapshot changed after it was sealed');
+  }
+
+  let pages: unknown;
+  try {
+    pages = JSON.parse(raw.toString('utf8'));
+  } catch (error) {
+    throw new LedgerError(
+      'review-thread snapshot must contain valid UTF-8 JSON',
+      { cause: error },
+    );
+  }
+
+  return parseReviewThreadPages(pages);
+}
+
+/**
+ * Assert every thread belongs to the requested repository and pull request.
+ */
+export function assertThreadScope(
+  threads: GitHubReviewThreadNode[],
+  repo: string,
+  pr: number,
+): void {
+  for (const thread of threads) {
+    const repository = thread.repository;
+    const pullRequest = thread.pullRequest;
+    if (
+      typeof repository !== 'object' ||
+      repository === null ||
+      repository.nameWithOwner !== repo ||
+      typeof pullRequest !== 'object' ||
+      pullRequest === null ||
+      pullRequest.number !== pr
+    ) {
+      fail('GitHub returned a review thread outside the requested PR');
+    }
+  }
+}
+
+/**
+ * Resolve review threads either live from GitHub or from a sealed snapshot,
+ * then assert they are all scoped to the requested PR.
+ */
+export function reviewThreads(
+  repo: string,
+  pr: number,
+  threadsFile?: string | undefined,
+  expectedDigest?: string | undefined,
+): GitHubReviewThreadNode[] {
+  const threads =
+    threadsFile === undefined
+      ? fetchReviewThreads(repo, pr)
+      : loadReviewThreads(threadsFile, expectedDigest);
+  assertThreadScope(threads, repo, pr);
+  return threads;
+}
+
+/**
+ * Fetch every review thread on a PR, with its PR scope attached.
  */
 export function fetchReviewThreads(
   repo: string,
@@ -685,6 +899,8 @@ export function fetchReviewThreads(
     fail('--repo must be OWNER/REPO');
   }
   const [owner, name] = parts;
+  // repository/pullRequest are selected per thread so the caller can prove each
+  // thread belongs to the PR under review, not just that GitHub returned it.
   const query = `
 query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
   repository(owner:$owner, name:$name) {
@@ -693,6 +909,8 @@ query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
         nodes {
           id
           isResolved
+          repository { nameWithOwner }
+          pullRequest { number }
           comments(first:100) {
             nodes { databaseId body author { login } }
             pageInfo { hasNextPage }
@@ -720,81 +938,21 @@ query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
     `number=${pr}`,
   ]);
 
-  if (!Array.isArray(pages) || pages.length === 0) {
-    fail('GitHub review-thread response has an unexpected shape');
-  }
-
-  const threads: GitHubReviewThreadNode[] = [];
-  for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
-    const page = pages[pageIndex] as {
-      errors?: unknown;
-      data?: {
-        repository?: {
-          pullRequest?: {
-            reviewThreads?: {
-              nodes?: unknown;
-              pageInfo?: { hasNextPage?: unknown; endCursor?: unknown };
-            };
-          };
-        };
-      };
-    };
-
-    if (typeof page !== 'object' || page === null || page.errors) {
-      fail('GitHub review-thread response is incomplete');
-    }
-
-    const connection = page.data?.repository?.pullRequest?.reviewThreads;
-    const nodes = connection?.nodes;
-    const pageInfo = connection?.pageInfo;
-
-    if (
-      !Array.isArray(nodes) ||
-      typeof pageInfo !== 'object' ||
-      pageInfo === null
-    ) {
-      fail('GitHub review-thread nodes have an unexpected shape');
-    }
-
-    const expectedMore = pageIndex < pages.length - 1;
-    if (pageInfo.hasNextPage !== expectedMore) {
-      fail('GitHub review-thread pagination is incomplete');
-    }
-    if (expectedMore && typeof pageInfo.endCursor !== 'string') {
-      fail('GitHub review-thread pagination omitted its cursor');
-    }
-
-    for (const thread of nodes as Array<{
-      comments?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown } };
-    }>) {
-      if (typeof thread !== 'object' || thread === null) {
-        fail('GitHub review thread has an unexpected shape');
-      }
-      const comments = thread.comments;
-      if (
-        typeof comments !== 'object' ||
-        comments === null ||
-        !Array.isArray(comments.nodes) ||
-        typeof comments.pageInfo !== 'object' ||
-        comments.pageInfo.hasNextPage !== false
-      ) {
-        fail('GitHub review-thread comments are incomplete');
-      }
-      threads.push(thread as unknown as GitHubReviewThreadNode);
-    }
-  }
-
-  return threads;
+  return parseReviewThreadPages(pages);
 }
 
 /**
- *
+ * Load the set of comment ids a pass may treat as pre-existing history.
  */
-export function loadHistoricalCommentIds(pathValue?: string): Set<number> {
-  const finalPath =
-    pathValue || process.env['AGENT_LOOP_REVIEW_HISTORICAL_COMMENT_IDS_FILE'];
+export function loadHistoricalCommentIds(
+  pathValue?: string,
+): Set<number> | undefined {
+  const finalPath = pathValue || process.env[HISTORICAL_COMMENT_IDS_ENV];
   if (!finalPath) {
-    return new Set();
+    // Undefined means "no bound was declared", which disables the check.
+    // An empty Set means "a bound was declared and it is empty", which
+    // rejects every historical record -- the two must not be conflated.
+    return undefined;
   }
   try {
     const stat = lstatSync(finalPath);
@@ -830,7 +988,7 @@ export function loadHistoricalCommentIds(pathValue?: string): Set<number> {
 }
 
 /**
- *
+ * Assert every historical v3 record is settled, owned, and in-bounds.
  */
 export function verifyPseudoV3History(
   threads: GitHubReviewThreadNode[],
@@ -870,9 +1028,9 @@ export function verifyPseudoV3History(
         continue;
       }
       if (
-        historicalCommentIds &&
-        row.databaseId !== undefined &&
-        !historicalCommentIds.has(row.databaseId)
+        historicalCommentIds !== undefined &&
+        (typeof row.databaseId !== 'number' ||
+          !historicalCommentIds.has(row.databaseId))
       ) {
         fail(
           'historical local-review:v3 finding was not captured before the current pass',
@@ -903,7 +1061,7 @@ export function verifyPseudoV3History(
 }
 
 /**
- *
+ * Load and forward-verify the head sequence a transition may span.
  */
 export function loadAllowedHeads(
   path: string,
@@ -977,7 +1135,7 @@ export function loadAllowedHeads(
 }
 
 /**
- *
+ * Report whether any row carries a historical pseudo-v3 marker.
  */
 export function rowsHavePseudoV3(rows: Array<{ body?: unknown }>): boolean {
   return rows.some((row) => PSEUDO_V3_RE.test(String(row.body ?? '')));

@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * CLI interface for @loomantix/review-ledger.
  * Create, reconcile, and disposition deterministic local-review ledger entries.
@@ -14,7 +13,7 @@ import {
   SUPPORTED_SIDES,
 } from './constants.js';
 import { fail, LedgerError } from './errors.js';
-import { computeFindingFingerprint, requireSha } from './hash.js';
+import { requireSha } from './hash.js';
 import {
   attest,
   dispose,
@@ -30,7 +29,7 @@ import {
 } from './ledger.js';
 import { readResult, validateResult, writeBlockedResult } from './result.js';
 import { formatFindings } from './format.js';
-import { resetGitHubRunner, setCurrentActor } from './github.js';
+import { resetGitHubRunner } from './github.js';
 import type {
   ReviewFinding,
   SupportedClassification,
@@ -308,19 +307,18 @@ function validateArgs(args: CliArgs): void {
       'base',
       'before',
       'resultFile',
-      'allowedHeadsFile',
     ];
     const present = resultFields.map((f) => args[f] !== undefined);
     if (present.some(Boolean) && !present.every(Boolean)) {
       fail(
-        'verify-ledger result evidence requires --engine, --round, --base, --before, --result-file, and --allowed-heads-file',
+        'verify-ledger result evidence requires --engine, --round, --base, --before, and --result-file',
       );
     }
   }
 }
 
 /**
- *
+ * Parse argv, dispatch the requested subcommand, and return an exit code.
  */
 export function runCli(argv: string[] = process.argv.slice(2)): number {
   resetGitHubRunner();
@@ -332,10 +330,6 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
   }
 
   validateArgs(args);
-
-  if (args.actor) {
-    setCurrentActor(args.actor);
-  }
 
   switch (args.command) {
     case 'preflight-anchor': {
@@ -539,6 +533,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         pr: args.pr,
         threadsFile: args.threadsFile,
         allowedHeadsFile: args.allowedHeadsFile,
+        expectedThreadsSha256: args.expectedThreadsSha256,
         actor: args.actor,
         historicalCommentIdsFile: args.historicalCommentIdsFile,
         classification: args.classification,
@@ -589,12 +584,11 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         args.round === undefined ||
         !args.base ||
         !args.before ||
-        !args.resultFile ||
-        !args.threadsFile ||
-        !args.allowedHeadsFile ||
-        !args.expectedResultSha256
+        !args.resultFile
       ) {
-        fail('attest missing required arguments');
+        fail(
+          'attest requires --repo, --pr, --head, --engine, --round, --base, --before, and --result-file',
+        );
       }
       const out = attest({
         repo: args.repo,
@@ -653,13 +647,8 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
       break;
     }
     case 'verify-ledger': {
-      if (
-        !args.repo ||
-        args.pr === undefined ||
-        !args.head ||
-        !args.threadsFile
-      ) {
-        fail('verify-ledger requires --repo, --pr, --head, and --threads-file');
+      if (!args.repo || args.pr === undefined || !args.head) {
+        fail('verify-ledger requires --repo, --pr, and --head');
       }
       const out = verifyLedger({
         repo: args.repo,
@@ -705,42 +694,9 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
       process.stdout.write(formatted + '\n');
       break;
     }
-    case 'compute-fingerprint': {
-      if (!args.path) {
-        fail('compute-fingerprint requires --path');
-      }
-      const fp = computeFindingFingerprint({
-        path: args.path,
-        message: args.message,
-        rootCause: args.rootCause,
-        rule: args.rule,
-        lens: args.lens,
-      });
-      process.stdout.write(`${fp}\n`);
-      break;
-    }
     default:
       fail(`unknown command: ${args.command}`);
   }
 
   return 0;
-}
-
-if (
-  process.argv[1] &&
-  (process.argv[1].endsWith('/cli.js') ||
-    process.argv[1].endsWith('/cli.ts') ||
-    process.argv[1].endsWith('/review-ledger') ||
-    process.argv[1].includes('review-ledger'))
-) {
-  try {
-    const exitCode = runCli();
-    if (exitCode !== 0) {
-      process.exit(exitCode);
-    }
-  } catch (error: unknown) {
-    const err = error as { message?: string };
-    process.stderr.write(`review-ledger: ${err.message ?? String(error)}\n`);
-    process.exit(1);
-  }
 }
