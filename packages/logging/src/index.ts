@@ -13,7 +13,9 @@ export {
 export {
   CENSOR,
   MAX_REDACT_DEPTH,
+  MAX_REDACT_NODES,
   REDACTED_FIELD_NAMES,
+  type RedactOptions,
   redactTree,
   sanitizeUrl,
 } from './redaction';

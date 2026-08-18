@@ -96,12 +96,116 @@ describe('redactTree', () => {
 
   it('leaves opaque values intact', () => {
     const date = new Date(0);
-    const err = new Error('boom');
     const buf = Buffer.from('abc');
-    const out: any = redactTree({ date, err, buf });
+    const re = /x/g;
+    const out: any = redactTree({ date, buf, re });
     expect(out.date).toBe(date);
-    expect(out.err).toBe(err);
     expect(out.buf).toBe(buf);
+    expect(out.re).toBe(re);
+  });
+
+  it('redacts an error instead of passing it through', () => {
+    // An error is not opaque: HTTP clients hang the entire failed request off
+    // one, so skipping it published the bearer token and the transcript.
+    const err: any = new Error('Request failed');
+    err.config = { headers: { Authorization: 'Bearer SECRET_BEARER_abc123' } };
+    err.response = { data: { transcript: 'Patient reports chest pain.' } };
+
+    const out: any = (redactTree({ err }) as any).err;
+    expect(out.type).toBe('Error');
+    expect(out.message).toBe('Request failed');
+    expect(out.stack).toContain('Request failed');
+    expect(out.config.headers.Authorization).toBe(CENSOR);
+    expect(out.response.data.transcript).toBe(CENSOR);
+    expect(JSON.stringify(out)).not.toContain('SECRET_BEARER_abc123');
+    expect(JSON.stringify(out)).not.toContain('chest pain');
+  });
+
+  it('matches a field name in any case or separator style', () => {
+    // PascalCase is what .NET and most EMR vendor APIs emit. Matching only the
+    // exact spelling and its all-lowercase form covered `ssn` but missed every
+    // camelCase entry, because `'PatientId'.toLowerCase()` is not `patientId`.
+    const out: any = redactTree({
+      PatientId: 'P-1',
+      SoapNote: 'note body',
+      ApiKey: 'k-1',
+      DateOfBirth: '1975-01-01',
+      AudioFileUrl: 's3://bucket/key.wav',
+      'MEDICAL-RECORD-NUMBER': 'MRN-1',
+      encounterId: 'e-1',
+    });
+    for (const key of [
+      'PatientId',
+      'SoapNote',
+      'ApiKey',
+      'DateOfBirth',
+      'AudioFileUrl',
+      'MEDICAL-RECORD-NUMBER',
+    ]) {
+      expect(out[key], key).toBe(CENSOR);
+    }
+    // A name that is not on the list still survives — the correlation id a
+    // caller is told to log instead of `patientId`.
+    expect(out.encounterId).toBe('e-1');
+  });
+
+  it('bounds total work on a shared-reference graph', () => {
+    // Twelve objects, each fanning out eight ways to the next. The visited set
+    // is path-scoped (so a DAG node is censored on every path), which means
+    // this is 8^12 visits without a budget — enough to pin the event loop.
+    let node: any = { leaf: 1 };
+    for (let i = 0; i < 12; i++) {
+      const parent: any = {};
+      for (let k = 0; k < 8; k++) parent['k' + k] = node;
+      node = parent;
+    }
+    const started = Date.now();
+    redactTree({ payload: node });
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('censors a node whose getter throws instead of propagating', () => {
+    // `Object.entries` invokes getters and `formatters.log` runs outside
+    // pino's error handling, so a throwing accessor would escape the
+    // `logger.info()` call and crash the caller.
+    const evil: Record<string, unknown> = { sibling: 'kept' };
+    Object.defineProperty(evil, 'boom', {
+      enumerable: true,
+      get() {
+        throw new Error('getter blew up');
+      },
+    });
+    const out: any = redactTree({ evil, other: 'kept' });
+    expect(out.evil).toBe('[REDACTED: unreadable]');
+    // Failure is contained to the unreadable node.
+    expect(out.other).toBe('kept');
+  });
+
+  it('passes root keys named in skipRootKeys through by reference', () => {
+    // pino runs `formatters.log` before its serializers, so the walker would
+    // otherwise clone the live `req`/`res` and strip the prototype methods and
+    // getters those serializers call.
+    class Live {
+      deep: unknown;
+      constructor(deep: unknown) {
+        this.deep = deep;
+      }
+      getHeaders() {
+        return { 'content-type': 'application/json' };
+      }
+    }
+    let deep: any = { end: 1 };
+    for (let i = 0; i < MAX_REDACT_DEPTH + 2; i++) deep = { nest: deep };
+    const res = new Live(deep);
+
+    const out: any = redactTree(
+      { res, ssn: '111-22-3333' },
+      { skipRootKeys: new Set(['res']) },
+    );
+    expect(out.res).toBe(res);
+    expect(typeof out.res.getHeaders).toBe('function');
+    // Skipping is scoped to the named root keys, not the whole entry.
+    expect(out.ssn).toBe(CENSOR);
   });
 
   it('does not let a __proto__ key reparent the result', () => {

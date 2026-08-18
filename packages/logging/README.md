@@ -94,11 +94,21 @@ Sink errors are caught — they never affect the logging pipeline.
 
 1. **`formatters.log`** walks each entry and replaces the value of any field
    named in `REDACTED_FIELD_NAMES` with `[REDACTED]`, **at every depth** —
-   including inside arrays. That set is built from `PHI_FIELD_NAMES` plus auth
-   headers, `snake_case` spellings, and query-string signing parameters.
+   including inside arrays and inside errors. That set is built from
+   `PHI_FIELD_NAMES` plus auth headers and query-string signing parameters.
+   Names are matched ignoring case and `_`/`-`, so one entry covers
+   `patientId`, `PatientId` and `patient_id`.
 2. **`redact.paths`** is derived from the same set and covers the root and
    depth 1. It is a backstop for consumers who spread this config and replace
-   `formatters`.
+   `formatters`, and it is the only layer that reaches `logger.child()`
+   bindings (see below).
+
+The `req` / `res` / `err` keys are walked **inside their serializers** rather
+than by `formatters.log`. pino runs `formatters.log` _before_ its serializers,
+so the walk would otherwise receive your live framework objects instead of the
+plain shapes the serializers produce — and rebuilding a live object keeps only
+its own enumerable properties, dropping the prototype accessors those
+serializers read.
 
 Two consequences worth knowing before you upgrade:
 
@@ -109,10 +119,27 @@ Two consequences worth knowing before you upgrade:
   `patient` / `content` / `text` / `notes`.
 - `req.url` and `referer` keep their path but have sensitive query-parameter
   **values** replaced, so `/api/e?token=abc&page=2` logs as
-  `/api/e?token=[REDACTED]&page=2`.
+  `/api/e?token=[REDACTED]&page=2`. Credentials in a `user:pass@` prefix are
+  censored too.
 
 Redaction never mutates the object you logged, and an unchanged payload is
-returned by reference, so the clean path costs a walk and no allocation.
+returned by reference, so the clean path costs a walk and no allocation. It
+fails closed in three places: past `MAX_REDACT_DEPTH`, past `MAX_REDACT_NODES`
+visited nodes, and on any property whose getter throws.
+
+#### Child bindings are only covered to depth 1
+
+pino renders `logger.child()` bindings once at `child()` time and resets any
+custom `formatters.bindings` to its own before doing so, so no config-level
+hook can walk them — `redact.paths` is the only layer and it stops at depth 1.
+If you bind untrusted data to a child logger, walk it yourself first with the
+same pass:
+
+```typescript
+import { redactTree } from '@loomantix/logging';
+
+const scoped = logger.child(redactTree(bindings) as pino.Bindings);
+```
 
 This is still a best-effort, name-based defense: a sensitive value logged
 under a novel key, or interpolated into the `msg` string, is passed through.

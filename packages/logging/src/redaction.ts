@@ -21,6 +21,35 @@ export const MAX_REDACT_DEPTH = 12;
 const DEPTH_CENSOR = '[REDACTED: max depth]';
 
 /**
+ * Maximum number of object nodes a single {@link redactTree} call will visit.
+ *
+ * The visited set is scoped to the *current path* (see the `finally` in
+ * `redactNode`) so that a node reachable by two different paths is censored on
+ * both. The cost of that correctness is that a shared subtree is re-walked
+ * once per path reaching it, which is `fan^depth` work for a payload holding
+ * only `depth` distinct objects — twelve objects fanning out eight ways reach
+ * ~7e10 visits and pin the event loop. The depth cap bounds how *deep* the
+ * walk goes, not how *much* work it does; this bounds the work.
+ *
+ * Ten thousand nodes is far past any legitimate log payload, so hitting it
+ * means the same thing hitting the depth cap does, and it fails closed the
+ * same way.
+ */
+export const MAX_REDACT_NODES = 10_000;
+
+const BUDGET_CENSOR = '[REDACTED: too large]';
+
+/**
+ * Written in place of a node whose properties could not be read.
+ *
+ * `Object.entries` invokes getters, and `formatters.log` runs outside any of
+ * pino's error handling — an accessor that throws would otherwise escape the
+ * `logger.info()` call and crash the caller. pino on its own tolerates such a
+ * payload, so the walker must too.
+ */
+const UNREADABLE_CENSOR = '[REDACTED: unreadable]';
+
+/**
  * Written in place of a back-reference.
  *
  * It has to be a marker, not the original object: returning the original hands
@@ -76,27 +105,47 @@ export const REDACTED_FIELD_NAMES: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
- * Query-string parameters whose *values* are censored by {@link sanitizeUrl}.
- * Matched case-insensitively against {@link REDACTED_FIELD_NAMES}.
+ * Collapse a field name to a case- and separator-insensitive form, so one
+ * entry in {@link REDACTED_FIELD_NAMES} covers every spelling of it.
+ *
+ * `patientId`, `PatientId`, `patient_id` and `PATIENT-ID` are the same field
+ * wearing four different house styles, and a healthcare backend meets all of
+ * them: PascalCase is what .NET and most EMR vendor APIs emit. Matching only
+ * the exact spelling and its all-lowercase form (which is what this did
+ * before) covers single words like `ssn` but silently misses every camelCase
+ * name in the list, because `'PatientId'.toLowerCase()` is `patientid` and
+ * the set holds `patientId`.
  */
+function normalizeName(name: string): string {
+  return name.toLowerCase().replace(/[_-]/g, '');
+}
+
+const NORMALIZED_FIELD_NAMES: ReadonlySet<string> = new Set(
+  [...REDACTED_FIELD_NAMES].map(normalizeName),
+);
+
+/** True when `name` names a field whose value must never be logged. */
 function isSensitiveName(name: string): boolean {
   return (
     REDACTED_FIELD_NAMES.has(name) ||
-    REDACTED_FIELD_NAMES.has(name.toLowerCase())
+    NORMALIZED_FIELD_NAMES.has(normalizeName(name))
   );
 }
 
 /**
  * Values that are objects but must be handed to the serializer untouched.
  *
- * Walking into them would either lose information (an `Error`'s non-enumerable
- * `stack`, a `Date`'s valueOf) or produce a nonsense clone (a `Buffer` becomes
- * `{0: 12, 1: 45, ...}`). None of them can carry a named field, so skipping
- * them costs no coverage.
+ * Walking into them would either lose information (a `Date`'s valueOf) or
+ * produce a nonsense clone (a `Buffer` becomes `{0: 12, 1: 45, ...}`). None of
+ * them can carry a named field, so skipping them costs no coverage.
+ *
+ * `Error` is deliberately *not* here. An error is a bag of arbitrary
+ * application data in practice — an HTTP client attaches the whole failed
+ * request to it — and skipping it published `config.headers.Authorization`
+ * and `response.data.transcript` in cleartext. See {@link redactError}.
  */
 function isOpaque(value: object): boolean {
   return (
-    value instanceof Error ||
     value instanceof Date ||
     value instanceof RegExp ||
     value instanceof Map ||
@@ -131,6 +180,46 @@ function safeAssign(
   out[key] = value;
 }
 
+/** Mutable state threaded through one {@link redactTree} walk. */
+interface WalkState {
+  /**
+   * Objects on the *current path*, released on the way out so a value
+   * legitimately reachable by two different paths (a shared config object) is
+   * redacted on both, not skipped on the second.
+   */
+  seen: WeakSet<object>;
+  /** Remaining node visits; see {@link MAX_REDACT_NODES}. */
+  budget: number;
+  /** Root-level keys to pass through untouched; see {@link RedactOptions}. */
+  skipRootKeys?: ReadonlySet<string> | undefined;
+}
+
+/** Options accepted by {@link redactTree}. */
+export interface RedactOptions {
+  /**
+   * Root-level keys handed through by reference instead of being walked.
+   *
+   * This exists for pino's serializers. `formatters.log` runs *before* them
+   * (pino `lib/tools.js`: `obj = formatters.log(obj)`, then the per-key
+   * `serializers[key](value)` loop), so without this the walker receives the
+   * live `req` / `res` / `err` objects rather than the plain shapes their
+   * serializers produce — and walking a live framework object destroys it.
+   *
+   * The walk builds its output with `Object.entries` and plain assignment, so
+   * it keeps only *own enumerable* properties. Methods and getters live on the
+   * prototype and do not survive. Because a real `req` / `res` graph is deeper
+   * than {@link MAX_REDACT_DEPTH}, the fail-closed depth marker always makes
+   * the walk report a change, which always forces that lossy clone: `res`
+   * arrived at its serializer without `getHeaders` (a `TypeError` on every
+   * response log) and `req` without its `headers` / `ip` / `query` accessors
+   * (empty headers and no client address in every request log).
+   *
+   * Serializers redact their own output instead — plain objects, walked with
+   * no live prototype to lose.
+   */
+  skipRootKeys?: ReadonlySet<string> | undefined;
+}
+
 /**
  * Recursively censor every {@link REDACTED_FIELD_NAMES} field at any depth.
  *
@@ -144,34 +233,75 @@ function safeAssign(
  * one this fixes. Unchanged subtrees are returned by reference, so a clean
  * payload costs a walk and no allocation.
  */
-export function redactTree(value: unknown): unknown {
-  return redactNode(value, 0, new WeakSet<object>());
+export function redactTree(value: unknown, options?: RedactOptions): unknown {
+  return redactNode(value, 0, {
+    seen: new WeakSet<object>(),
+    budget: MAX_REDACT_NODES,
+    skipRootKeys: options?.skipRootKeys,
+  });
 }
 
-function redactNode(
-  value: unknown,
+/**
+ * Rebuild an `Error` as a plain, redacted object.
+ *
+ * Errors carry arbitrary application data: an HTTP client hangs the entire
+ * failed request off one, so `err.config.headers.Authorization` and
+ * `err.response.data.transcript` are ordinary contents, not exotic ones.
+ * Passing errors through untouched published both in cleartext.
+ *
+ * `name` / `message` / `stack` are non-enumerable, so they have to be copied
+ * across explicitly or the result is the `{}` that `JSON.stringify` gives for
+ * a bare error. The shape matches `pino.stdSerializers.err` so a nested error
+ * reads the same as a top-level one.
+ */
+function redactError(
+  error: Error,
   depth: number,
-  seen: WeakSet<object>,
-): unknown {
+  state: WalkState,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    type: error.name,
+    message: error.message,
+    stack: error.stack,
+  };
+  for (const [key, item] of Object.entries(error)) {
+    if (isSensitiveName(key)) {
+      safeAssign(out, key, CENSOR);
+      continue;
+    }
+    safeAssign(out, key, redactNode(item, depth + 1, state));
+  }
+  return out;
+}
+
+function redactNode(value: unknown, depth: number, state: WalkState): unknown {
   if (value === null || typeof value !== 'object') {
     return value;
   }
   if (isOpaque(value)) {
     return value;
   }
-  if (seen.has(value)) {
+  if (state.seen.has(value)) {
     return CIRCULAR;
   }
   if (depth >= MAX_REDACT_DEPTH) {
     return DEPTH_CENSOR;
   }
-  seen.add(value);
+  if (state.budget <= 0) {
+    return BUDGET_CENSOR;
+  }
+  state.budget -= 1;
+  state.seen.add(value);
 
   try {
+    if (value instanceof Error) {
+      return redactError(value, depth, state);
+    }
+
     if (Array.isArray(value)) {
       let changed = false;
       const out = value.map((item) => {
-        const next = redactNode(item, depth + 1, seen);
+        const next = redactNode(item, depth + 1, state);
         if (next !== item) changed = true;
         return next;
       });
@@ -180,23 +310,63 @@ function redactNode(
 
     let changed = false;
     const out: Record<string, unknown> = {};
+    // `Object.entries` invokes getters, so this whole block is inside the
+    // `catch` below: an accessor that throws must not escape `logger.info()`.
     for (const [key, item] of Object.entries(value)) {
+      if (depth === 0 && state.skipRootKeys?.has(key)) {
+        safeAssign(out, key, item);
+        continue;
+      }
       if (isSensitiveName(key)) {
         safeAssign(out, key, CENSOR);
         changed = true;
         continue;
       }
-      const next = redactNode(item, depth + 1, seen);
+      const next = redactNode(item, depth + 1, state);
       if (next !== item) changed = true;
       safeAssign(out, key, next);
     }
     return changed ? out : value;
+  } catch {
+    return UNREADABLE_CENSOR;
   } finally {
-    // Release on the way out so a value legitimately reachable by two
-    // different paths (a shared config object, an interned string wrapper)
-    // is redacted on both, not skipped on the second.
-    seen.delete(value);
+    state.seen.delete(value);
   }
+}
+
+/**
+ * Censor `user:pass@` credentials embedded in an absolute URL.
+ *
+ * Matters because {@link sanitizeUrl} is applied to `referer`, which arrives
+ * as a full absolute URL rather than a path.
+ */
+function stripUserinfo(path: string): string {
+  return path.replace(/^([A-Za-z][\w+.-]*:\/\/)[^/@]*@/, `$1${CENSOR}@`);
+}
+
+/**
+ * Judge a raw (still percent-encoded) query parameter name.
+ *
+ * Array and nested syntax (`token[]`, `filters[token]`) is what `qs`, Rails
+ * and PHP emit, and it hides the name from a plain set lookup, so the
+ * bracketed form is unwrapped and checked too.
+ */
+function isSensitiveParam(rawName: string): boolean {
+  let name: string;
+  try {
+    name = decodeURIComponent(rawName);
+  } catch {
+    // Malformed percent-encoding — judge the raw name rather than throwing
+    // and losing the whole URL.
+    name = rawName;
+  }
+  if (isSensitiveName(name)) {
+    return true;
+  }
+  const unwrapped = name.endsWith('[]')
+    ? name.slice(0, -2)
+    : /^[^[]*\[([^\]]+)\]$/.exec(name)?.[1];
+  return unwrapped !== undefined && isSensitiveName(unwrapped);
 }
 
 /**
@@ -217,31 +387,28 @@ export function sanitizeUrl(url: unknown): unknown {
   // client-supplied string and its contents are unvetted. Drop it.
   const withoutHash = hashAt === -1 ? url : url.slice(0, hashAt);
   const queryAt = withoutHash.indexOf('?');
+
+  const path = stripUserinfo(
+    queryAt === -1 ? withoutHash : withoutHash.slice(0, queryAt),
+  );
   if (queryAt === -1) {
-    return withoutHash;
+    return path;
   }
 
-  const path = withoutHash.slice(0, queryAt);
   const rawQuery = withoutHash.slice(queryAt + 1);
   if (rawQuery.length === 0) {
     return path;
   }
 
-  const parts = rawQuery.split('&').map((pair) => {
-    if (pair.length === 0) return pair;
-    const eq = pair.indexOf('=');
-    if (eq === -1) return pair;
-    const name = pair.slice(0, eq);
-    let decodedName: string;
-    try {
-      decodedName = decodeURIComponent(name);
-    } catch {
-      // Malformed percent-encoding — judge the raw name rather than throwing
-      // and losing the whole URL.
-      decodedName = name;
-    }
-    return isSensitiveName(decodedName) ? `${name}=${CENSOR}` : pair;
+  // Capturing the separator keeps `;`-delimited pairs — legal, and still
+  // emitted by older stacks — from being treated as one opaque parameter.
+  const parts = rawQuery.split(/([&;])/).map((piece) => {
+    if (piece.length === 0 || piece === '&' || piece === ';') return piece;
+    const eq = piece.indexOf('=');
+    if (eq === -1) return piece;
+    const name = piece.slice(0, eq);
+    return isSensitiveParam(name) ? `${name}=${CENSOR}` : piece;
   });
 
-  return `${path}?${parts.join('&')}`;
+  return `${path}?${parts.join('')}`;
 }

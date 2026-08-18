@@ -14,8 +14,10 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import http from 'node:http';
 import pino, { Logger } from 'pino';
 import { createPinoConfig } from './pino.config';
+import { redactTree } from './redaction';
 
 /** Minimal pino destination that captures emitted log lines in memory. */
 function bufferDestination(): {
@@ -317,5 +319,130 @@ describe('pino.config — security regressions', () => {
     cyclic.self = cyclic;
     expect(() => captured.logger.info(cyclic)).not.toThrow();
     expect(JSON.stringify(captured.lines[0]!)).not.toContain('111-22-3333');
+  });
+});
+
+describe('pino.config — live framework objects', () => {
+  let captured: { logger: Logger; lines: Array<Record<string, unknown>> };
+
+  beforeEach(() => {
+    captured = bufferDestination();
+  });
+
+  /**
+   * `formatters.log` runs *before* pino's serializers, so anything it walks is
+   * the caller's live object rather than a serialized shape. The walk keeps
+   * only own enumerable properties, and a real `req`/`res` graph is deeper
+   * than the depth cap — which made the walk always report a change and always
+   * return a plain clone with the prototype stripped off.
+   *
+   * These run against a real Node server so the objects have the accessors a
+   * plain test fixture does not.
+   */
+  function withLiveExchange(
+    assert: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        try {
+          assert(req, res);
+        } catch (error) {
+          reject(error);
+        } finally {
+          res.end('ok');
+          server.close(() => resolve());
+        }
+      });
+      server.listen(0, () => {
+        const port = (server.address() as { port: number }).port;
+        http
+          .get(
+            {
+              port,
+              path: '/api/v1/enc?token=SECRET_BEARER_abc123&page=2',
+              headers: {
+                cookie: 'session=abc',
+                authorization: 'Bearer SECRET_BEARER_abc123',
+                'user-agent': 'vitest',
+                'x-forwarded-for': '203.0.113.7',
+              },
+            },
+            (response) => response.resume(),
+          )
+          .on('error', reject);
+      });
+    });
+  }
+
+  it('logs a live response without throwing', async () => {
+    // `res.getHeaders` lives on the prototype, so a cloned `res` arrived at
+    // the serializer without it: `TypeError: res.getHeaders is not a function`
+    // on every response log.
+    await withLiveExchange((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      expect(() => captured.logger.info({ res }, 'responded')).not.toThrow();
+      const logged = captured.lines[0]!['res'] as any;
+      expect(logged.headers['content-type']).toBe('application/json');
+    });
+  });
+
+  it('keeps request headers and address on a live request', async () => {
+    // `IncomingMessage.headers` is a prototype getter built lazily from
+    // `rawHeaders`, so the clone dropped it and every request log came out
+    // with `headers: {}` and no client address — an audit-trail gap.
+    await withLiveExchange((req) => {
+      captured.logger.info({ req }, 'received');
+      const logged = captured.lines[0]!['req'] as any;
+      expect(logged.headers['user-agent']).toBe('vitest');
+      expect(logged.headers['x-forwarded-for']).toBe('203.0.113.7');
+      expect(logged.remotePort).toEqual(expect.any(Number));
+      // The credential in the query string is still rewritten out.
+      expect(logged.url).toBe('/api/v1/enc?token=[REDACTED]&page=2');
+      expect(JSON.stringify(logged)).not.toContain('SECRET_BEARER_abc123');
+    });
+  });
+
+  it('redacts credentials and PHI hung off an error', () => {
+    // `stdSerializers.err` flattens an error's own properties into the entry,
+    // and it runs after `formatters.log` — so nothing walked them.
+    const err: any = new Error('Request failed');
+    err.config = { headers: { Authorization: 'Bearer SECRET_BEARER_abc123' } };
+    err.response = { data: { transcript: 'Patient reports chest pain.' } };
+
+    captured.logger.error({ err }, 'upstream failed');
+    const line = JSON.stringify(captured.lines[0]!);
+    expect(line).not.toContain('SECRET_BEARER_abc123');
+    expect(line).not.toContain('chest pain');
+    // The error is still diagnostically useful.
+    expect((captured.lines[0]!['err'] as any).message).toBe('Request failed');
+  });
+
+  it('covers child bindings only as deep as redact.paths reaches', () => {
+    // pino renders child bindings once at `child()` time and resets any custom
+    // `formatters.bindings` to its own first, so the depth-independent walk
+    // cannot reach this channel at all — `redact.paths` is the only layer, and
+    // it stops at depth 1. Pinned so the boundary is a decision, not a
+    // surprise; consumers binding untrusted data should walk it themselves
+    // with the exported `redactTree`.
+    const covered = captured.logger.child({ ctx: { ssn: '111-22-3333' } });
+    covered.info('scoped');
+    expect(JSON.stringify(captured.lines[0]!)).not.toContain('111-22-3333');
+
+    const walked = captured.logger.child(
+      redactTree({ ctx: { inner: { ssn: '111-22-3333' } } }) as object,
+    );
+    walked.info('scoped');
+    expect(JSON.stringify(captured.lines[1]!)).not.toContain('111-22-3333');
+  });
+
+  it('does not let a throwing getter escape the log call', () => {
+    const payload: Record<string, unknown> = {};
+    Object.defineProperty(payload, 'boom', {
+      enumerable: true,
+      get() {
+        throw new Error('getter blew up');
+      },
+    });
+    expect(() => captured.logger.info({ payload }, 'm')).not.toThrow();
   });
 });

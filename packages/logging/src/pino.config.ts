@@ -33,6 +33,18 @@ const EXACT_REDACT_PATHS = [
   'res.headers["set-cookie"]',
 ];
 
+/**
+ * Root keys pino hands to a serializer.
+ *
+ * `formatters.log` must leave these alone: it runs *before* the serializers,
+ * so it would otherwise walk the live `req` / `res` / `err` objects instead of
+ * the plain shapes the serializers produce. Each serializer redacts its own
+ * output instead — see `RedactOptions.skipRootKeys`.
+ *
+ * Kept in one place so the skip set and the serializer map cannot drift.
+ */
+const SERIALIZED_KEYS: ReadonlySet<string> = new Set(['req', 'res', 'err']);
+
 const REDACT_PATHS = [
   ...new Set([
     ...EXACT_REDACT_PATHS,
@@ -108,12 +120,16 @@ export function createPinoConfig(serviceName?: string): LoggerOptions {
        * `*.ssn` and reached stdout in cleartext. Walking the object makes
        * depth irrelevant, which a path list cannot do at any length.
        *
-       * Runs after serializers and before `redact.paths` (pino applies
-       * redaction to this function's return value), so it sees serialized
-       * `req`/`res`/`err` shapes and the two layers compose.
+       * Runs *before* the serializers, not after — pino's `_asJson` calls
+       * `formatters.log(obj)` and only then loops applying `serializers[key]`.
+       * So this pass never sees a serialized shape, and the keys that have a
+       * serializer are skipped here and redacted in the serializer instead.
        */
       log(object: Record<string, unknown>): Record<string, unknown> {
-        return redactTree(object) as Record<string, unknown>;
+        return redactTree(object, { skipRootKeys: SERIALIZED_KEYS }) as Record<
+          string,
+          unknown
+        >;
       },
     },
 
@@ -124,6 +140,16 @@ export function createPinoConfig(serviceName?: string): LoggerOptions {
       // SECOND layer. `formatters.log` above is what actually guarantees
       // coverage; these paths are a cheap backstop that keeps working if a
       // consumer spreads this config and replaces `formatters`.
+      //
+      // They are also the *only* layer covering `logger.child()` bindings.
+      // pino renders child bindings once at `child()` time and splices them in
+      // as a pre-rendered string, and it resets any custom `formatters.bindings`
+      // to its own before doing so (`lib/proto.js`) — so no config-level hook
+      // can walk them and coverage there stops at depth 1. A consumer binding
+      // untrusted data to a child logger should walk it first: the exported
+      // `redactTree` is the same pass `formatters.log` runs.
+      //
+      //   logger.child(redactTree(bindings) as Bindings)
       //
       // pino / fast-redact path semantics:
       //   - `foo`       → matches `foo` at the top level of the merging object
@@ -140,19 +166,22 @@ export function createPinoConfig(serviceName?: string): LoggerOptions {
       censor: CENSOR,
     },
     serializers: {
+      // Each serializer redacts its own return value. `formatters.log` cannot
+      // do it for them: it runs before they do, so it would be handed the live
+      // framework object rather than the plain shape below.
       req: (req: any) => {
         if (!req) return {};
-        return {
+        return redactTree({
           id: req.id,
           method: req.method,
           // Credentials ride in query strings constantly (password resets,
           // presigned links, webhook callbacks). `url` is a single string, so
           // no path-based rule can reach inside it — it has to be rewritten.
           url: sanitizeUrl(req.url),
-          // `query` and `params` are objects, so the depth-independent pass in
-          // `formatters.log` censors sensitive names inside them. They are
-          // deliberately not dropped wholesale: request shape is most of a
-          // request log's diagnostic value.
+          // `query` and `params` are objects, so the depth-independent walk
+          // censors sensitive names inside them. They are deliberately not
+          // dropped wholesale: request shape is most of a request log's
+          // diagnostic value.
           query: req.query,
           params: req.params,
           headers: req.headers
@@ -167,16 +196,26 @@ export function createPinoConfig(serviceName?: string): LoggerOptions {
             : {},
           remoteAddress: req.ip,
           remotePort: req.socket?.remotePort,
-        };
+        });
       },
-      res: (res: any) => ({
-        statusCode: res.statusCode,
-        headers: {
-          'content-type': res.getHeaders()['content-type'],
-          'content-length': res.getHeaders()['content-length'],
-        },
-      }),
-      err: pino.stdSerializers.err,
+      res: (res: any) => {
+        if (!res) return {};
+        const headers =
+          typeof res.getHeaders === 'function' ? res.getHeaders() : {};
+        return redactTree({
+          statusCode: res.statusCode,
+          headers: {
+            'content-type': headers['content-type'],
+            'content-length': headers['content-length'],
+          },
+        });
+      },
+      // `stdSerializers.err` flattens an error's own enumerable properties
+      // into the output, and an HTTP client hangs the whole failed request off
+      // one — `err.config.headers.Authorization` and `err.response.data`
+      // reached stdout in cleartext until this walked the result.
+      err: (error: unknown) =>
+        redactTree(pino.stdSerializers.err(error as Error)),
     },
     // Use pretty logs in development for readability
     ...(shouldUsePrettyLogs()
