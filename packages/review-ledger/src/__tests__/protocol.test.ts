@@ -92,6 +92,47 @@ describe('protocol serialization and parsing', () => {
     expect(match?.outcome).toBe('fixed');
   });
 
+  it('rejects invalid runtime marker identity before serialization', () => {
+    const finding = {
+      engine: 'codex',
+      round: 1,
+      head: headSha,
+      fingerprint: 'fp1',
+      occurrence: 1,
+      severity: 'major',
+      lens: 'code-reviewer',
+      content: 'Finding content',
+    } as const;
+    const disposition = {
+      engine: 'codex',
+      round: 1,
+      head: headSha,
+      fingerprint: 'fp1',
+      occurrence: 1,
+      outcome: 'fixed',
+      content: 'Disposition content',
+    } as const;
+
+    expect(() => buildFindingBody({ ...finding, round: 0 })).toThrowError(
+      'round must be a positive integer',
+    );
+    expect(() =>
+      buildFindingBody({ ...finding, occurrence: Number.MAX_SAFE_INTEGER + 1 }),
+    ).toThrowError('occurrence must be a positive integer');
+    expect(() => buildFindingBody({ ...finding, head: 'bad' })).toThrowError(
+      '--head must be a full 40-character lowercase commit SHA',
+    );
+    expect(() =>
+      buildFindingBody({ ...finding, engine: 'unknown' as 'codex' }),
+    ).toThrowError('engine must be one of');
+    expect(() =>
+      buildFindingBody({ ...finding, severity: 'unknown' as 'major' }),
+    ).toThrowError('severity must be one of');
+    expect(() =>
+      buildDispositionBody({ ...disposition, outcome: 'unknown' as 'fixed' }),
+    ).toThrowError('outcome must be one of');
+  });
+
   it('matches pseudo v3 historical comments', () => {
     const historical =
       'Settled review comment\n<!-- local-review:v3 engine=claude fingerprint=fp1 outcome=deferred -->';

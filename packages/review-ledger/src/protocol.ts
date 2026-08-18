@@ -1,8 +1,15 @@
 import { readFileSync } from 'node:fs';
-import { DISPOSITION_V3_RE, FINDING_V3_RE, PSEUDO_V3_RE } from './constants.js';
+import {
+  DISPOSITION_V3_RE,
+  FINDING_V3_RE,
+  PSEUDO_V3_RE,
+  SUPPORTED_ENGINES,
+  SUPPORTED_OUTCOMES,
+  SUPPORTED_SEVERITIES,
+} from './constants.js';
 import { fail, LedgerError } from './errors.js';
 import { assertRegularFile } from './io.js';
-import { requireToken, sha256Text } from './hash.js';
+import { requireSha, requireToken, sha256Text } from './hash.js';
 import type {
   DispositionV3Match,
   FindingV3Match,
@@ -112,9 +119,21 @@ export function buildFindingBody(params: {
   lens: string;
   content: string;
 }): { marker: string; body: string } {
+  if (!SUPPORTED_ENGINES.includes(params.engine)) {
+    fail('engine must be one of: codex, claude, gemini, antigravity');
+  }
+  if (!Number.isSafeInteger(params.round) || params.round < 1) {
+    fail('round must be a positive integer');
+  }
+  if (!Number.isSafeInteger(params.occurrence) || params.occurrence < 1) {
+    fail('occurrence must be a positive integer');
+  }
+  if (!SUPPORTED_SEVERITIES.includes(params.severity)) {
+    fail('severity must be one of: blocking, major, minor, nit');
+  }
   const marker =
     `<!-- local-review:v3 engine=${params.engine} round=${params.round} ` +
-    `head=${params.head} fingerprint=${requireToken(params.fingerprint, 'fingerprint')} ` +
+    `head=${requireSha(params.head, 'head')} fingerprint=${requireToken(params.fingerprint, 'fingerprint')} ` +
     `occurrence=${params.occurrence} severity=${params.severity} ` +
     `lens=${requireToken(params.lens, 'lens')} ` +
     `content-sha256=${sha256Text(params.content)} -->`;
@@ -133,9 +152,21 @@ export function buildDispositionBody(params: {
   outcome: SupportedOutcome;
   content: string;
 }): { marker: string; body: string } {
+  if (!SUPPORTED_ENGINES.includes(params.engine)) {
+    fail('engine must be one of: codex, claude, gemini, antigravity');
+  }
+  if (!Number.isSafeInteger(params.round) || params.round < 1) {
+    fail('round must be a positive integer');
+  }
+  if (!Number.isSafeInteger(params.occurrence) || params.occurrence < 1) {
+    fail('occurrence must be a positive integer');
+  }
+  if (!SUPPORTED_OUTCOMES.includes(params.outcome)) {
+    fail('outcome must be one of: fixed, dismissed, deferred');
+  }
   const marker =
     `<!-- local-review-disposition:v3 engine=${params.engine} round=${params.round} ` +
-    `head=${params.head} fingerprint=${requireToken(params.fingerprint, 'fingerprint')} ` +
+    `head=${requireSha(params.head, 'head')} fingerprint=${requireToken(params.fingerprint, 'fingerprint')} ` +
     `occurrence=${params.occurrence} outcome=${params.outcome} ` +
     `content-sha256=${sha256Text(params.content)} -->`;
   return { marker, body: `${marker}\n${params.content}` };
