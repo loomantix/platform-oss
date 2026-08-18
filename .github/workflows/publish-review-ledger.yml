@@ -1,0 +1,97 @@
+name: Publish @loomantix/review-ledger
+
+on:
+  push:
+    tags:
+      - 'review-ledger-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-review-ledger-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Verify tag matches package.json version
+        working-directory: packages/review-ledger
+        run: |
+          tag_version="${GITHUB_REF_NAME#review-ledger-v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Tag version ($tag_version) does not match package.json ($pkg_version)"
+            exit 1
+          fi
+          echo "Preparing @loomantix/review-ledger@$pkg_version"
+
+      - run: pnpm --filter @loomantix/review-ledger typecheck
+      - run: pnpm --filter @loomantix/review-ledger test
+      - run: pnpm --filter @loomantix/review-ledger build
+
+      - name: Pack publish artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/review-ledger-package"
+          pnpm --filter @loomantix/review-ledger pack \
+            --pack-destination "$RUNNER_TEMP/review-ledger-package"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: review-ledger-package
+          path: ${{ runner.temp }}/review-ledger-package/*.tgz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # A tag-triggered run executes the workflow definition from the tagged ref.
+    # The environment's protection rules live in repository settings, outside
+    # the ref's reach, and are what actually gate publication; scope the npm
+    # Trusted Publisher to this environment so the gate is unavoidable.
+    environment: npm-publish
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: review-ledger-package
+          path: package
+      # registry-url writes token auth config that masks Trusted Publisher OIDC (actions/setup-node#1551).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Publish
+        run: |
+          set -- ./package/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::Expected exactly one package tarball"
+            exit 1
+          fi
+          npm publish "$1" --registry=https://registry.npmjs.org --access public --provenance --ignore-scripts

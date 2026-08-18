@@ -1,0 +1,96 @@
+import type {
+  SupportedClassification,
+  SupportedEngine,
+  SupportedOutcome,
+  SupportedSeverity,
+  SupportedSide,
+  SupportedStatus,
+} from './types.js';
+
+export const PROTOCOL_VERSION = 3;
+
+/** Pins the authenticated GitHub actor for the lifetime of a review relay. */
+export const EXPECTED_ACTOR_ENV = 'AGENT_LOOP_REVIEW_ACTOR';
+/** Seals a review-thread snapshot so it cannot be edited after capture. */
+export const EXPECTED_THREADS_SHA256_ENV = 'AGENT_LOOP_REVIEW_THREADS_SHA256';
+/** Bounds the pseudo-v3 history a pass is allowed to treat as pre-existing. */
+export const HISTORICAL_COMMENT_IDS_ENV =
+  'AGENT_LOOP_REVIEW_HISTORICAL_COMMENT_IDS_FILE';
+
+export const SUPPORTED_ENGINES: readonly SupportedEngine[] = [
+  'codex',
+  'claude',
+  'gemini',
+  'antigravity',
+] as const;
+
+export const SUPPORTED_SEVERITIES: readonly SupportedSeverity[] = [
+  'blocking',
+  'major',
+  'minor',
+  'nit',
+] as const;
+
+export const SUPPORTED_OUTCOMES: readonly SupportedOutcome[] = [
+  'fixed',
+  'dismissed',
+  'deferred',
+] as const;
+
+export const SUPPORTED_STATUSES: readonly SupportedStatus[] = [
+  'clean',
+  'changed',
+  'blocked',
+] as const;
+
+export const SUPPORTED_CLASSIFICATIONS: readonly SupportedClassification[] = [
+  'minor',
+  'material',
+] as const;
+
+export const SUPPORTED_SIDES: readonly SupportedSide[] = [
+  'RIGHT',
+  'LEFT',
+] as const;
+
+export const HUNK_WITH_LEFT_RE =
+  /^@@ -(?<left>\d+)(?:,\d+)? \+(?<right>\d+)(?:,\d+)? @@/;
+
+export const SHA_RE = /^[0-9a-f]{40}$/;
+export const SHA_64_RE = /^[0-9a-f]{64}$/;
+export const TOKEN_RE = /^[A-Za-z0-9._:/-]+$/;
+
+/**
+ * Matches the first line of any comment that presents itself as a local-review
+ * record. Used to reject markers that are malformed or from an unsupported
+ * protocol version rather than silently ignoring them.
+ */
+export const PROTOCOL_THREAD_MARKER_RE = /^<!--[ \t]*local-review(?=[: \t-])/;
+export const LEGACY_THREAD_MARKER_RE =
+  /^<!--[ \t]*local-review(?:-disposition)?:v1(?=[ \t]|-->)/;
+
+export const FINDING_V1 = '<!-- local-review:v1 ';
+export const DISPOSITION_V1 = '<!-- local-review-disposition:v1 ';
+
+/** Opening token of a v3 finding marker, used to spot malformed v3 records. */
+export const FINDING_V3_OPENER = '<!-- local-review:v3';
+export const PR_V1_MARKERS: readonly string[] = [
+  '<!-- local-review-refactor:v1 ',
+  '<!-- local-review-pass:v1 ',
+  '<!-- local-review-complete:v1 ',
+] as const;
+
+export const FINDING_V3_RE =
+  /^<!-- local-review:v3 engine=(?<engine>codex|claude|gemini|antigravity) round=(?<round>[1-9][0-9]*) head=(?<head>[0-9a-f]{40}) fingerprint=(?<fingerprint>[A-Za-z0-9._:/-]+) occurrence=(?<occurrence>[1-9][0-9]*) severity=(?<severity>blocking|major|minor|nit) lens=(?<lens>[A-Za-z0-9._:/-]+) content-sha256=(?<content_sha>[0-9a-f]{64}) -->$/m;
+
+export const PSEUDO_V3_RE =
+  /^<!-- local-review:v3 engine=(?:claude|gemini|antigravity) fingerprint=(?<fingerprint>[A-Za-z0-9._:/-]+)(?: outcome=deferred)? -->$/m;
+
+export const DISPOSITION_V3_RE =
+  /^<!-- local-review-disposition:v3 engine=(?<engine>codex|claude|gemini|antigravity) round=(?<round>[1-9][0-9]*) head=(?<head>[0-9a-f]{40}) fingerprint=(?<fingerprint>[A-Za-z0-9._:/-]+) occurrence=(?<occurrence>[1-9][0-9]*) outcome=(?<outcome>fixed|dismissed|deferred) content-sha256=(?<content_sha>[0-9a-f]{64}) -->$/m;
+
+export const FINDING_V1_RE =
+  /^<!-- local-review:v1 engine=(?<engine>codex|claude|gemini|antigravity) round=(?<round>[1-9][0-9]*) head=(?<head>[0-9a-f]{40}) fingerprint=(?<fingerprint>[A-Za-z0-9._:/-]+) -->$/m;
+
+export const DISPOSITION_V1_RE =
+  /^<!-- local-review-disposition:v1 engine=(?<engine>codex|claude|gemini|antigravity) round=(?<round>[1-9][0-9]*) head=(?<head>[0-9a-f]{40}) fingerprint=(?<fingerprint>[A-Za-z0-9._:/-]+) outcome=(?<outcome>fixed|dismissed|deferred) -->$/m;
