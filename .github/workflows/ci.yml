@@ -200,6 +200,29 @@ jobs:
           node --eval "const pkg = require('@loomantix/review-ledger'); if (pkg.PROTOCOL_VERSION !== 3 || 'setGitHubRunner' in pkg) process.exit(1)"
           test "$(./node_modules/.bin/review-ledger --protocol-version)" = "3"
 
+          # Exercise real installed-bin dispatch, file handling, deterministic
+          # result writing, and validation without requiring GitHub mutations.
+          sha="0123456789abcdef0123456789abcdef01234567"
+          printf '%s\n' 'GitHub unavailable during review.' > blocker.txt
+          ./node_modules/.bin/review-ledger write-blocked-result \
+            --head "$sha" --engine codex --round 2 --base "$sha" \
+            --before "$sha" --result-file result.json --blocker-file blocker.txt \
+            > write-output.json
+          ./node_modules/.bin/review-ledger validate-result \
+            --head "$sha" --engine codex --round 2 --base "$sha" \
+            --before "$sha" --result-file result.json > validate-output.json
+          ./node_modules/.bin/review-ledger read-result --result-file result.json \
+            > read-output.json
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          for (const file of ['write-output.json', 'validate-output.json', 'read-output.json']) {
+            const value = JSON.parse(readFileSync(file, 'utf8'));
+            if (value.status !== 'blocked' || value.finalLaneComplete !== false) {
+              throw new Error(`${file} did not preserve the blocked result contract`);
+            }
+          }
+          NODE
+
           if ! publish_output=$(npm publish "$tarball" --access public --dry-run --ignore-scripts 2>&1); then
             printf '%s\n' "$publish_output"
             case "$publish_output" in

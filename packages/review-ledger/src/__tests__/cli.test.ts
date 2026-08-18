@@ -27,6 +27,24 @@ describe('CLI command parser and execution', () => {
     );
   });
 
+  it.each([
+    ['preflight-anchor', /preflight-anchor requires/],
+    ['post-finding', /post-finding requires/],
+    ['reopen-occurrence', /reopen-occurrence missing required parameters/],
+    ['dispose', /dispose missing required parameters/],
+    ['reply', /reply requires/],
+    ['post-pr-comment', /post-pr-comment requires/],
+    ['validate-result', /validate-result missing required arguments/],
+    ['write-result', /write-result missing required arguments/],
+    ['write-blocked-result', /write-blocked-result missing required arguments/],
+    ['resolve', /resolve requires/],
+    ['reconcile', /reconcile requires/],
+    ['read-result', /read-result requires --file or --result-file/],
+    ['format-findings', /format-findings requires/],
+  ])('dispatches %s to its command-specific validation', (command, message) => {
+    expect(() => runCli([command])).toThrowError(message);
+  });
+
   it.each(['0', '-1', '1.5', '1junk', '9007199254740992'])(
     'rejects malformed numeric argument %s',
     (value) => {

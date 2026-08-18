@@ -12,7 +12,7 @@ export function sha256Text(value: string): string {
 /**
  * Return the hex-encoded SHA-256 digest of binary bytes.
  */
-export function sha256Bytes(value: Uint8Array | Buffer): string {
+export function sha256Bytes(value: Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
 }
 

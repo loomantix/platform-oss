@@ -127,7 +127,8 @@ review-ledger reconcile --repo owner/repo --pr 123 --head <sha> --fingerprint au
 # Verify the complete thread ledger against live GitHub state
 review-ledger verify-ledger --repo owner/repo --pr 123 --head <sha>
 
-# ...or against a snapshot, which must be sealed by its own SHA-256 digest
+# ...or against a snapshot captured through a trusted channel. The digest
+# detects later byte changes; it does not prove that the file came from GitHub.
 review-ledger verify-ledger --repo owner/repo --pr 123 --head <sha> \
   --threads-file ./threads.json \
   --expected-threads-sha256 "$(sha256sum ./threads.json | cut -d' ' -f1)"
@@ -141,9 +142,11 @@ Three inputs are assertions the ledger checks, never values it takes on trust:
   compared against the live `gh api user` login and fails on mismatch; it cannot
   select whose comments count as actor-owned. `AGENT_LOOP_REVIEW_ACTOR` pins the
   same identity for a whole relay.
-- `--threads-file` is offline evidence, so it must be sealed: pass
-  `--expected-threads-sha256` (or set `AGENT_LOOP_REVIEW_THREADS_SHA256`). An
-  unsealed snapshot is refused rather than read.
+- `--threads-file` is offline input, not independently authenticated evidence.
+  Capture it through a trusted channel and pass `--expected-threads-sha256` (or
+  set `AGENT_LOOP_REVIEW_THREADS_SHA256`) from that channel. The digest detects
+  changes after capture; a digest computed from the same untrusted file proves
+  no GitHub provenance. Prefer a live fetch whenever provenance is required.
 - Every thread must carry the repository and PR number it came from, and must
   match the `--repo` / `--pr` under review.
 

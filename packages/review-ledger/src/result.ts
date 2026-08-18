@@ -32,7 +32,7 @@ import type {
 /**
  * Read a review-result file as raw bytes.
  */
-export function readResultBytes(pathValue: string): Buffer {
+export function readResultBytes(pathValue: string): Uint8Array {
   assertRegularFile(
     pathValue,
     'review result must be a regular non-symlink file',
@@ -62,7 +62,7 @@ export function validateResultData(
     head: string;
     resultHead?: string | undefined;
   },
-  rawInput?: Buffer | string,
+  rawInput?: Uint8Array | string,
 ): LedgerResult {
   const raw =
     rawInput !== undefined
@@ -263,7 +263,7 @@ export function writeResultFile(
 export function readResult(resultFile: string): LedgerResult {
   const raw = readResultBytes(resultFile);
   const parsed = parseJsonOrFail(
-    raw.toString('utf8'),
+    Buffer.from(raw).toString('utf8'),
     'review result must contain valid UTF-8 JSON',
   );
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
