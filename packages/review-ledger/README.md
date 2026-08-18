@@ -24,6 +24,29 @@ Most GitHub-backed commands require Node.js 18 or later, Git with the reviewed
 history available locally, and an authenticated [GitHub CLI](https://cli.github.com/)
 session. File-only result validation and `--protocol-version` do not use GitHub.
 
+### Vendored single-file build
+
+The published tarball also ships `dist/review-ledger.bundle.js`: the whole CLI
+as one self-contained, unminified ES module with a `#!/usr/bin/env node`
+shebang. It imports no sibling chunk and needs no `node_modules`, so it can be
+copied anywhere and run as `node review-ledger.js`. Invoke it through `node`
+rather than executing it directly: npm normalises non-`bin` files to mode 0644
+in the tarball, so the extracted file is not executable even though the shebang
+is present.
+
+This is the artifact the engine repos vendor. They commit it verbatim from a
+pinned version's tarball rather than rebuilding it, so a consumer never needs an
+install step and the committed bytes can be checked against the registry:
+
+```bash
+npm pack @loomantix/review-ledger@<version>
+tar xzf loomantix-review-ledger-<version>.tgz
+cmp package/dist/review-ledger.bundle.js <vendored path>
+```
+
+Rebuilding the bundle locally is not a supported way to produce that file — only
+bytes extracted from the published tarball are comparable.
+
 ## CLI Usage
 
 The `review-ledger` binary exposes all subcommands:
