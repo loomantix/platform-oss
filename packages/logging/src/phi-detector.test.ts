@@ -522,3 +522,79 @@ describe('PHI Detector', () => {
     });
   });
 });
+
+/**
+ * Regression tests for the S3 filename leak found in the August 2026 security
+ * review: `redactS3Url` hid the object path and kept the filename, which is
+ * where recording pipelines put patient names, MRNs and dates of birth.
+ */
+describe('logMetadata — S3 redaction', () => {
+  it('drops the filename and keeps only the extension', () => {
+    expect(
+      logMetadata({
+        audioFileKey: 'encounters/123/JaneDoe-MRN9987-dob1975.wav',
+      }),
+    ).toEqual({ audioFileKey: '[REDACTED].wav' });
+  });
+
+  it('does not leak identifiers from the filename', () => {
+    const out = JSON.stringify(
+      logMetadata({ audioFileUrl: 's3://b/e/JohnDoe-MRN4471-1980-05-02.wav' }),
+    );
+    expect(out).not.toContain('JohnDoe');
+    expect(out).not.toContain('MRN4471');
+    expect(out).not.toContain('1980-05-02');
+  });
+
+  it('drops presigned query parameters', () => {
+    const out = JSON.stringify(
+      logMetadata({
+        recordingUrl:
+          'https://b.s3.amazonaws.com/e/1/a.wav?X-Amz-Signature=deadbeef',
+      }),
+    );
+    expect(out).not.toContain('deadbeef');
+    expect(out).toContain('[REDACTED].wav');
+  });
+
+  it('returns a bare marker when there is no extension', () => {
+    expect(logMetadata({ inputKey: 'encounters/123/JaneDoe-MRN9987' })).toEqual(
+      { inputKey: '[REDACTED]' },
+    );
+  });
+
+  it('treats a dotfile as having no extension', () => {
+    expect(logMetadata({ inputKey: 'some/path/.env' })).toEqual({
+      inputKey: '[REDACTED]',
+    });
+  });
+
+  it('rejects an over-long or non-alphanumeric extension', () => {
+    // A crafted key could otherwise smuggle data through as an "extension".
+    expect(
+      logMetadata({ outputKey: 'p/a.JaneDoeMRN9987DobNineteenSeventyFive' }),
+    ).toEqual({ outputKey: '[REDACTED]' });
+    expect(logMetadata({ outputKey: 'p/a.wav-MRN9987' })).toEqual({
+      outputKey: '[REDACTED]',
+    });
+  });
+
+  it('still applies to every S3 field name', () => {
+    for (const field of [
+      'audioFileUrl',
+      'audioFileKey',
+      'recordingUrl',
+      'downloadUrl',
+      'uploadUrl',
+      'completeAudioFileKey',
+      'inputKey',
+      'outputKey',
+      'compressedKey',
+      'oggKey',
+    ]) {
+      expect(logMetadata({ [field]: 'a/b/Secret-Name.ogg' })).toEqual({
+        [field]: '[REDACTED].ogg',
+      });
+    }
+  });
+});

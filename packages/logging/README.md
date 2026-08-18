@@ -7,9 +7,10 @@ Structured logging primitives for NestJS backends. Wraps
   or inject via `createLogger(context)`.
 - **OpenTelemetry trace context** — every log line gets `traceId` / `spanId` / `traceFlags`
   from the active OTel context, so logs correlate with traces in Grafana / Tempo.
-- **PHI-safe redaction + detector** — pino `redact.paths` covers ~30 common
-  auth/PII/PHI fields; `detectPHI` / `assertPHISafe` / `logMetadata` catch
-  leaks in test or pre-emit.
+- **PHI-safe redaction + detector** — every name in `PHI_FIELD_NAMES` is
+  censored at **any depth** on the way to stdout, and request URLs have their
+  sensitive query parameters stripped; `detectPHI` / `assertPHISafe` /
+  `logMetadata` catch leaks in test or pre-emit.
 - **Pluggable event sink** — register a callback via `setEventSink` to forward
   entries carrying an `event` field to a queue / audit store. PHI stripped
   before forwarding.
@@ -86,6 +87,36 @@ names outside the list are passed through unmodified, so application code
 should still avoid logging sensitive values under novel keys.
 
 Sink errors are caught — they never affect the logging pipeline.
+
+### What gets redacted on the stdout path
+
+`createPinoConfig` applies two layers:
+
+1. **`formatters.log`** walks each entry and replaces the value of any field
+   named in `REDACTED_FIELD_NAMES` with `[REDACTED]`, **at every depth** —
+   including inside arrays. That set is built from `PHI_FIELD_NAMES` plus auth
+   headers, `snake_case` spellings, and query-string signing parameters.
+2. **`redact.paths`** is derived from the same set and covers the root and
+   depth 1. It is a backstop for consumers who spread this config and replace
+   `formatters`.
+
+Two consequences worth knowing before you upgrade:
+
+- A field whose **name** is sensitive is censored **including its subtree**.
+  `{ patient: { id, nickname } }` becomes `patient: '[REDACTED]'`, matching
+  what the event sink already did. Log correlation identifiers under a name
+  that is not on the list (`encounterId`, `recordRef`) rather than under
+  `patient` / `content` / `text` / `notes`.
+- `req.url` and `referer` keep their path but have sensitive query-parameter
+  **values** replaced, so `/api/e?token=abc&page=2` logs as
+  `/api/e?token=[REDACTED]&page=2`.
+
+Redaction never mutates the object you logged, and an unchanged payload is
+returned by reference, so the clean path costs a walk and no allocation.
+
+This is still a best-effort, name-based defense: a sensitive value logged
+under a novel key, or interpolated into the `msg` string, is passed through.
+Use `assertPHISafe` in tests to catch that.
 
 ### PHI safety in tests
 

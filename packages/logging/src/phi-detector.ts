@@ -45,17 +45,23 @@ const PHI_PATTERNS = [
 /**
  * Field names that commonly contain PHI/PII and should never be logged.
  *
- * Enforced in two places:
+ * Enforced in three places:
  * 1. `extractPHIFields` / `detectPHI` — used by `assertPHISafe` to catch
  *    leaks at authoring time.
  * 2. `emitToEventSink` — before forwarding to any registered sink, values
  *    at these keys are stripped (see `logMetadata`).
+ * 3. `redaction.ts` — `REDACTED_FIELD_NAMES` is built from this list, and
+ *    `pino.config.ts` censors those names at every depth on the way to
+ *    stdout.
  *
- * This list is a superset of `pino.redact.paths` in `pino.config.ts`:
- * pino.redact covers stdout; this list additionally covers the event-sink
- * path, which would otherwise leak auth/PII fields to external queues.
+ * This is the single source of truth for all three. It used to cover only
+ * the event sink while `pino.redact.paths` carried its own shorter list,
+ * which meant the clinical fields below (`transcript`, `soapNote`, the S3
+ * keys) were stripped from the audit sink but written to stdout — and
+ * stdout is what ships to log aggregation. Adding a name here now protects
+ * both channels; do not reintroduce a second list.
  */
-const PHI_FIELD_NAMES = [
+export const PHI_FIELD_NAMES = [
   // Healthcare / transcription PHI
   'text',
   'words',
@@ -217,19 +223,37 @@ function extractPHIFieldsInner(
 }
 
 /**
- * Redact an S3 URL or key for safe logging
- * Shows only filename and extension while hiding the full path
+ * Longest run of characters accepted as a file extension. An extension is a
+ * format hint (`wav`, `ogg`, `json`); anything longer is data wearing a dot.
+ */
+const MAX_EXTENSION_LENGTH = 10;
+
+/**
+ * Redact an S3 URL or key for safe logging, keeping only the file extension.
+ *
+ * The filename is dropped, not preserved. Recording filenames routinely embed
+ * exactly the identifiers this function exists to remove — an object key like
+ * `encounters/123/JaneDoe-MRN9987-dob1975.wav` carries a patient name, an MRN
+ * and a date of birth in the last path segment, so returning
+ * `[REDACTED]/JaneDoe-MRN9987-dob1975.wav` redacted the part that was already
+ * safe and published the part that was not.
+ *
+ * The extension survives because it is the only piece with diagnostic value
+ * (which pipeline stage produced the object) and no identifying content.
  *
  * @param urlOrKey - S3 URL or key to redact
- * @returns Redacted string showing only the filename
+ * @returns `[REDACTED]` plus the extension, when one is present
  *
  * @example
  * ```typescript
  * redactS3Url('s3://bucket/encounters/123/audio.wav');
- * // Returns: '[REDACTED]/audio.wav'
+ * // Returns: '[REDACTED].wav'
  *
- * redactS3Url('https://bucket.s3.amazonaws.com/encounters/123/audio.wav?signature=...');
- * // Returns: '[REDACTED]/audio.wav'
+ * redactS3Url('https://bucket.s3.amazonaws.com/e/123/a.wav?X-Amz-Signature=...');
+ * // Returns: '[REDACTED].wav'
+ *
+ * redactS3Url('s3://bucket/encounters/123/no-extension');
+ * // Returns: '[REDACTED]'
  * ```
  */
 function redactS3Url(urlOrKey: string): string {
@@ -237,14 +261,29 @@ function redactS3Url(urlOrKey: string): string {
     return '[REDACTED]';
   }
 
-  // Extract filename from URL or key
-  const parts = urlOrKey.split('/');
-  const filename = parts[parts.length - 1];
+  // Drop the presigned query string and any fragment before looking at the
+  // path — a signature is credential material, not part of the filename.
+  const withoutQuery = urlOrKey.split(/[?#]/)[0] ?? '';
+  const parts = withoutQuery.split('/');
+  const filename = parts[parts.length - 1] ?? '';
 
-  // Remove query parameters from presigned URLs
-  const cleanFilename = filename?.split('?')[0] || '';
+  const dot = filename.lastIndexOf('.');
+  // `dot < 1` covers both "no extension" and a dotfile like `.env`, whose
+  // leading dot introduces a name rather than a format.
+  if (dot < 1) {
+    return '[REDACTED]';
+  }
 
-  return `[REDACTED]/${cleanFilename}`;
+  const extension = filename.slice(dot + 1);
+  if (
+    extension.length === 0 ||
+    extension.length > MAX_EXTENSION_LENGTH ||
+    !/^[A-Za-z0-9]+$/.test(extension)
+  ) {
+    return '[REDACTED]';
+  }
+
+  return `[REDACTED].${extension}`;
 }
 
 /**

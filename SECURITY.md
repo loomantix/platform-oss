@@ -56,5 +56,8 @@ If a vulnerability is being actively exploited, we may shorten this timeline.
 
 **`@loomantix/logging`:**
 
-- The `redact` paths and `PHI_FIELD_NAMES` list are best-effort defenses. Consumers logging sensitive values under custom field names not in the list will leak. Use `assertPHISafe` in tests to catch this.
+- `PHI_FIELD_NAMES` is the single source of truth for redaction. Both the stdout path (`formatters.log` plus a derived `redact.paths`) and the event-sink path (`logMetadata`) are built from it, so a name added there protects both channels. Before v0.4.0 the two lists were maintained separately and had drifted: clinical fields such as `transcript` and `soapNote` were stripped from the sink but written to stdout in cleartext.
+- Redaction is **name-based**, applied at every depth. It is still best-effort: a sensitive value logged under a name not in the list, or interpolated into the `msg` string, is passed through. Use `assertPHISafe` in tests to catch this.
+- A field whose name is sensitive is censored together with its subtree, so `{ patient: {...} }` yields `[REDACTED]` rather than a walked object. Log correlation identifiers under non-sensitive names.
+- `redactS3Url` keeps only the file extension. Object keys routinely carry patient names, MRNs, and dates of birth in the last path segment, so the filename is dropped rather than preserved.
 - The event sink is fire-and-forget; sink errors are swallowed by design (logging must not affect the request path). If your audit pipeline requires guaranteed delivery, layer durability above the sink callback.
