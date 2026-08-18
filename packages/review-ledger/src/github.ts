@@ -839,7 +839,7 @@ mutation($threadId: ID!) {
   } catch (error: unknown) {
     let verifiedAfterError = false;
     try {
-      if (getThreadState(threadId, commentId) === resolved) {
+      if (getThreadState(threadId, commentId, scope) === resolved) {
         verifiedAfterError = true;
       }
     } catch {

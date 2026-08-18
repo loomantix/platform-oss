@@ -176,10 +176,13 @@ const markdown = formatFindings([
 
 ## Migration from `review-ledger.py`
 
-The subcommands and flags mirror `review-ledger.py`. Implementations with the
-same protocol version and shared engine support use the same marker layout,
-content hashing, and verification rules; parity tests keep those shared records
-interoperable.
+The subcommands and flags mirror `review-ledger.py`. For a marker whose protocol
+version and engine both implementations support, the marker layout, content
+hashing, and verification rules are intended to match. This package's tests pin
+those rules for this implementation only — they do not execute
+`review-ledger.py` or compare against its output, so they cannot detect drift
+between the two. Verify compatibility against the implementation you exchange
+records with rather than relying on this suite.
 
 1. **Execution**: replace `python3 <skill>/scripts/review-ledger.py ...` with
    `review-ledger ...` or `npx @loomantix/review-ledger ...`. No Python runtime

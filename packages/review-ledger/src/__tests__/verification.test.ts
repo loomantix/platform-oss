@@ -74,7 +74,11 @@ function dispositionMarker(o: {
 }
 
 /** One fingerprint, posted at BEFORE and fixed at HEAD: a real changed round. */
-function fixedThread(fingerprint = 'fp1'): GitHubReviewThreadNode {
+function fixedThread(
+  fingerprint = 'fp1',
+  severity = 'major',
+  round = 1,
+): GitHubReviewThreadNode {
   const fc = 'the finding\n';
   const dc = 'the fix\n';
   return {
@@ -86,12 +90,12 @@ function fixedThread(fingerprint = 'fp1'): GitHubReviewThreadNode {
       nodes: [
         {
           databaseId: 1,
-          body: `${findingMarker({ fingerprint, content: fc })}\n${fc}`,
+          body: `${findingMarker({ fingerprint, severity, round, content: fc })}\n${fc}`,
           author: { login: ACTOR },
         },
         {
           databaseId: 2,
-          body: `${dispositionMarker({ fingerprint, content: dc })}\n${dc}`,
+          body: `${dispositionMarker({ fingerprint, round, content: dc })}\n${dc}`,
           author: { login: ACTOR },
         },
       ],
@@ -117,6 +121,7 @@ class ConfigurableRunner implements GitHubRunner {
   ancestor = true;
   compareStatus = 'ahead';
   compareMergeBase: string | null = null;
+  revList: string[] | null = null;
   commentIdSeq = 900;
 
   runGh(args: string[], payload?: unknown): string {
@@ -203,7 +208,7 @@ class ConfigurableRunner implements GitHubRunner {
   }
 
   gitRevList(_before: string, head: string): string[] {
-    return [head];
+    return this.revList ?? [head];
   }
 
   runGit(args: string[]): string {
@@ -367,6 +372,58 @@ describe('result evidence is matched against real ledger evidence', () => {
         resultFile: file,
       }),
     ).toThrow('do not equal the complete same-round disposition set');
+  });
+
+  it('rejects a fixed major finding classified as minor', () => {
+    const file = writeResultJson(changedResult({ classification: 'minor' }));
+    expect(() =>
+      verifyLedger({
+        repo: REPO,
+        pr: PR,
+        head: HEAD,
+        engine: 'claude',
+        round: 1,
+        base: BASE,
+        before: BEFORE,
+        resultFile: file,
+      }),
+    ).toThrow(
+      'fixed blocking or major findings require material classification',
+    );
+  });
+
+  it('rejects a convergence round that fixed a non-blocking finding', () => {
+    runner.threadNodes = [fixedThread('fp1', 'minor', 3)];
+    const file = writeResultJson(changedResult({ round: 3 }));
+    expect(() =>
+      verifyLedger({
+        repo: REPO,
+        pr: PR,
+        head: HEAD,
+        engine: 'claude',
+        round: 3,
+        base: BASE,
+        before: BEFORE,
+        resultFile: file,
+      }),
+    ).toThrow('convergence review results cannot fix non-blocking findings');
+  });
+
+  it('rejects a transition whose revision walk does not reach the head', () => {
+    runner.revList = [OTHER];
+    const file = writeResultJson(changedResult());
+    expect(() =>
+      verifyLedger({
+        repo: REPO,
+        pr: PR,
+        head: HEAD,
+        engine: 'claude',
+        round: 1,
+        base: BASE,
+        before: BEFORE,
+        resultFile: file,
+      }),
+    ).toThrow('review result transition is not forward-only');
   });
 
   it('accepts a result that exactly matches the ledger', () => {

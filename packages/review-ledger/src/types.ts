@@ -145,7 +145,7 @@ export interface WriteResultParams extends BaseResultParams {
 }
 
 /**
- * Parameters for `writeBlocked`.
+ * Parameters for `writeBlockedResult`.
  */
 export interface WriteBlockedParams extends BaseResultParams {
   blockerFile?: string | undefined;
