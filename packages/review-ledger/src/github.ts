@@ -4,6 +4,7 @@ import { fail, LedgerError } from './errors.js';
 import { assertRegularFile, parseJsonOrFail } from './io.js';
 import { matchProtocol, matchPseudoV3 } from './protocol.js';
 import {
+  SUBPROCESS_MAX_BUFFER,
   EXPECTED_ACTOR_ENV,
   EXPECTED_THREADS_SHA256_ENV,
   HISTORICAL_COMMENT_IDS_ENV,
@@ -23,6 +24,21 @@ import type {
 } from './types.js';
 
 let defaultActor: string | null = null;
+
+/**
+ * Describe a failed subprocess.
+ *
+ * `ENOBUFS` arrives with an empty stderr — the child was killed for exceeding
+ * the output ceiling, not for anything it reported — so reporting the usual
+ * "no diagnostic returned" would name the wrong cause.
+ */
+export function execFailureDetail(error: unknown): string {
+  const execError = error as { stderr?: string; code?: string };
+  if (execError.code === 'ENOBUFS') {
+    return `output exceeded the ${SUBPROCESS_MAX_BUFFER}-byte subprocess buffer`;
+  }
+  return execError.stderr?.trim() || 'no diagnostic returned';
+}
 
 /**
  * Default runner: shells out to `gh` and `git`.
@@ -53,12 +69,11 @@ export class DefaultGitHubRunner implements GitHubRunner {
         input,
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
       });
       return stdout;
     } catch (error: unknown) {
-      const execError = error as { stderr?: string; message?: string };
-      const detail = execError.stderr?.trim() || 'no diagnostic returned';
-      fail(`GitHub operation failed: ${detail}`);
+      fail(`GitHub operation failed: ${execFailureDetail(error)}`);
     }
   }
 
@@ -83,7 +98,11 @@ export class DefaultGitHubRunner implements GitHubRunner {
       const stdout = execFileSync(
         'git',
         ['rev-list', '--reverse', '--ancestry-path', `${before}..${head}`],
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+        {
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: SUBPROCESS_MAX_BUFFER,
+        },
       );
       return stdout.trim().split(/\r?\n/).filter(Boolean);
     } catch {
@@ -96,11 +115,10 @@ export class DefaultGitHubRunner implements GitHubRunner {
       return execFileSync('git', args, {
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: SUBPROCESS_MAX_BUFFER,
       });
     } catch (error: unknown) {
-      const execError = error as { stderr?: string };
-      const detail = execError.stderr?.trim() || 'no diagnostic returned';
-      fail(`Git operation failed: ${detail}`);
+      fail(`Git operation failed: ${execFailureDetail(error)}`);
     }
   }
 
@@ -109,17 +127,20 @@ export class DefaultGitHubRunner implements GitHubRunner {
       execFileSync(
         'git',
         ['merge-base', '--is-ancestor', ancestor, descendant],
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+        {
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: SUBPROCESS_MAX_BUFFER,
+        },
       );
       return true;
     } catch (error: unknown) {
       // git exits 1 for "not an ancestor" and >1 for a real failure.
-      const execError = error as { status?: number; stderr?: string };
+      const execError = error as { status?: number };
       if (execError.status === 1) {
         return false;
       }
-      const detail = execError.stderr?.trim() || 'no diagnostic returned';
-      fail(`Git ancestry check failed: ${detail}`);
+      fail(`Git ancestry check failed: ${execFailureDetail(error)}`);
     }
   }
 }
@@ -877,7 +898,11 @@ mutation($threadId: ID!) {
  */
 export function parseReviewThreadPages(
   pages: unknown,
+  options?: { requireFullComments?: boolean },
 ): GitHubReviewThreadNode[] {
+  // Callers that read markers need every comment; a caller that only reads a
+  // thread's first comment must opt out explicitly rather than by omission.
+  const requireFullComments = options?.requireFullComments ?? true;
   if (!Array.isArray(pages)) {
     fail('GitHub review-thread response has an unexpected shape');
   }
@@ -934,7 +959,8 @@ export function parseReviewThreadPages(
         !Array.isArray(comments.nodes) ||
         typeof comments.pageInfo !== 'object' ||
         comments.pageInfo === null ||
-        comments.pageInfo.hasNextPage !== false
+        typeof comments.pageInfo.hasNextPage !== 'boolean' ||
+        (requireFullComments && comments.pageInfo.hasNextPage !== false)
       ) {
         fail('GitHub review-thread comments are incomplete');
       }
@@ -1073,6 +1099,81 @@ query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
   ]);
 
   return parseReviewThreadPages(pages);
+}
+
+/**
+ * Find the review thread whose first comment is `rootCommentId`.
+ *
+ * `reviewThreads` refuses any thread whose comment history is truncated,
+ * because a marker sitting past the first page would be invisible in `nodes`
+ * and the thread would be silently treated as marker-free. That rule is right
+ * for verification, which has to read every marker on the PR — but it makes an
+ * unrelated 100-comment discussion able to break recovery on a PR whose ledger
+ * is perfectly intact.
+ *
+ * Recovery does not need any thread's full history. The protocol pins the
+ * occurrence-1 finding as the *first* comment in its thread, so asking for
+ * exactly that comment answers the question completely, and no thread's later
+ * pages can change the answer. Thread-level pagination is still proven
+ * complete, and PR scope is still asserted per thread.
+ */
+export function findRootThread(
+  repo: string,
+  pr: number,
+  rootCommentId: number,
+): GitHubReviewThreadNode | null {
+  const parts = repo.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    fail('--repo must be OWNER/REPO');
+  }
+  const [owner, name] = parts;
+  const query = `
+query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      reviewThreads(first:100, after:$endCursor) {
+        nodes {
+          id
+          isResolved
+          repository { nameWithOwner }
+          pullRequest { number }
+          comments(first:1) {
+            nodes { databaseId body author { login } }
+            pageInfo { hasNextPage }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+`.trim();
+
+  const pages = jsonOutput<unknown[]>([
+    'api',
+    'graphql',
+    '--paginate',
+    '--slurp',
+    '-f',
+    `query=${query}`,
+    '-f',
+    `owner=${owner}`,
+    '-f',
+    `name=${name}`,
+    '-F',
+    `number=${pr}`,
+  ]);
+
+  const threads = parseReviewThreadPages(pages, { requireFullComments: false });
+  assertThreadScope(threads, repo, pr);
+
+  const matching = threads.filter(
+    (thread) => thread.comments.nodes[0]?.databaseId === rootCommentId,
+  );
+  if (matching.length > 1) {
+    fail('could not identify exactly one root review thread');
+  }
+  return matching[0] ?? null;
 }
 
 /**

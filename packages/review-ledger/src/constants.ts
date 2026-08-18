@@ -9,6 +9,18 @@ import type {
 
 export const PROTOCOL_VERSION = 3;
 
+/**
+ * Output ceiling for every `gh` and `git` subprocess.
+ *
+ * Node caps `execFileSync` output at 1 MiB by default and fails the call with
+ * `ENOBUFS` and an empty stderr once the child exceeds it. A pull request that
+ * has accumulated a real ledger crosses that in review comments alone, so the
+ * default turns a routine read into an undiagnosable GitHub failure exactly on
+ * the pull requests this protocol exists to serve. The Python implementation
+ * this package ports uses `subprocess.run`, which applies no such limit.
+ */
+export const SUBPROCESS_MAX_BUFFER = 256 * 1024 * 1024;
+
 /** Pins the authenticated GitHub actor for the lifetime of a review relay. */
 export const EXPECTED_ACTOR_ENV = 'AGENT_LOOP_REVIEW_ACTOR';
 /** Seals a review-thread snapshot so it cannot be edited after capture. */

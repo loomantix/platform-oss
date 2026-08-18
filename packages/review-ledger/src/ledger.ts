@@ -8,6 +8,7 @@ import {
   PROTOCOL_THREAD_MARKER_RE,
   PR_V1_MARKERS,
   PROTOCOL_VERSION,
+  SUBPROCESS_MAX_BUFFER,
 } from './constants.js';
 import { fail, LedgerError } from './errors.js';
 import {
@@ -27,6 +28,7 @@ import {
   loadAllowedHeads,
   loadHistoricalCommentIds,
   postReviewComment,
+  findRootThread,
   reviewThreads,
   rowsHaveHistoricalMarkers,
   setThreadState,
@@ -614,7 +616,11 @@ export function transitionHeads(params: {
           '--ancestry-path',
           `${params.before}..${target}`,
         ],
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+        {
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: SUBPROCESS_MAX_BUFFER,
+        },
       )
         .trim()
         .split(/\r?\n/)
@@ -1437,6 +1443,32 @@ export function reconcile(params: ReconcileParams): ReconcileResult {
         ? 'reopen-occurrence'
         : 'post-finding';
 
+  // reconcile is the recovery path after an uncertain mutation, so it has to
+  // return something the caller can act on: resolving or replying to the thread
+  // needs its node id, and whether it is already resolved decides which of
+  // those two is correct. Deriving it here is what keeps recovery from
+  // improvising an API call against a thread it has not identified.
+  let threadId: string | null = null;
+  let threadResolved: boolean | null = null;
+  const rootIds = findingRows
+    .filter((row) => (row['occurrence'] as number) === 1)
+    .map((row) => row['id'])
+    .filter((id): id is number => typeof id === 'number');
+  if (ledgerValid && rootIds.length === 1) {
+    const candidate = findRootThread(params.repo, params.pr, rootIds[0]!);
+    if (candidate === null) {
+      fail('could not identify exactly one root review thread');
+    }
+    if (
+      typeof candidate.id !== 'string' ||
+      typeof candidate.isResolved !== 'boolean'
+    ) {
+      fail('root review thread has an unexpected shape');
+    }
+    threadId = candidate.id;
+    threadResolved = candidate.isResolved;
+  }
+
   return {
     findings: findingRows,
     dispositions: dispositionRows,
@@ -1445,6 +1477,8 @@ export function reconcile(params: ReconcileParams): ReconcileResult {
     nextOccurrence: sequenceValid ? occurrences.length + 1 : null,
     undisposedOccurrences: undisposed,
     nextAction,
+    threadId,
+    threadResolved,
     verified: true,
   };
 }

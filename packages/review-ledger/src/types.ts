@@ -363,6 +363,14 @@ export interface ReconcileResult {
     | 'dispose'
     | 'reopen-occurrence'
     | 'post-finding';
+  /**
+   * The review thread holding occurrence 1, when the ledger is valid and
+   * exactly one root comment identifies it. `null` when the fingerprint has no
+   * occurrence-1 comment to anchor to, which is what an unposted finding looks
+   * like.
+   */
+  threadId: string | null;
+  threadResolved: boolean | null;
   verified: true;
 }
 

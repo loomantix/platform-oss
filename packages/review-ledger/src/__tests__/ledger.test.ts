@@ -296,16 +296,28 @@ describe('ledger operations and workflow verification', () => {
     expect(mock.threads[0]!.isResolved).toBe(true);
   });
 
+  const reconcileFindingComment = (
+    commentId: number,
+  ): Record<string, unknown> => ({
+    id: commentId,
+    databaseId: commentId,
+    author: { login: mock.actor },
+    body: '<!-- local-review:v3 engine=gemini round=1 head=1111111111111111111111111111111111111111 fingerprint=fp-test occurrence=1 severity=minor lens=code-reviewer content-sha256=2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae -->\nfoo',
+  });
+
   it('reconciles findings and dispositions', () => {
     const commentId = 100;
-    mock.reviewComments = [
+    const comment = reconcileFindingComment(commentId);
+    mock.reviewComments = [comment];
+    mock.threads = [
       {
-        id: commentId,
-        databaseId: commentId,
-        author: { login: mock.actor },
-        body: '<!-- local-review:v3 engine=gemini round=1 head=1111111111111111111111111111111111111111 fingerprint=fp-test occurrence=1 severity=minor lens=code-reviewer content-sha256=2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae -->\nfoo',
+        id: 'PRRT_reconcile',
+        isResolved: false,
+        repository: { nameWithOwner: 'loomantix/platform-oss' },
+        pullRequest: { number: 10 },
+        comments: { nodes: [comment], pageInfo: { hasNextPage: false } },
       },
-    ];
+    ] as unknown as typeof mock.threads;
 
     const report = reconcile({
       repo: 'loomantix/platform-oss',
@@ -317,6 +329,77 @@ describe('ledger operations and workflow verification', () => {
     expect(report.sequenceValid).toBe(true);
     expect(report.undisposedOccurrences).toEqual([1]);
     expect(report.nextAction).toBe('dispose');
+    // Recovery needs an actionable thread, not just a verdict.
+    expect(report.threadId).toBe('PRRT_reconcile');
+    expect(report.threadResolved).toBe(false);
+  });
+
+  it('reports no thread for a fingerprint that was never posted', () => {
+    mock.reviewComments = [];
+    mock.threads = [];
+
+    const report = reconcile({
+      repo: 'loomantix/platform-oss',
+      pr: 10,
+      head: headSha,
+      fingerprint: 'fp-never-posted',
+    });
+
+    expect(report.nextAction).toBe('post-finding');
+    expect(report.threadId).toBeNull();
+    expect(report.threadResolved).toBeNull();
+  });
+
+  it('resolves the root thread despite an unrelated truncated discussion', () => {
+    // A 100-comment discussion elsewhere on the PR says nothing about this
+    // fingerprint. Requiring its full history to answer a root-thread question
+    // would make recovery fail on exactly the long-lived PRs it is for.
+    const commentId = 100;
+    const comment = reconcileFindingComment(commentId);
+    mock.reviewComments = [comment];
+    mock.threads = [
+      {
+        id: 'PRRT_unrelated',
+        isResolved: false,
+        repository: { nameWithOwner: 'loomantix/platform-oss' },
+        pullRequest: { number: 10 },
+        comments: {
+          nodes: [{ databaseId: 999, author: { login: mock.actor }, body: '' }],
+          pageInfo: { hasNextPage: true },
+        },
+      },
+      {
+        id: 'PRRT_reconcile',
+        isResolved: true,
+        repository: { nameWithOwner: 'loomantix/platform-oss' },
+        pullRequest: { number: 10 },
+        comments: { nodes: [comment], pageInfo: { hasNextPage: false } },
+      },
+    ] as unknown as typeof mock.threads;
+
+    const report = reconcile({
+      repo: 'loomantix/platform-oss',
+      pr: 10,
+      head: headSha,
+      fingerprint: 'fp-test',
+    });
+
+    expect(report.threadId).toBe('PRRT_reconcile');
+    expect(report.threadResolved).toBe(true);
+  });
+
+  it('refuses to guess when the root comment matches no review thread', () => {
+    mock.reviewComments = [reconcileFindingComment(100)];
+    mock.threads = [];
+
+    expect(() =>
+      reconcile({
+        repo: 'loomantix/platform-oss',
+        pr: 10,
+        head: headSha,
+        fingerprint: 'fp-test',
+      }),
+    ).toThrow(/exactly one root review thread/);
   });
 
   it('resolves a review thread', () => {
