@@ -32,7 +32,7 @@ let defaultActor: string | null = null;
  * the output ceiling, not for anything it reported — so reporting the usual
  * "no diagnostic returned" would name the wrong cause.
  */
-function execFailureDetail(error: unknown): string {
+export function execFailureDetail(error: unknown): string {
   const execError = error as { stderr?: string; code?: string };
   if (execError.code === 'ENOBUFS') {
     return `output exceeded the ${SUBPROCESS_MAX_BUFFER}-byte subprocess buffer`;
@@ -898,7 +898,11 @@ mutation($threadId: ID!) {
  */
 export function parseReviewThreadPages(
   pages: unknown,
+  options?: { requireFullComments?: boolean },
 ): GitHubReviewThreadNode[] {
+  // Callers that read markers need every comment; a caller that only reads a
+  // thread's first comment must opt out explicitly rather than by omission.
+  const requireFullComments = options?.requireFullComments ?? true;
   if (!Array.isArray(pages)) {
     fail('GitHub review-thread response has an unexpected shape');
   }
@@ -955,7 +959,8 @@ export function parseReviewThreadPages(
         !Array.isArray(comments.nodes) ||
         typeof comments.pageInfo !== 'object' ||
         comments.pageInfo === null ||
-        comments.pageInfo.hasNextPage !== false
+        typeof comments.pageInfo.hasNextPage !== 'boolean' ||
+        (requireFullComments && comments.pageInfo.hasNextPage !== false)
       ) {
         fail('GitHub review-thread comments are incomplete');
       }
@@ -1094,6 +1099,81 @@ query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
   ]);
 
   return parseReviewThreadPages(pages);
+}
+
+/**
+ * Find the review thread whose first comment is `rootCommentId`.
+ *
+ * `reviewThreads` refuses any thread whose comment history is truncated,
+ * because a marker sitting past the first page would be invisible in `nodes`
+ * and the thread would be silently treated as marker-free. That rule is right
+ * for verification, which has to read every marker on the PR — but it makes an
+ * unrelated 100-comment discussion able to break recovery on a PR whose ledger
+ * is perfectly intact.
+ *
+ * Recovery does not need any thread's full history. The protocol pins the
+ * occurrence-1 finding as the *first* comment in its thread, so asking for
+ * exactly that comment answers the question completely, and no thread's later
+ * pages can change the answer. Thread-level pagination is still proven
+ * complete, and PR scope is still asserted per thread.
+ */
+export function findRootThread(
+  repo: string,
+  pr: number,
+  rootCommentId: number,
+): GitHubReviewThreadNode | null {
+  const parts = repo.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    fail('--repo must be OWNER/REPO');
+  }
+  const [owner, name] = parts;
+  const query = `
+query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      reviewThreads(first:100, after:$endCursor) {
+        nodes {
+          id
+          isResolved
+          repository { nameWithOwner }
+          pullRequest { number }
+          comments(first:1) {
+            nodes { databaseId body author { login } }
+            pageInfo { hasNextPage }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+`.trim();
+
+  const pages = jsonOutput<unknown[]>([
+    'api',
+    'graphql',
+    '--paginate',
+    '--slurp',
+    '-f',
+    `query=${query}`,
+    '-f',
+    `owner=${owner}`,
+    '-f',
+    `name=${name}`,
+    '-F',
+    `number=${pr}`,
+  ]);
+
+  const threads = parseReviewThreadPages(pages, { requireFullComments: false });
+  assertThreadScope(threads, repo, pr);
+
+  const matching = threads.filter(
+    (thread) => thread.comments.nodes[0]?.databaseId === rootCommentId,
+  );
+  if (matching.length > 1) {
+    fail('could not identify exactly one root review thread');
+  }
+  return matching[0] ?? null;
 }
 
 /**

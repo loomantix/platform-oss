@@ -350,6 +350,44 @@ describe('ledger operations and workflow verification', () => {
     expect(report.threadResolved).toBeNull();
   });
 
+  it('resolves the root thread despite an unrelated truncated discussion', () => {
+    // A 100-comment discussion elsewhere on the PR says nothing about this
+    // fingerprint. Requiring its full history to answer a root-thread question
+    // would make recovery fail on exactly the long-lived PRs it is for.
+    const commentId = 100;
+    const comment = reconcileFindingComment(commentId);
+    mock.reviewComments = [comment];
+    mock.threads = [
+      {
+        id: 'PRRT_unrelated',
+        isResolved: false,
+        repository: { nameWithOwner: 'loomantix/platform-oss' },
+        pullRequest: { number: 10 },
+        comments: {
+          nodes: [{ databaseId: 999, author: { login: mock.actor }, body: '' }],
+          pageInfo: { hasNextPage: true },
+        },
+      },
+      {
+        id: 'PRRT_reconcile',
+        isResolved: true,
+        repository: { nameWithOwner: 'loomantix/platform-oss' },
+        pullRequest: { number: 10 },
+        comments: { nodes: [comment], pageInfo: { hasNextPage: false } },
+      },
+    ] as unknown as typeof mock.threads;
+
+    const report = reconcile({
+      repo: 'loomantix/platform-oss',
+      pr: 10,
+      head: headSha,
+      fingerprint: 'fp-test',
+    });
+
+    expect(report.threadId).toBe('PRRT_reconcile');
+    expect(report.threadResolved).toBe(true);
+  });
+
   it('refuses to guess when the root comment matches no review thread', () => {
     mock.reviewComments = [reconcileFindingComment(100)];
     mock.threads = [];

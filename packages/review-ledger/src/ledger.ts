@@ -28,6 +28,7 @@ import {
   loadAllowedHeads,
   loadHistoricalCommentIds,
   postReviewComment,
+  findRootThread,
   reviewThreads,
   rowsHaveHistoricalMarkers,
   setThreadState,
@@ -1454,15 +1455,10 @@ export function reconcile(params: ReconcileParams): ReconcileResult {
     .map((row) => row['id'])
     .filter((id): id is number => typeof id === 'number');
   if (ledgerValid && rootIds.length === 1) {
-    const matching = reviewThreads(params.repo, params.pr).filter((thread) =>
-      thread.comments.nodes.some(
-        (comment) => comment.databaseId === rootIds[0],
-      ),
-    );
-    if (matching.length !== 1) {
+    const candidate = findRootThread(params.repo, params.pr, rootIds[0]!);
+    if (candidate === null) {
       fail('could not identify exactly one root review thread');
     }
-    const candidate = matching[0]!;
     if (
       typeof candidate.id !== 'string' ||
       typeof candidate.isResolved !== 'boolean'
