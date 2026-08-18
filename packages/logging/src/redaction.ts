@@ -1,6 +1,10 @@
 /** @format */
 
-import { PHI_FIELD_NAMES, normalizePHIName } from './phi-detector';
+import {
+  SENSITIVE_FIELD_NAMES,
+  isSensitiveFieldName,
+  normalizePHIName,
+} from './phi-detector';
 
 /** Replacement written in place of a sensitive value. */
 export const CENSOR = '[REDACTED]';
@@ -63,22 +67,25 @@ const CIRCULAR = '[Circular]';
  * Field names that carry credentials or PHI/PII and must never reach a log
  * sink in cleartext.
  *
- * Built from {@link PHI_FIELD_NAMES} so the stdout path and the event-sink
- * path cannot drift: adding a name to that list now protects both channels.
- * The extras below are the request-header and `snake_case` spellings that
- * only ever appear in wire-shaped payloads, so they have no place in the
- * PHI list that `logMetadata` walks.
+ * Built from {@link SENSITIVE_FIELD_NAMES} so the stdout path and the
+ * event-sink path cannot drift: adding a name to `PHI_FIELD_NAMES` or
+ * `CREDENTIAL_FIELD_NAMES` protects both channels. Both lists live in
+ * `phi-detector.ts` because the sink matches against the same union; keeping
+ * the credential names here instead made them stdout-only, which is the
+ * original defect with the channels swapped.
+ *
+ * Exported because `pino.config.ts` derives its `redact.paths` backstop from
+ * it.
  */
 export const REDACTED_FIELD_NAMES: ReadonlySet<string> = new Set<string>([
-  ...PHI_FIELD_NAMES,
-  // Request/response headers.
-  'authorization',
-  'cookie',
-  'set-cookie',
-  'x-api-key',
-  'x-auth-token',
-  'proxy-authorization',
-  // snake_case spellings of names already covered in camelCase.
+  ...SENSITIVE_FIELD_NAMES,
+  // `snake_case` spellings of names already covered in camelCase above.
+  //
+  // The walk does not need these — `isSensitiveName` normalizes separators, so
+  // `patient_id` already matches `patientId`. The `redact.paths` backstop does:
+  // `fast-redact` matches a path literally and never normalizes, and it is the
+  // only layer covering `logger.child()` bindings. Dropping these spellings
+  // would silently narrow that layer.
   'api_key',
   'session_id',
   'date_of_birth',
@@ -94,41 +101,61 @@ export const REDACTED_FIELD_NAMES: ReadonlySet<string> = new Set<string>([
   'id_token',
   'client_secret',
   'private_key',
-  // Signing material that travels in query strings. A presigned S3 link is a
-  // bearer credential: anyone holding the signature can fetch the object until
-  // it expires, and those links point at recordings.
-  'signature',
-  'sig',
-  'x-amz-signature',
-  'x-amz-credential',
-  'x-amz-security-token',
 ]);
 
 /**
- * Case- and separator-insensitive forms of every name above.
+ * True when `name` names a field whose value must never be logged.
  *
- * The normalizer itself lives in `phi-detector.ts` so that the stdout walk,
- * the event sink, and `assertPHISafe` all match names by one rule. Splitting
- * the rule is how the two channels drifted apart in the first place.
+ * Delegates to `phi-detector.ts` so the stdout walk, the event sink, and
+ * `assertPHISafe` all match names by one rule against one set. Splitting
+ * either the rule or the set is how the two channels drifted apart.
  */
-const NORMALIZED_FIELD_NAMES: ReadonlySet<string> = new Set(
-  [...REDACTED_FIELD_NAMES].map(normalizePHIName),
+function isSensitiveName(name: string): boolean {
+  return isSensitiveFieldName(name);
+}
+
+/**
+ * Field names whose string value is a URL and must be rewritten, not censored.
+ *
+ * {@link sanitizeUrl} was applied only at the two request call sites, so a URL
+ * reaching a log any other way kept its query string intact. The common case is
+ * an error: an HTTP client hangs the whole failed request off the error it
+ * throws, so `err.config.url` — token and all — is an ordinary payload, and it
+ * is logged at `error` level at exactly the moment the request failed.
+ *
+ * These are rewritten rather than replaced with {@link CENSOR} because the URL
+ * is most of what makes the entry diagnostic; the value inside it is the only
+ * part that has to go. A secret inside a string is unreachable by any
+ * name-matching rule, which is why the string has to be parsed at all.
+ */
+const URL_FIELD_NAMES: ReadonlySet<string> = new Set(
+  [
+    'url',
+    'uri',
+    'path',
+    'originalUrl',
+    'requestUrl',
+    'baseURL',
+    'location',
+    'referer',
+    'referrer',
+  ].map(normalizePHIName),
 );
 
-/** True when `name` names a field whose value must never be logged. */
-function isSensitiveName(name: string): boolean {
-  return (
-    REDACTED_FIELD_NAMES.has(name) ||
-    NORMALIZED_FIELD_NAMES.has(normalizePHIName(name))
-  );
+/** True when `name` names a field whose string value should be sanitized. */
+function isUrlName(name: string): boolean {
+  return URL_FIELD_NAMES.has(normalizePHIName(name));
 }
 
 /**
  * Values that are objects but must be handed to the serializer untouched.
  *
  * Walking into them would either lose information (a `Date`'s valueOf) or
- * produce a nonsense clone (a `Buffer` becomes `{0: 12, 1: 45, ...}`). None of
- * them can carry a named field, so skipping them costs no coverage.
+ * produce a nonsense clone (a `Buffer` becomes `{0: 12, 1: 45, ...}`).
+ *
+ * Being on this list is necessary but not sufficient: one of these values can
+ * still serialize a named field if a property was assigned to it directly, so
+ * {@link carriesOwnData} decides whether the early return is actually safe.
  *
  * `Error` is deliberately *not* here. An error is a bag of arbitrary
  * application data in practice — an HTTP client attaches the whole failed
@@ -144,6 +171,30 @@ function isOpaque(value: object): boolean {
     ArrayBuffer.isView(value) ||
     value instanceof ArrayBuffer
   );
+}
+
+/**
+ * True when an otherwise-opaque value would still serialize named fields.
+ *
+ * "None of them can carry a named field" is not quite right: an own enumerable
+ * property assigned to a `Map`, `Set`, `RegExp`, or plain typed array is what
+ * `JSON.stringify` emits for it, since those have no `toJSON` to override the
+ * result. Returning such a value early handed the serializer an unwalked
+ * object, and `redact.paths` only reaches depth 1 — so `{a:{b:{m}}}` with an
+ * `ssn` hung off `m` published it in cleartext.
+ *
+ * A value whose `toJSON` governs the output (`Date`, `Buffer`) is unaffected:
+ * `JSON.stringify` calls the method and ignores own properties entirely, so it
+ * stays opaque and keeps rendering as a timestamp rather than its fields.
+ *
+ * `Object.keys` reads key names without invoking getters, so this cannot throw
+ * on a value the walk was about to pass through.
+ */
+function carriesOwnData(value: object): boolean {
+  if (typeof (value as { toJSON?: unknown }).toJSON === 'function') {
+    return false;
+  }
+  return Object.keys(value).length > 0;
 }
 
 /**
@@ -260,6 +311,10 @@ function redactError(
       safeAssign(out, key, CENSOR);
       continue;
     }
+    if (typeof item === 'string' && isUrlName(key)) {
+      safeAssign(out, key, sanitizeUrl(item));
+      continue;
+    }
     safeAssign(out, key, redactNode(item, depth + 1, state));
   }
   return out;
@@ -269,7 +324,7 @@ function redactNode(value: unknown, depth: number, state: WalkState): unknown {
   if (value === null || typeof value !== 'object') {
     return value;
   }
-  if (isOpaque(value)) {
+  if (isOpaque(value) && !carriesOwnData(value)) {
     return value;
   }
   if (state.seen.has(value)) {
@@ -333,6 +388,12 @@ function redactNode(value: unknown, depth: number, state: WalkState): unknown {
       if (isSensitiveName(key)) {
         safeAssign(out, key, CENSOR);
         changed = true;
+        continue;
+      }
+      if (typeof item === 'string' && isUrlName(key)) {
+        const sanitized = sanitizeUrl(item);
+        if (sanitized !== item) changed = true;
+        safeAssign(out, key, sanitized);
         continue;
       }
       const next = redactNode(item, depth + 1, state);

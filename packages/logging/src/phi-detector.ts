@@ -54,7 +54,10 @@ const PHI_PATTERNS = [
  *    `pino.config.ts` censors those names at every depth on the way to
  *    stdout.
  *
- * This is the single source of truth for all three. It used to cover only
+ * This list plus {@link CREDENTIAL_FIELD_NAMES} — together
+ * {@link SENSITIVE_FIELD_NAMES} — are the single source of truth for all
+ * three. This one is the PHI half: it is what `detectPHI` classifies as
+ * clinical. It used to cover only
  * the event sink while `pino.redact.paths` carried its own shorter list,
  * which meant the clinical fields below (`transcript`, `soapNote`, the S3
  * keys) were stripped from the audit sink but written to stdout — and
@@ -141,6 +144,70 @@ const NORMALIZED_PHI_FIELD_NAMES: ReadonlySet<string> = new Set(
 /** True when `key` names a PHI/PII field, in any case or separator style. */
 export function isPHIFieldName(key: string): boolean {
   return NORMALIZED_PHI_FIELD_NAMES.has(normalizePHIName(key));
+}
+
+/**
+ * Field names that carry credentials rather than PHI.
+ *
+ * These live here, beside {@link PHI_FIELD_NAMES}, because both the stdout
+ * walk and the event sink have to match them. Keeping them in `redaction.ts`
+ * made the superset stdout-only: `hasPHIFields` returned `false` for an entry
+ * whose only sensitive field was one of these, so the sink forwarded the raw
+ * entry — the same stdout/sink drift this module exists to prevent, with the
+ * channels swapped.
+ *
+ * They are a separate list from `PHI_FIELD_NAMES` because they are not PHI:
+ * only the PHI list drives the clinical classification `detectPHI` reports.
+ * Both lists feed {@link isSensitiveFieldName}, which is what decides whether
+ * a value may be written.
+ */
+export const CREDENTIAL_FIELD_NAMES = [
+  // Request/response headers.
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'x-auth-token',
+  'proxy-authorization',
+  // snake_case spellings whose normalized form has no camelCase counterpart
+  // in PHI_FIELD_NAMES. (`api_key` and `session_id` normalize onto `apiKey`
+  // and `sessionId`, so they need no entry.)
+  'accessToken',
+  'refreshToken',
+  'idToken',
+  'clientSecret',
+  'privateKey',
+  // Signing material that travels in query strings. A presigned S3 link is a
+  // bearer credential: anyone holding the signature can fetch the object until
+  // it expires, and those links point at recordings.
+  'signature',
+  'sig',
+  'x-amz-signature',
+  'x-amz-credential',
+  'x-amz-security-token',
+];
+
+/**
+ * Every field name that must never be written in cleartext, on any channel.
+ *
+ * The stdout walk, the event sink, and `assertPHISafe` all match against this
+ * union so a name added to either list protects all three at once.
+ */
+export const SENSITIVE_FIELD_NAMES = [
+  ...PHI_FIELD_NAMES,
+  ...CREDENTIAL_FIELD_NAMES,
+];
+
+const NORMALIZED_SENSITIVE_FIELD_NAMES: ReadonlySet<string> = new Set(
+  SENSITIVE_FIELD_NAMES.map(normalizePHIName),
+);
+
+/**
+ * True when `key` names a field whose value must never be logged — PHI or
+ * credential — in any case or separator style.
+ */
+export function isSensitiveFieldName(key: string): boolean {
+  return NORMALIZED_SENSITIVE_FIELD_NAMES.has(normalizePHIName(key));
 }
 
 /**
@@ -253,7 +320,7 @@ function extractPHIFieldsInner(
   const foundFields: string[] = [];
 
   for (const [key, value] of Object.entries(data)) {
-    if (isPHIFieldName(key)) {
+    if (isSensitiveFieldName(key)) {
       foundFields.push(key);
     }
 
@@ -398,8 +465,8 @@ function logMetadataInner(
       continue;
     }
 
-    // Skip other PHI fields entirely
-    if (isPHIFieldName(key)) {
+    // Skip other sensitive fields entirely
+    if (isSensitiveFieldName(key)) {
       if (Array.isArray(value)) {
         metadata[`${key}Count`] = value.length;
       } else if (typeof value === 'string') {

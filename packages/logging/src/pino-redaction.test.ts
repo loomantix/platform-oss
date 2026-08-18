@@ -464,3 +464,99 @@ describe('pino.config — live framework objects', () => {
     expect(() => captured.logger.info({ payload }, 'm')).not.toThrow();
   });
 });
+
+describe('pino.config — URLs carried on an error', () => {
+  let captured: { logger: Logger; lines: Array<Record<string, unknown>> };
+
+  beforeEach(() => {
+    captured = bufferDestination();
+  });
+
+  it('sanitizes URLs an HTTP client hangs off a failed request', () => {
+    // stdSerializers.err flattens the error's own properties into the entry,
+    // and the walk censors sensitive *names* — a URL sits under an ordinary
+    // name like `url`, so its query string used to survive in cleartext.
+    const error = new Error('Request failed') as Error & {
+      config?: unknown;
+      request?: unknown;
+      response?: unknown;
+    };
+    error.config = {
+      url: 'https://api.example.test/v1/enc?token=SECRET_A&page=2',
+      method: 'get',
+    };
+    error.request = { path: '/v1/enc?token=SECRET_B' };
+    error.response = {
+      status: 500,
+      config: { url: 'https://api.example.test/v1/e?apiKey=SECRET_C' },
+    };
+
+    captured.logger.error({ err: error }, 'request failed');
+    const line = JSON.stringify(captured.lines[0]);
+
+    expect(line).not.toContain('SECRET_A');
+    expect(line).not.toContain('SECRET_B');
+    expect(line).not.toContain('SECRET_C');
+    // The path and benign parameters survive — a log with no shape is useless.
+    expect(line).toContain('/v1/enc?token=[REDACTED]&page=2');
+  });
+
+  it('leaves the request serializer output stable when it sanitizes first', () => {
+    captured.logger.info(
+      {
+        req: {
+          method: 'GET',
+          url: '/api/x?token=SECRET_D&page=2',
+          headers: { referer: 'https://h.test/p?apiKey=SECRET_E' },
+        },
+      },
+      'req',
+    );
+    const req = captured.lines[0]!['req'] as Record<string, unknown>;
+    expect(req['url']).toBe('/api/x?token=[REDACTED]&page=2');
+    const headers = req['headers'] as Record<string, unknown>;
+    expect(headers['referer']).toBe('https://h.test/p?apiKey=[REDACTED]');
+  });
+});
+
+describe('pino.config — formatters.log return shape', () => {
+  it('never hands pino a non-object, even without the mixin', () => {
+    // pino iterates the return value with `for…in`, so a string would be
+    // emitted one indexed key per character. redactTree can legitimately
+    // return a non-object when a root `toJSON` projects to one; the shipped
+    // `mixin` flattens the merge object before it gets here, but the guard
+    // must not depend on an unrelated option staying set.
+    class Projecting {
+      id = 'ENC-1';
+      toJSON(): string {
+        return 'MRN-9987';
+      }
+    }
+    const lines: Array<Record<string, unknown>> = [];
+    const previous = process.env['LOG_FORMAT'];
+    process.env['LOG_FORMAT'] = 'json';
+    const config = createPinoConfig('test-service') as Record<string, unknown>;
+    if (previous === undefined) {
+      delete process.env['LOG_FORMAT'];
+    } else {
+      process.env['LOG_FORMAT'] = previous;
+    }
+    delete config['mixin'];
+    const logger = pino({ ...config, transport: undefined, level: 'trace' }, {
+      write(chunk: string) {
+        for (const line of chunk.split('\n').filter(Boolean)) {
+          try {
+            lines.push(JSON.parse(line));
+          } catch {
+            // Ignore malformed lines.
+          }
+        }
+      },
+    } as never);
+
+    logger.info(new Projecting() as unknown as Record<string, unknown>, 'm');
+    const entry = lines[0]!;
+    expect(entry['0']).toBeUndefined();
+    expect(JSON.stringify(entry)).not.toContain('MRN-9987');
+  });
+});

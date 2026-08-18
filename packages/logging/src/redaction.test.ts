@@ -360,3 +360,90 @@ describe('sanitizeUrl', () => {
     );
   });
 });
+
+describe('redactTree — opaque built-ins carrying own properties', () => {
+  // An own enumerable property assigned to a Map/Set/RegExp is what
+  // JSON.stringify emits for it, since none of them has a `toJSON` to
+  // override the result. The early return used to hand such a value to the
+  // serializer unwalked, and `redact.paths` only reaches depth 1.
+  it('censors a sensitive property hung off a nested Map', () => {
+    const map = new Map<string, string>() as Map<string, string> & {
+      ssn?: string;
+    };
+    map.ssn = '111-22-3333';
+    const out = redactTree({ a: { b: { c: { map } } } }) as Record<
+      string,
+      Record<string, Record<string, Record<string, unknown>>>
+    >;
+    expect(out['a']!['b']!['c']!['map']).toEqual({ ssn: CENSOR });
+  });
+
+  it('censors a sensitive property on a Set and a RegExp', () => {
+    const set = new Set<string>() as Set<string> & { transcript?: string };
+    set.transcript = 'Patient reports chest pain.';
+    const pattern = /x/ as RegExp & { patientId?: string };
+    pattern.patientId = 'P-1';
+    expect(redactTree({ deep: { set, pattern } })).toEqual({
+      deep: { set: { transcript: CENSOR }, pattern: { patientId: CENSOR } },
+    });
+  });
+
+  it('leaves a built-in without own properties untouched, by reference', () => {
+    // The ordinary case: a Map with entries has no own enumerable keys, so it
+    // serializes to `{}` either way and must not be cloned.
+    const input = { map: new Map([['k', 'v']]), set: new Set(['v']) };
+    expect(redactTree(input)).toBe(input);
+  });
+
+  it('keeps values whose toJSON governs the output opaque', () => {
+    // JSON.stringify calls toJSON and ignores own properties entirely, so a
+    // Date must still render as a timestamp rather than being flattened.
+    const date = new Date('2020-01-02T03:04:05.000Z') as Date & {
+      ssn?: string;
+    };
+    date.ssn = '111-22-3333';
+    const out = redactTree({ date }) as Record<string, unknown>;
+    expect(out['date']).toBe(date);
+    expect(JSON.stringify(out)).toBe('{"date":"2020-01-02T03:04:05.000Z"}');
+  });
+});
+
+describe('redactTree — URL-bearing fields', () => {
+  // sanitizeUrl was applied only at the two request call sites, so a URL
+  // reaching a log any other way kept its query string intact.
+  it('sanitizes a URL nested under an ordinary name', () => {
+    expect(
+      redactTree({ ctx: { config: { url: '/api/x?token=abc&page=2' } } }),
+    ).toEqual({ ctx: { config: { url: `/api/x?token=${CENSOR}&page=2` } } });
+  });
+
+  it('sanitizes every URL-shaped field name', () => {
+    const out = redactTree({
+      uri: '/a?apiKey=k',
+      path: '/b?sig=s',
+      originalUrl: '/c?password=p',
+      referer: 'https://h.test/d?token=t',
+    });
+    expect(out).toEqual({
+      uri: `/a?apiKey=${CENSOR}`,
+      path: `/b?sig=${CENSOR}`,
+      originalUrl: `/c?password=${CENSOR}`,
+      referer: `https://h.test/d?token=${CENSOR}`,
+    });
+  });
+
+  it('is idempotent, so the request serializer may sanitize first', () => {
+    const once = sanitizeUrl('/api/x?token=abc&page=2') as string;
+    expect(redactTree({ url: once })).toEqual({ url: once });
+  });
+
+  it('leaves a URL with no sensitive parameter by reference', () => {
+    const input = { url: '/api/x?page=2' };
+    expect(redactTree(input)).toBe(input);
+  });
+
+  it('does not sanitize a non-string value at a URL name', () => {
+    const input = { url: { nested: 'value' } };
+    expect(redactTree(input)).toBe(input);
+  });
+});

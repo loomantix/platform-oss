@@ -654,3 +654,62 @@ describe('redactS3Url keeps only a recognized extension', () => {
     });
   });
 });
+
+describe('credential field names on the event-sink path', () => {
+  // The credential names used to live only in redaction.ts, so they were
+  // censored on stdout and forwarded to the event sink in cleartext — the
+  // stdout/sink drift this package exists to prevent, with the channels
+  // swapped. Both channels now match the same union.
+  it('reports a credential-only payload as sensitive', () => {
+    // hasPHIFields gates whether emitToEventSink redacts at all: false here
+    // meant the raw entry was forwarded untouched.
+    expect(hasPHIFields({ authorization: 'Bearer abc' })).toBe(true);
+    expect(hasPHIFields({ 'x-api-key': 'k' })).toBe(true);
+    expect(hasPHIFields({ clientSecret: 's' })).toBe(true);
+  });
+
+  it('extracts credential field names', () => {
+    expect(extractPHIFields({ authorization: 'Bearer abc' })).toContain(
+      'authorization',
+    );
+    expect(extractPHIFields({ ctx: { accessToken: 'a' } })).toContain(
+      'ctx.accessToken',
+    );
+  });
+
+  it('summarizes credentials instead of copying them', () => {
+    expect(
+      logMetadata({
+        authorization: 'Bearer ab',
+        clientSecret: 'cs',
+        accessToken: 'at',
+        refreshToken: 'rt',
+        signature: 'sg',
+        encounterId: 'enc-1',
+      }),
+    ).toEqual({
+      authorizationLength: 9,
+      clientSecretLength: 2,
+      accessTokenLength: 2,
+      refreshTokenLength: 2,
+      signatureLength: 2,
+      encounterId: 'enc-1',
+    });
+  });
+
+  it('matches credential names in any case or separator style', () => {
+    expect(hasPHIFields({ Authorization: 'x' })).toBe(true);
+    expect(hasPHIFields({ ACCESS_TOKEN: 'x' })).toBe(true);
+    expect(hasPHIFields({ 'x-amz-signature': 'x' })).toBe(true);
+    expect(hasPHIFields({ xAmzSignature: 'x' })).toBe(true);
+  });
+
+  it('still passes a non-sensitive name through', () => {
+    expect(hasPHIFields({ requestId: 'r-1' })).toBe(false);
+    expect(logMetadata({ requestId: 'r-1' })).toEqual({ requestId: 'r-1' });
+  });
+
+  it('assertPHISafe rejects a credential payload', () => {
+    expect(() => assertPHISafe({ authorization: 'Bearer abc' })).toThrow();
+  });
+});

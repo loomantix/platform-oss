@@ -103,3 +103,37 @@ describe('event-sink', () => {
     });
   });
 });
+
+describe('event-sink — credential redaction', () => {
+  beforeEach(() => {
+    setEventSink(null);
+  });
+
+  it('does not forward a bearer token when it is the only sensitive field', () => {
+    // hasPHIFields returned false for this entry, so the raw object — token
+    // and all — was handed to the sink without ever reaching logMetadata.
+    const sink = vi.fn();
+    setEventSink(sink);
+    emitToEventSink({ event: 'auth.failed', authorization: 'Bearer abc123' });
+    const entry = sink.mock.calls[0]![0] as Record<string, unknown>;
+    expect(entry).not.toHaveProperty('authorization');
+    expect(JSON.stringify(entry)).not.toContain('abc123');
+    expect(entry['authorizationLength']).toBe(13);
+  });
+
+  it('redacts credentials alongside PHI in a mixed entry', () => {
+    const sink = vi.fn();
+    setEventSink(sink);
+    emitToEventSink({
+      event: 'upload.failed',
+      'x-api-key': 'sk_live_1',
+      transcript: 'Patient reports chest pain.',
+      encounterId: 'enc-1',
+    });
+    const entry = sink.mock.calls[0]![0] as Record<string, unknown>;
+    const serialized = JSON.stringify(entry);
+    expect(serialized).not.toContain('sk_live_1');
+    expect(serialized).not.toContain('chest pain');
+    expect(entry['encounterId']).toBe('enc-1');
+  });
+});

@@ -79,12 +79,13 @@ setEventSink((entry) => {
 ```
 
 Only entries with an `event` field are forwarded. Before the callback fires,
-values at any of the known PHI/PII field names (see `phi-detector.ts`
-`PHI_FIELD_NAMES`) are stripped or reduced to metadata (lengths, counts,
-sentinels), and the accompanying `msg` string is dropped if it matches one
-of the PHI regex patterns. This is a best-effort defense — custom field
-names outside the list are passed through unmodified, so application code
-should still avoid logging sensitive values under novel keys.
+values at any known sensitive field name — PHI/PII (`PHI_FIELD_NAMES`) or
+credential (`CREDENTIAL_FIELD_NAMES`), both in `phi-detector.ts` — are
+stripped or reduced to metadata (lengths, counts, sentinels), and the
+accompanying `msg` string is dropped if it matches one of the PHI regex
+patterns. This is a best-effort defense — custom field names outside the list
+are passed through unmodified, so application code should still avoid logging
+sensitive values under novel keys.
 
 Sink errors are caught — they never affect the logging pipeline.
 
@@ -94,10 +95,10 @@ Sink errors are caught — they never affect the logging pipeline.
 
 1. **`formatters.log`** walks each entry and replaces the value of any field
    named in `REDACTED_FIELD_NAMES` with `[REDACTED]`, **at every depth** —
-   including inside arrays and inside errors. That set is built from
-   `PHI_FIELD_NAMES` plus auth headers and query-string signing parameters.
-   Names are matched ignoring case and `_`/`-`, so one entry covers
-   `patientId`, `PatientId` and `patient_id`.
+   including inside arrays and inside errors. That set is `PHI_FIELD_NAMES`
+   plus `CREDENTIAL_FIELD_NAMES` (auth headers and query-string signing
+   parameters). Names are matched ignoring case and `_`/`-`, so one entry
+   covers `patientId`, `PatientId` and `patient_id`.
 2. **`redact.paths`** is derived from the same set and covers the root and
    depth 1. It is a backstop for consumers who spread this config and replace
    `formatters`, and it is the only layer that reaches `logger.child()`
@@ -126,10 +127,19 @@ Two consequences worth knowing before you upgrade:
   what the event sink already did. Log correlation identifiers under a name
   that is not on the list (`encounterId`, `recordRef`) rather than under
   `patient` / `content` / `text` / `notes`.
-- `req.url` and `referer` keep their path but have sensitive query-parameter
-  **values** replaced, so `/api/e?token=abc&page=2` logs as
-  `/api/e?token=[REDACTED]&page=2`. Credentials in a `user:pass@` prefix are
-  censored too.
+- URLs keep their path but have sensitive query-parameter **values** replaced,
+  so `/api/e?token=abc&page=2` logs as `/api/e?token=[REDACTED]&page=2`.
+  Credentials in a `user:pass@` prefix are censored too. This applies to any
+  string at a URL-shaped name (`url`, `uri`, `path`, `originalUrl`,
+  `requestUrl`, `baseURL`, `location`, `referer`, `referrer`) at any depth, not
+  just `req.url` — an HTTP client hangs the whole failed request off the error
+  it throws, so `err.config.url` is where a token most often turns up.
+
+A `Map`, `Set`, `RegExp`, or typed array is handed to the serializer whole,
+since walking it would produce a nonsense clone — but if one carries an own
+enumerable property, that property is what gets serialized, so it is walked
+after all. A `Date` or `Buffer` is unaffected: its `toJSON` governs the output
+and ignores own properties.
 
 Redaction never mutates the object you logged, and an unchanged payload is
 returned by reference, so the clean path costs a walk and no allocation. It

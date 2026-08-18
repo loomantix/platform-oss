@@ -45,6 +45,16 @@ const EXACT_REDACT_PATHS = [
  */
 const SERIALIZED_KEYS: ReadonlySet<string> = new Set(['req', 'res', 'err']);
 
+/**
+ * True when a value is safe to hand back from `formatters.log`.
+ *
+ * Arrays are excluded along with primitives: pino's `for…in` over an array
+ * emits numeric keys, not the entry the caller meant to log.
+ */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 const REDACT_PATHS = [
   ...new Set([
     ...EXACT_REDACT_PATHS,
@@ -126,10 +136,20 @@ export function createPinoConfig(serviceName?: string): LoggerOptions {
        * serializer are skipped here and redacted in the serializer instead.
        */
       log(object: Record<string, unknown>): Record<string, unknown> {
-        return redactTree(object, { skipRootKeys: SERIALIZED_KEYS }) as Record<
-          string,
-          unknown
-        >;
+        const redacted = redactTree(object, { skipRootKeys: SERIALIZED_KEYS });
+        // pino iterates this return value with `for…in`, so anything that is
+        // not a plain object is emitted one indexed key per character or
+        // element. `redactTree` can legitimately return a non-object — the
+        // `toJSON` branch replaces a node with its projection, and projecting
+        // to a string is ordinary — so the shape has to be checked here.
+        //
+        // The shipped config does not reach that case: `mixin` is always set,
+        // and pino's `defaultMixinMergeStrategy` does
+        // `Object.assign(mixinObject, mergeObject)`, so `object` is already a
+        // plain object with no prototype `toJSON` to project. This guard exists
+        // because that is an implementation detail of an unrelated option, and
+        // a consumer spreading this config may not keep it.
+        return isPlainRecord(redacted) ? redacted : {};
       },
     },
 
