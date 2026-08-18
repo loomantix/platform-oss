@@ -19,6 +19,7 @@ import {
   TOKEN_RE,
 } from './constants.js';
 import { fail, LedgerError } from './errors.js';
+import { assertRegularFile, parseJsonOrFail } from './io.js';
 import { sha256Bytes, sha256Text } from './hash.js';
 import { readContent, validateContentString } from './protocol.js';
 import type {
@@ -32,15 +33,10 @@ import type {
  * Read a review-result file as raw bytes.
  */
 export function readResultBytes(pathValue: string): Buffer {
-  try {
-    const stat = lstatSync(pathValue);
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      fail('review result must be a regular non-symlink file');
-    }
-  } catch (err) {
-    if (err instanceof LedgerError) throw err;
-    fail('review result must be a regular non-symlink file');
-  }
+  assertRegularFile(
+    pathValue,
+    'review result must be a regular non-symlink file',
+  );
   return readFileSync(pathValue);
 }
 
@@ -75,18 +71,13 @@ export function validateResultData(
         : rawInput
       : undefined;
 
-  let data: Record<string, unknown>;
-  try {
-    if (raw === undefined) {
-      fail('review result raw content is required');
-    }
-    data = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
-  } catch (error) {
-    if (error instanceof LedgerError) throw error;
-    throw new LedgerError('review result must contain valid UTF-8 JSON', {
-      cause: error,
-    });
+  if (raw === undefined) {
+    fail('review result raw content is required');
   }
+  const data = parseJsonOrFail<Record<string, unknown>>(
+    raw.toString('utf8'),
+    'review result must contain valid UTF-8 JSON',
+  );
 
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
     fail('review result must be a JSON object');
@@ -271,14 +262,10 @@ export function writeResultFile(
  */
 export function readResult(resultFile: string): LedgerResult {
   const raw = readResultBytes(resultFile);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw.toString('utf8'));
-  } catch (error) {
-    throw new LedgerError('review result must contain valid UTF-8 JSON', {
-      cause: error,
-    });
-  }
+  const parsed = parseJsonOrFail(
+    raw.toString('utf8'),
+    'review result must contain valid UTF-8 JSON',
+  );
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     fail('review result must be a JSON object');
   }

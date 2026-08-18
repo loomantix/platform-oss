@@ -13,7 +13,7 @@ import {
   SUPPORTED_SEVERITIES,
   SUPPORTED_SIDES,
 } from './constants.js';
-import { fail, LedgerError } from './errors.js';
+import { fail } from './errors.js';
 import { requireSha } from './hash.js';
 import {
   attest,
@@ -100,6 +100,17 @@ function parsePositiveInteger(value: string, name: string): number {
   return parsed;
 }
 
+function parseEnum<T extends string>(
+  arg: string,
+  value: string,
+  allowed: readonly T[],
+): T {
+  if (!allowed.includes(value as T)) {
+    fail(`${arg} must be one of: ${allowed.join(', ')}`);
+  }
+  return value as T;
+}
+
 function parseCliArgs(argv: string[]): CliArgs {
   const args: CliArgs = {};
   let i = 0;
@@ -150,14 +161,9 @@ function parseCliArgs(argv: string[]): CliArgs {
       case '--before':
         args.before = parseVal(arg);
         break;
-      case '--engine': {
-        const val = parseVal(arg);
-        if (!SUPPORTED_ENGINES.includes(val as SupportedEngine)) {
-          fail(`--engine must be one of: ${SUPPORTED_ENGINES.join(', ')}`);
-        }
-        args.engine = val as SupportedEngine;
+      case '--engine':
+        args.engine = parseEnum(arg, parseVal(arg), SUPPORTED_ENGINES);
         break;
-      }
       case '--round':
         args.round = parsePositiveInteger(parseVal(arg), arg);
         break;
@@ -167,25 +173,15 @@ function parseCliArgs(argv: string[]): CliArgs {
       case '--occurrence':
         args.occurrence = parsePositiveInteger(parseVal(arg), arg);
         break;
-      case '--severity': {
-        const val = parseVal(arg);
-        if (!SUPPORTED_SEVERITIES.includes(val as SupportedSeverity)) {
-          fail(`--severity must be one of: ${SUPPORTED_SEVERITIES.join(', ')}`);
-        }
-        args.severity = val as SupportedSeverity;
+      case '--severity':
+        args.severity = parseEnum(arg, parseVal(arg), SUPPORTED_SEVERITIES);
         break;
-      }
       case '--lens':
         args.lens = parseVal(arg);
         break;
-      case '--outcome': {
-        const val = parseVal(arg);
-        if (!SUPPORTED_OUTCOMES.includes(val as SupportedOutcome)) {
-          fail(`--outcome must be one of: ${SUPPORTED_OUTCOMES.join(', ')}`);
-        }
-        args.outcome = val as SupportedOutcome;
+      case '--outcome':
+        args.outcome = parseEnum(arg, parseVal(arg), SUPPORTED_OUTCOMES);
         break;
-      }
       case '--comment-id':
         args.commentId = parsePositiveInteger(parseVal(arg), arg);
         break;
@@ -198,14 +194,9 @@ function parseCliArgs(argv: string[]): CliArgs {
       case '--line':
         args.line = parsePositiveInteger(parseVal(arg), arg);
         break;
-      case '--side': {
-        const val = parseVal(arg);
-        if (!SUPPORTED_SIDES.includes(val as SupportedSide)) {
-          fail(`--side must be one of: ${SUPPORTED_SIDES.join(', ')}`);
-        }
-        args.side = val as SupportedSide;
+      case '--side':
+        args.side = parseEnum(arg, parseVal(arg), SUPPORTED_SIDES);
         break;
-      }
       case '--content-file':
         args.contentFile = parseVal(arg);
         break;
@@ -239,18 +230,13 @@ function parseCliArgs(argv: string[]): CliArgs {
       case '--blocker-file':
         args.blockerFile = parseVal(arg);
         break;
-      case '--classification': {
-        const val = parseVal(arg);
-        if (
-          !SUPPORTED_CLASSIFICATIONS.includes(val as SupportedClassification)
-        ) {
-          fail(
-            `--classification must be one of: ${SUPPORTED_CLASSIFICATIONS.join(', ')}`,
-          );
-        }
-        args.classification = val as SupportedClassification;
+      case '--classification':
+        args.classification = parseEnum(
+          arg,
+          parseVal(arg),
+          SUPPORTED_CLASSIFICATIONS,
+        );
         break;
-      }
       case '--file':
         args.file = parseVal(arg);
         break;
@@ -294,16 +280,6 @@ function validateArgs(args: CliArgs): void {
     !SHA_64_RE.test(args.expectedResultSha256)
   ) {
     fail('--expected-result-sha256 must be a lowercase SHA-256 digest');
-  }
-
-  if (args.round !== undefined && (isNaN(args.round) || args.round < 1)) {
-    fail('--round must be a positive integer');
-  }
-  if (
-    args.occurrence !== undefined &&
-    (isNaN(args.occurrence) || args.occurrence < 1)
-  ) {
-    fail('--occurrence must be a positive integer');
   }
 
   if (

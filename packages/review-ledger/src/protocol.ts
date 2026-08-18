@@ -1,6 +1,7 @@
-import { lstatSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { DISPOSITION_V3_RE, FINDING_V3_RE, PSEUDO_V3_RE } from './constants.js';
 import { fail, LedgerError } from './errors.js';
+import { assertRegularFile } from './io.js';
 import { requireToken, sha256Text } from './hash.js';
 import type {
   DispositionV3Match,
@@ -63,17 +64,7 @@ export function readContent(path: string): string {
       'v3 content must be a regular file; stdin and heredocs are not accepted',
     );
   }
-  try {
-    const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      fail('content file must be a regular non-symlink file');
-    }
-  } catch (err) {
-    if (err instanceof LedgerError) {
-      throw err;
-    }
-    fail('content file must be a regular non-symlink file');
-  }
+  assertRegularFile(path, 'content file must be a regular non-symlink file');
 
   let content: string;
   try {
@@ -83,6 +74,25 @@ export function readContent(path: string): string {
   }
 
   return validateContentString(content);
+}
+
+/**
+ * Resolve v3 content from an inline string or a content file.
+ *
+ * Returns `undefined` when neither is supplied; callers that require content
+ * own the failure message for their own command.
+ */
+export function resolveContent(params: {
+  content?: string | undefined;
+  contentFile?: string | undefined;
+}): string | undefined {
+  if (params.content === undefined && params.contentFile) {
+    return readContent(params.contentFile);
+  }
+  if (params.content !== undefined) {
+    return validateContentString(params.content);
+  }
+  return undefined;
 }
 
 /**

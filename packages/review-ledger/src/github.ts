@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { fail, LedgerError } from './errors.js';
-import { matchFinding, matchProtocol, matchPseudoV3 } from './protocol.js';
+import { assertRegularFile, parseJsonOrFail } from './io.js';
+import { matchProtocol, matchPseudoV3 } from './protocol.js';
 import {
   EXPECTED_ACTOR_ENV,
   EXPECTED_THREADS_SHA256_ENV,
@@ -75,11 +76,7 @@ export class DefaultGitHubRunner implements GitHubRunner {
       'api',
       `repos/${repo}/compare/${before}...${after}`,
     ]);
-    try {
-      return JSON.parse(raw);
-    } catch (error) {
-      throw new LedgerError('GitHub returned invalid JSON', { cause: error });
-    }
+    return parseJsonOrFail(raw, 'GitHub returned invalid JSON');
   }
 
   gitRevList(before: string, head: string): string[] {
@@ -164,11 +161,38 @@ export function runGh(args: string[], payload?: unknown): string {
  */
 export function jsonOutput<T = unknown>(args: string[], payload?: unknown): T {
   const raw = runGh(args, payload);
-  try {
-    return JSON.parse(raw) as T;
-  } catch (error) {
-    throw new LedgerError('GitHub returned invalid JSON', { cause: error });
-  }
+  return parseJsonOrFail<T>(raw, 'GitHub returned invalid JSON');
+}
+
+/**
+ * Report whether `after` is strictly ahead of `before` with `before` as merge base.
+ *
+ * This is the protocol's forward-only transition predicate. It has exactly one
+ * implementation so the two call sites — the exported transition verifiers and
+ * the allowed-heads chain check — cannot drift apart.
+ */
+export function compareIsForward(
+  repo: string,
+  before: string,
+  after: string,
+): boolean {
+  const comparison = activeRunner.gitCompare
+    ? (activeRunner.gitCompare(repo, before, after) as Record<string, unknown>)
+    : jsonOutput<Record<string, unknown>>([
+        'api',
+        `repos/${repo}/compare/${before}...${after}`,
+      ]);
+  const mergeBase = comparison?.['merge_base_commit'] as
+    | { sha?: string }
+    | undefined;
+  return (
+    typeof comparison === 'object' &&
+    comparison !== null &&
+    comparison['status'] === 'ahead' &&
+    typeof mergeBase === 'object' &&
+    mergeBase !== null &&
+    mergeBase.sha === before
+  );
 }
 
 /**
@@ -719,7 +743,7 @@ mutation($threadId: ID!) {
   let verified: boolean;
   try {
     verified = getThreadState(threadId, commentId);
-  } catch (error) {
+  } catch {
     verified = getThreadState(threadId, commentId);
   }
   if (verified !== resolved) {
@@ -812,15 +836,10 @@ export function loadReviewThreads(
   pathValue: string,
   expectedDigest?: string | undefined,
 ): GitHubReviewThreadNode[] {
-  try {
-    const stat = lstatSync(pathValue);
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      fail('review-thread snapshot must be a regular non-symlink file');
-    }
-  } catch (err) {
-    if (err instanceof LedgerError) throw err;
-    fail('review-thread snapshot must be a regular non-symlink file');
-  }
+  assertRegularFile(
+    pathValue,
+    'review-thread snapshot must be a regular non-symlink file',
+  );
 
   const digest = expectedDigest ?? process.env[EXPECTED_THREADS_SHA256_ENV];
   if (digest === undefined || !SHA_64_RE.test(digest)) {
@@ -832,15 +851,10 @@ export function loadReviewThreads(
     fail('review-thread snapshot changed after it was sealed');
   }
 
-  let pages: unknown;
-  try {
-    pages = JSON.parse(raw.toString('utf8'));
-  } catch (error) {
-    throw new LedgerError(
-      'review-thread snapshot must contain valid UTF-8 JSON',
-      { cause: error },
-    );
-  }
+  const pages = parseJsonOrFail(
+    raw.toString('utf8'),
+    'review-thread snapshot must contain valid UTF-8 JSON',
+  );
 
   return parseReviewThreadPages(pages);
 }
@@ -949,25 +963,15 @@ export function loadHistoricalCommentIds(pathValue?: string): Set<number> {
   if (!finalPath) {
     return new Set();
   }
-  try {
-    const stat = lstatSync(finalPath);
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      fail('historical comment IDs must be a regular non-symlink file');
-    }
-  } catch (err) {
-    if (err instanceof LedgerError) throw err;
-    fail('historical comment IDs must be a regular non-symlink file');
-  }
+  assertRegularFile(
+    finalPath,
+    'historical comment IDs must be a regular non-symlink file',
+  );
 
-  let values: unknown;
-  try {
-    values = JSON.parse(readFileSync(finalPath, 'utf8'));
-  } catch (error) {
-    throw new LedgerError(
-      'historical comment IDs must contain valid UTF-8 JSON',
-      { cause: error },
-    );
-  }
+  const values = parseJsonOrFail(
+    readFileSync(finalPath, 'utf8'),
+    'historical comment IDs must contain valid UTF-8 JSON',
+  );
 
   if (
     !Array.isArray(values) ||
@@ -1064,25 +1068,15 @@ export function loadAllowedHeads(
   afterSha: string,
   repo: string,
 ): Record<string, number> {
-  try {
-    const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      fail('allowed transition heads must be a regular non-symlink file');
-    }
-  } catch (err) {
-    if (err instanceof LedgerError) throw err;
-    fail('allowed transition heads must be a regular non-symlink file');
-  }
+  assertRegularFile(
+    path,
+    'allowed transition heads must be a regular non-symlink file',
+  );
 
-  let values: unknown;
-  try {
-    values = JSON.parse(readFileSync(path, 'utf8'));
-  } catch (error) {
-    throw new LedgerError(
-      'allowed transition heads must contain valid UTF-8 JSON',
-      { cause: error },
-    );
-  }
+  const values = parseJsonOrFail(
+    readFileSync(path, 'utf8'),
+    'allowed transition heads must contain valid UTF-8 JSON',
+  );
 
   if (
     !Array.isArray(values) ||
@@ -1101,23 +1095,7 @@ export function loadAllowedHeads(
   for (let i = 0; i < headList.length - 1; i++) {
     const cur = headList[i]!;
     const nxt = headList[i + 1]!;
-    const comparison = activeRunner.gitCompare
-      ? (activeRunner.gitCompare(repo, cur, nxt) as Record<string, unknown>)
-      : jsonOutput<Record<string, unknown>>([
-          'api',
-          `repos/${repo}/compare/${cur}...${nxt}`,
-        ]);
-    const mergeBase = comparison?.['merge_base_commit'] as
-      | { sha?: string }
-      | undefined;
-    if (
-      typeof comparison !== 'object' ||
-      comparison === null ||
-      comparison['status'] !== 'ahead' ||
-      typeof mergeBase !== 'object' ||
-      mergeBase === null ||
-      mergeBase.sha !== cur
-    ) {
+    if (!compareIsForward(repo, cur, nxt)) {
       fail('allowed transition heads are not forward-only');
     }
   }

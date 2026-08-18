@@ -13,6 +13,7 @@ import { fail, LedgerError } from './errors.js';
 import {
   assertActor,
   assertThreadScope,
+  compareIsForward,
   currentActor,
   findMatchingBody,
   getGitHubRunner,
@@ -42,9 +43,8 @@ import {
   matchDisposition,
   matchFinding,
   matchPseudoV3,
-  readContent,
   readLegacyBody,
-  validateContentString,
+  resolveContent,
   verifyV1Marker,
 } from './protocol.js';
 import {
@@ -322,24 +322,7 @@ export function verifyForwardTransitionOrFail(
   after: string,
   message: string,
 ): void {
-  const runner = getGitHubRunner();
-  const comparison = runner.gitCompare
-    ? (runner.gitCompare(repo, before, after) as Record<string, unknown>)
-    : jsonOutput<Record<string, unknown>>([
-        'api',
-        `repos/${repo}/compare/${before}...${after}`,
-      ]);
-  const mergeBase = comparison?.['merge_base_commit'] as
-    | { sha?: string }
-    | undefined;
-  if (
-    typeof comparison !== 'object' ||
-    comparison === null ||
-    comparison['status'] !== 'ahead' ||
-    typeof mergeBase !== 'object' ||
-    mergeBase === null ||
-    mergeBase.sha !== before
-  ) {
+  if (!compareIsForward(repo, before, after)) {
     fail(message);
   }
 }
@@ -837,15 +820,44 @@ export function preflightAnchor(
 }
 
 /**
+ * Parse each comment once and keep the rows whose finding marker matches.
+ */
+function findingRows(
+  comments: GitHubReviewCommentNode[],
+  fingerprint: string | undefined,
+): Array<{ row: GitHubReviewCommentNode; match: FindingV3Match }> {
+  const rows: Array<{ row: GitHubReviewCommentNode; match: FindingV3Match }> =
+    [];
+  for (const row of comments) {
+    const match = matchFinding(String(row.body ?? ''));
+    if (match !== null && match.fingerprint === fingerprint) {
+      rows.push({ row, match });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Assert exactly one occurrence-1 record exists and that it is `commentId`.
+ */
+function assertRootComment(
+  rows: Array<{ row: GitHubReviewCommentNode; match: FindingV3Match }>,
+  commentId: number,
+): void {
+  const roots = rows.filter((entry) => entry.match.occurrence === 1);
+  if (
+    roots.length !== 1 ||
+    (roots[0]?.row.databaseId ?? roots[0]?.row.id) !== commentId
+  ) {
+    fail('--comment-id does not identify the fingerprint root comment');
+  }
+}
+
+/**
  * Post a new finding and verify it landed as written.
  */
 export function postFinding(params: PostFindingParams): PostFindingResult {
-  let content = params.content;
-  if (content === undefined && params.contentFile) {
-    content = readContent(params.contentFile);
-  } else if (content !== undefined) {
-    content = validateContentString(content);
-  }
+  const content = resolveContent(params);
 
   let marker: string;
   let body: string;
@@ -900,10 +912,7 @@ export function postFinding(params: PostFindingParams): PostFindingResult {
       marker,
       body,
     );
-    const records = comments.filter((row) => {
-      const match = matchFinding(String(row.body ?? ''));
-      return match !== null && match.fingerprint === params.fingerprint;
-    });
+    const records = findingRows(comments, params.fingerprint);
 
     if (existing === null && records.length > 0) {
       fail('fingerprint already has a root thread; use reopen-occurrence');
@@ -961,12 +970,8 @@ export function postFinding(params: PostFindingParams): PostFindingResult {
 export function reopenOccurrence(
   params: ReopenOccurrenceParams,
 ): ReopenOccurrenceResult {
-  let content = params.content;
-  if (content === undefined && params.contentFile) {
-    content = readContent(params.contentFile);
-  } else if (content !== undefined) {
-    content = validateContentString(content);
-  } else {
+  const content = resolveContent(params);
+  if (content === undefined) {
     fail('reopen-occurrence requires content or content-file');
   }
 
@@ -987,10 +992,7 @@ export function reopenOccurrence(
     verifyHistoricalThreads(params.repo, params.pr);
   }
 
-  const records = comments.filter((row) => {
-    const match = matchFinding(String(row.body ?? ''));
-    return match !== null && match.fingerprint === params.fingerprint;
-  });
+  const records = findingRows(comments, params.fingerprint);
   const existing = findMatchingBody(
     comments as unknown as Array<Record<string, unknown>>,
     marker,
@@ -1001,24 +1003,14 @@ export function reopenOccurrence(
     fail('reopen-occurrence requires occurrence 2 or later');
   }
 
-  const roots = records.filter((row) => {
-    const match = matchFinding(String(row.body ?? ''));
-    return match !== null && match.occurrence === 1;
-  });
-  if (
-    roots.length !== 1 ||
-    (roots[0]?.databaseId ?? roots[0]?.id) !== params.commentId
-  ) {
-    fail('--comment-id does not identify the fingerprint root comment');
-  }
+  assertRootComment(records, params.commentId);
 
   // Verify prior occurrences disposed
   const dispositions = comments
     .map((row) => matchDisposition(String(row.body ?? '')))
     .filter((d): d is DispositionV3Match => d !== null);
 
-  for (const row of records) {
-    const finding = matchFinding(String(row.body ?? ''))!;
+  for (const { match: finding } of records) {
     if (finding.occurrence >= params.occurrence) {
       continue;
     }
@@ -1036,7 +1028,7 @@ export function reopenOccurrence(
 
   if (existing === null) {
     const occurrences = records
-      .map((row) => matchFinding(String(row.body ?? ''))!.occurrence)
+      .map((entry) => entry.match.occurrence)
       .sort((a, b) => a - b);
     const expected = Array.from(
       { length: params.occurrence - 1 },
@@ -1079,12 +1071,8 @@ export function reopenOccurrence(
  * Record the outcome of a finding and resolve its thread.
  */
 export function dispose(params: DisposeParams): DisposeResult {
-  let content = params.content;
-  if (content === undefined && params.contentFile) {
-    content = readContent(params.contentFile);
-  } else if (content !== undefined) {
-    content = validateContentString(content);
-  } else {
+  const content = resolveContent(params);
+  if (content === undefined) {
     fail('dispose requires content or content-file');
   }
 
@@ -1105,23 +1093,11 @@ export function dispose(params: DisposeParams): DisposeResult {
     verifyHistoricalThreads(params.repo, params.pr);
   }
 
-  const records = comments.filter((row) => {
-    const match = matchFinding(String(row.body ?? ''));
-    return match !== null && match.fingerprint === params.fingerprint;
-  });
-  const roots = records.filter((row) => {
-    const match = matchFinding(String(row.body ?? ''));
-    return match !== null && match.occurrence === 1;
-  });
-  if (
-    roots.length !== 1 ||
-    (roots[0]?.databaseId ?? roots[0]?.id) !== params.commentId
-  ) {
-    fail('--comment-id does not identify the fingerprint root comment');
-  }
+  const records = findingRows(comments, params.fingerprint);
+  assertRootComment(records, params.commentId);
 
   const matches = records
-    .map((row) => matchFinding(String(row.body ?? ''))!)
+    .map((entry) => entry.match)
     .filter(
       (match) =>
         match.engine === params.engine &&
@@ -1265,17 +1241,11 @@ export function attest(params: AttestParams): AttestResult {
 
   verifyResultEvidence(params, threads, { data, historicalCommentIds });
 
-  let content: string;
-  if (params.content !== undefined) {
-    content = validateContentString(params.content);
-  } else if (params.contentFile) {
-    content = readContent(params.contentFile);
-  } else {
-    content =
-      data.status === 'clean'
-        ? 'No new material findings.'
-        : 'Review fixes completed and ledger dispositions verified.';
-  }
+  const content =
+    resolveContent(params) ??
+    (data.status === 'clean'
+      ? 'No new material findings.'
+      : 'Review fixes completed and ledger dispositions verified.');
 
   let marker: string;
   if (data.status === 'clean') {
