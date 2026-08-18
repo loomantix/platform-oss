@@ -4,11 +4,11 @@ Deterministic local-review ledger protocol, verification, and CLI for multi-engi
 
 ## Overview
 
-The review ledger uses an open draft pull request as the durable, tamper-evident ledger for local adversarial code reviews and cleanup passes. `@loomantix/review-ledger` provides:
+The review ledger uses an open draft pull request as a durable ledger of actor-owned, content-integrity-checked records for local adversarial code reviews and cleanup passes. `@loomantix/review-ledger` provides:
 
 - **Strict Protocol Validation**: Deterministic v3 marker serialization, SHA-256 content hashing, sequential occurrence verification, and blocker resolution enforcement.
 - **Multi-Engine Support**: Unified contract for `codex`, `claude`, `gemini`, and `antigravity` reviewer engines.
-- **Standalone CLI & TypeScript API**: Zero runtime dependencies, dual ESM/CJS distribution, and CLI executable (`review-ledger`).
+- **Standalone CLI & TypeScript API**: Zero npm runtime dependencies, dual ESM/CJS distribution, and CLI executable (`review-ledger`).
 
 ## Installation
 
@@ -19,6 +19,10 @@ pnpm add @loomantix/review-ledger
 # Or invoke directly via npx
 npx @loomantix/review-ledger --protocol-version
 ```
+
+Most GitHub-backed commands require Node.js 18 or later, Git with the reviewed
+history available locally, and an authenticated [GitHub CLI](https://cli.github.com/)
+session. File-only result validation and `--protocol-version` do not use GitHub.
 
 ## CLI Usage
 
@@ -47,7 +51,7 @@ review-ledger preflight-anchor \
 
 ### Post Inline Finding
 
-Post an inline finding with an authenticated v3 protocol marker and content hash:
+Post an inline finding with an actor-owned v3 protocol marker and content hash:
 
 ```bash
 review-ledger post-finding \
@@ -169,22 +173,22 @@ const markdown = formatFindings([
 
 ## Migration from `review-ledger.py`
 
-The subcommands and flags mirror `review-ledger.py`, and the wire format —
-marker layout, content hashing, and every verification rule — is a direct port,
-so a ledger written by either implementation verifies under the other.
+The subcommands and flags mirror `review-ledger.py`. Implementations with the
+same protocol version and shared engine support use the same marker layout,
+content hashing, and verification rules; parity tests keep those shared records
+interoperable.
 
 1. **Execution**: replace `python3 <skill>/scripts/review-ledger.py ...` with
    `review-ledger ...` or `npx @loomantix/review-ledger ...`. No Python runtime
-   is needed; Node.js 18+ is sufficient and there are no runtime dependencies.
+   is needed; the external Git and GitHub CLI prerequisites above still apply.
 2. **Fingerprints are supplied, not derived.** As in the Python, a fingerprint
    is a caller-chosen stable token for one root cause, passed as
    `--fingerprint`. This package deliberately ships no fingerprint generator: an
    engine-local hashing scheme would drift from the tokens already recorded on
    open PRs and would not agree across engines.
 3. **Engine set.** This package accepts `codex`, `claude`, `gemini`, and
-   `antigravity`. `claude-platform`'s Python copy still accepts only `codex` and
-   `claude`, so a `gemini` or `antigravity` marker written here will not verify
-   there until that copy is updated. Sequence adoption accordingly.
+   `antigravity`. Before exchanging records with another implementation,
+   confirm that it supports the selected engine and protocol version.
 4. **`formatFindings` is additive**, with no counterpart in the Python. It is a
    presentation helper and no verification path depends on its output.
 

@@ -26,4 +26,38 @@ describe('CLI command parser and execution', () => {
       /verify-ledger requires --repo, --pr, and --head/,
     );
   });
+
+  it.each(['0', '-1', '1.5', '1junk', '9007199254740992'])(
+    'rejects malformed numeric argument %s',
+    (value) => {
+      expect(() => runCli(['verify-ledger', '--pr', value])).toThrowError(
+        /--pr must be a positive/,
+      );
+    },
+  );
+
+  it('requires a sealed result for attestation', () => {
+    const sha = 'a'.repeat(40);
+    expect(() =>
+      runCli([
+        'attest',
+        '--repo',
+        'owner/repo',
+        '--pr',
+        '1',
+        '--head',
+        sha,
+        '--engine',
+        'codex',
+        '--round',
+        '1',
+        '--base',
+        sha,
+        '--before',
+        sha,
+        '--result-file',
+        'result.json',
+      ]),
+    ).toThrowError(/--expected-result-sha256/);
+  });
 });

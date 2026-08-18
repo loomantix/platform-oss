@@ -376,12 +376,12 @@ export function verifyHistoricalThreads(repo: string, pr: number): void {
 }
 
 /**
- * Enforce the blocking rule on the latest occurrence of each fingerprint.
+ * Require the latest blocking occurrence to be fixed.
  *
  * A fingerprint's occurrences are a sequential history of one root cause, so
- * the highest occurrence is its current state. A blocking finding may not end
- * deferred; when a later occurrence clears an earlier blocking deferral, the
- * recurrence and its fix must form strict forward Git transitions.
+ * the highest occurrence is its current state. When a later occurrence clears
+ * an earlier unfixed blocker, the recurrence and its fix must form strict
+ * forward Git transitions.
  */
 export function verifyBlockingNotDeferred(
   repo: string | undefined,
@@ -400,32 +400,32 @@ export function verifyBlockingNotDeferred(
   for (const records of grouped.values()) {
     records.sort((a, b) => a[0] - b[0]);
     const [, finding, disposition] = records[records.length - 1]!;
-    if (finding.severity === 'blocking' && disposition.outcome === 'deferred') {
-      fail('blocking local-review findings cannot be deferred');
+    if (finding.severity === 'blocking' && disposition.outcome !== 'fixed') {
+      fail('blocking local-review findings must be fixed');
     }
 
-    const priorBlockingDeferrals: number[] = [];
+    const priorUnfixedBlockers: number[] = [];
     for (let index = 0; index < records.length - 1; index++) {
       const [, priorFinding, priorDisposition] = records[index]!;
       if (
         priorFinding.severity === 'blocking' &&
-        priorDisposition.outcome === 'deferred'
+        priorDisposition.outcome !== 'fixed'
       ) {
-        priorBlockingDeferrals.push(index);
+        priorUnfixedBlockers.push(index);
       }
     }
-    if (priorBlockingDeferrals.length === 0) {
+    if (priorUnfixedBlockers.length === 0) {
       continue;
     }
     if (disposition.outcome !== 'fixed') {
-      fail('a blocking deferral must be cleared by a later fixed occurrence');
+      fail('an unfixed blocker must be cleared by a later fixed occurrence');
     }
     if (repo === undefined) {
       fail(
-        'clearing a blocking deferral requires a repository to verify against',
+        'clearing an unfixed blocker requires a repository to verify against',
       );
     }
-    const start = priorBlockingDeferrals[priorBlockingDeferrals.length - 1]!;
+    const start = priorUnfixedBlockers[priorUnfixedBlockers.length - 1]!;
     for (let index = start; index < records.length - 1; index++) {
       verifyForwardTransition(
         repo,
@@ -506,14 +506,14 @@ export function verifyThreadDispositions(
 /**
  * Derive this round's fix evidence from the verified finding/disposition pairs.
  *
- * Returns `[fingerprint, hasFix, hasMajorFix]` per fingerprint, sorted.
+ * Returns `[fingerprint, hasFix, hasMajorFix, hasNonblockingFix]` per fingerprint, sorted.
  */
 export function sameRoundDispositions(
   args: { engine: SupportedEngine; round: number; repo?: string | undefined },
   matched: Array<[FindingV3Match, DispositionV3Match]>,
   allowedHeads: Record<string, number>,
-): Array<[string, boolean, boolean]> {
-  const evidence = new Map<string, [boolean, boolean]>();
+): Array<[string, boolean, boolean, boolean]> {
+  const evidence = new Map<string, [boolean, boolean, boolean]>();
 
   for (const [finding, disposition] of matched) {
     if (finding.engine !== args.engine || finding.round !== args.round) {
@@ -521,7 +521,7 @@ export function sameRoundDispositions(
     }
     const findingHead = finding.head;
     const dispositionHead = disposition.head;
-    let findingPosition = Object.prototype.hasOwnProperty.call(
+    const findingPosition = Object.prototype.hasOwnProperty.call(
       allowedHeads,
       findingHead,
     )
@@ -529,8 +529,8 @@ export function sameRoundDispositions(
       : undefined;
 
     if (findingPosition === undefined) {
-      // A finding posted before the observed transition still counts if it was
-      // fixed inside it; anything else predates this round and is not evidence.
+      // Settled historical findings are validated but never become evidence
+      // for the current before-to-after transition.
       if (disposition.outcome !== 'fixed') {
         continue;
       }
@@ -546,12 +546,7 @@ export function sameRoundDispositions(
         dispositionHead,
         'historical fixed disposition is not a forward transition',
       );
-      if (
-        !Object.prototype.hasOwnProperty.call(allowedHeads, dispositionHead)
-      ) {
-        continue;
-      }
-      findingPosition = -1;
+      continue;
     }
 
     if (disposition.outcome === 'fixed' && dispositionHead === findingHead) {
@@ -579,10 +574,12 @@ export function sameRoundDispositions(
     const fixedMajor =
       fixed &&
       (finding.severity === 'blocking' || finding.severity === 'major');
-    const previous = evidence.get(finding.fingerprint) ?? [false, false];
+    const fixedNonblocking = fixed && finding.severity !== 'blocking';
+    const previous = evidence.get(finding.fingerprint) ?? [false, false, false];
     evidence.set(finding.fingerprint, [
       previous[0] || fixed,
       previous[1] || fixedMajor,
+      previous[2] || fixedNonblocking,
     ]);
   }
 
@@ -592,6 +589,7 @@ export function sameRoundDispositions(
       (fingerprint) =>
         [fingerprint, ...evidence.get(fingerprint)!] as [
           string,
+          boolean,
           boolean,
           boolean,
         ],
@@ -663,6 +661,7 @@ export function verifyResultEvidence(
     round: number;
     base: string;
     before: string;
+    resultFile: string;
     resultHead?: string | undefined;
     allowedHeadsFile?: string | undefined;
   },
@@ -673,7 +672,8 @@ export function verifyResultEvidence(
     historicalCommentIds?: Set<number> | undefined;
   },
 ): LedgerResult {
-  const data = options?.data ?? validateResultData(args);
+  const data =
+    options?.data ?? validateResultData(args, readResultBytes(args.resultFile));
   if (data.status !== 'clean' && data.status !== 'changed') {
     fail('ledger result evidence requires a clean or changed review result');
   }
@@ -719,6 +719,12 @@ export function verifyResultEvidence(
   if (!evidence.some(([, hasFix]) => hasFix)) {
     fail('changed review results require a fixed ledger finding');
   }
+  if (
+    args.round >= 3 &&
+    evidence.some(([, , , hasNonblockingFix]) => hasNonblockingFix)
+  ) {
+    fail('convergence review results cannot fix non-blocking findings');
+  }
 
   return data;
 }
@@ -727,6 +733,7 @@ export function verifyResultEvidence(
  * Derive and persist a review result from the verified ledger state.
  */
 export function writeResult(params: WriteResultParams): LedgerResult {
+  assertActor(params.actor);
   const threads = reviewThreads(
     params.repo,
     params.pr,
@@ -773,6 +780,13 @@ export function writeResult(params: WriteResultParams): LedgerResult {
   }
   if (changed && !dispositions.some(([, hasFix]) => hasFix)) {
     fail('changed review results require a fixed ledger finding');
+  }
+  if (
+    changed &&
+    params.round >= 3 &&
+    dispositions.some(([, , , hasNonblockingFix]) => hasNonblockingFix)
+  ) {
+    fail('convergence review results cannot fix non-blocking findings');
   }
   if (
     changed &&
@@ -829,6 +843,8 @@ export function postFinding(params: PostFindingParams): PostFindingResult {
   let content = params.content;
   if (content === undefined && params.contentFile) {
     content = readContent(params.contentFile);
+  } else if (content !== undefined) {
+    content = validateContentString(content);
   }
 
   let marker: string;
@@ -1229,10 +1245,7 @@ export function attest(params: AttestParams): AttestResult {
   assertActor(params.actor);
   const resultHash = sha256Bytes(raw);
 
-  if (
-    params.expectedResultSha256 &&
-    resultHash !== params.expectedResultSha256
-  ) {
+  if (resultHash !== params.expectedResultSha256) {
     fail('review result changed before attestation');
   }
 
@@ -1329,6 +1342,7 @@ export function attest(params: AttestParams): AttestResult {
  */
 export function resolve(params: ResolveParams): ResolveResult {
   verifyHead(params.repo, params.pr, params.head);
+  assertThreadIdsInScope(params.repo, params.pr, [params.threadId]);
   setThreadState(params.threadId, true);
   verifyHead(params.repo, params.pr, params.head);
   return { thread_id: params.threadId, resolved: true };
@@ -1344,11 +1358,23 @@ export function resolveThreads(params: {
   threadIds: string[];
 }): { threadIds: string[]; resolved: true } {
   verifyHead(params.repo, params.pr, params.head);
+  assertThreadIdsInScope(params.repo, params.pr, params.threadIds);
   for (const threadId of params.threadIds) {
     setThreadState(threadId, true);
   }
   verifyHead(params.repo, params.pr, params.head);
   return { threadIds: params.threadIds, resolved: true };
+}
+
+function assertThreadIdsInScope(
+  repo: string,
+  pr: number,
+  threadIds: string[],
+): void {
+  const scopedIds = new Set(reviewThreads(repo, pr).map((thread) => thread.id));
+  if (threadIds.some((threadId) => !scopedIds.has(threadId))) {
+    fail('review thread does not belong to the requested PR');
+  }
 }
 
 /**
@@ -1452,6 +1478,7 @@ export function verifyLedger(params: VerifyLedgerParams): VerifyLedgerResult {
         round: params.round,
         base: params.base,
         before: params.before,
+        resultFile: params.resultFile,
         resultHead: params.resultHead,
         allowedHeadsFile: params.allowedHeadsFile,
       },

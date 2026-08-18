@@ -11,12 +11,12 @@ import {
   loadReviewThreads,
   matchProtocol,
   pairDispositions,
-  resetGitHubRunner,
-  setGitHubRunner,
+  sameRoundDispositions,
   threadProtocolRecords,
   verifyLedger,
   verifyThreadDispositions,
 } from '../index.js';
+import { resetGitHubRunner, setGitHubRunner } from '../github.js';
 import type {
   DispositionV3Match,
   FindingV3Match,
@@ -413,6 +413,32 @@ describe('finding and disposition pairing', () => {
     );
     expect(matched).toHaveLength(2);
   });
+
+  it('tracks fixed non-blocking findings separately', () => {
+    const evidence = sameRoundDispositions(
+      { engine: 'claude', round: 1, repo: 'loomantix/platform-oss' },
+      [
+        [
+          finding('fp1', 1, 'minor'),
+          { ...disposition('fp1'), head: LATER_HEAD },
+        ],
+      ],
+      { [HEAD]: 0, [LATER_HEAD]: 1 },
+    );
+    expect(evidence).toEqual([['fp1', true, false, true]]);
+  });
+
+  it('validates but excludes findings from before the observed transition', () => {
+    const priorHead = 'c'.repeat(40);
+    const historicalFinding = { ...finding('fp1'), head: priorHead };
+    const laterDisposition = { ...disposition('fp1'), head: LATER_HEAD };
+    const evidence = sameRoundDispositions(
+      { engine: 'claude', round: 1, repo: 'loomantix/platform-oss' },
+      [[historicalFinding, laterDisposition]],
+      { [HEAD]: 0, [LATER_HEAD]: 1 },
+    );
+    expect(evidence).toEqual([]);
+  });
 });
 
 describe('complete thread verification', () => {
@@ -480,10 +506,10 @@ describe('complete thread verification', () => {
     ]);
     expect(() =>
       verifyThreadDispositions([node], undefined, scope),
-    ).toThrowError(/blocking local-review findings cannot be deferred/);
+    ).toThrowError(/blocking local-review findings must be fixed/);
   });
 
-  it('allows a blocking finding that was dismissed', () => {
+  it('rejects a blocking finding that was dismissed', () => {
     const fc = 'the finding\n';
     const dc = 'not a defect after all\n';
     const node = thread([
@@ -496,7 +522,9 @@ describe('complete thread verification', () => {
         2,
       ),
     ]);
-    expect(verifyThreadDispositions([node], undefined, scope)).toHaveLength(1);
+    expect(() =>
+      verifyThreadDispositions([node], undefined, scope),
+    ).toThrowError(/blocking local-review findings must be fixed/);
   });
 
   it('rejects one fingerprint split across two threads', () => {
@@ -522,8 +550,8 @@ describe('complete thread verification', () => {
 });
 
 describe('historical comment id bounds', () => {
-  it('treats an absent file as no declared bound', () => {
-    expect(loadHistoricalCommentIds()).toBeUndefined();
+  it('fails closed when no bound is declared', () => {
+    expect(loadHistoricalCommentIds()).toEqual(new Set());
   });
 });
 

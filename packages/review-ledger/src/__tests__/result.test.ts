@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { sha256Bytes } from '../hash.js';
 import {
   readResult,
   validateResult,
@@ -111,10 +112,21 @@ describe('review result data validation, reading, and writing', () => {
       expect(res.finalLaneComplete).toBe(false);
       expect(res.blocker).toBe('Integration test environment unavailable');
       expect(existsSync(tempFile)).toBe(true);
+      expect(res.resultSha256).toBe(sha256Bytes(readFileSync(tempFile)));
 
       const readBack = readResult(tempFile);
       expect(readBack.status).toBe('blocked');
       expect(readBack.blocker).toBe('Integration test environment unavailable');
+    } finally {
+      if (existsSync(tempFile)) unlinkSync(tempFile);
+    }
+  });
+
+  it('rejects malformed result files when reading', () => {
+    const tempFile = join(tmpdir(), `test-invalid-${Date.now()}.json`);
+    try {
+      writeFileSync(tempFile, JSON.stringify({ status: 'clean' }));
+      expect(() => readResult(tempFile)).toThrowError(/identity fields/);
     } finally {
       if (existsSync(tempFile)) unlinkSync(tempFile);
     }

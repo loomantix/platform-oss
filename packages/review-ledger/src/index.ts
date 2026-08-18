@@ -81,15 +81,10 @@ export {
 } from './ledger.js';
 
 export {
-  DefaultGitHubRunner,
-  getGitHubRunner,
-  setGitHubRunner,
-  resetGitHubRunner,
   runGh,
   jsonOutput,
   currentActor,
   assertActor,
-  setCurrentActor,
   authenticatedRows,
   verifyHead,
   getPrFiles,

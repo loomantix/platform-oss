@@ -306,7 +306,7 @@ export interface AttestParams extends BaseResultParams {
   allowedHeadsFile?: string | undefined;
   actor?: string | undefined;
   historicalCommentIdsFile?: string | undefined;
-  expectedResultSha256?: string | undefined;
+  expectedResultSha256: string;
   expectedThreadsSha256?: string | undefined;
   contentFile?: string | undefined;
   content?: string | undefined;

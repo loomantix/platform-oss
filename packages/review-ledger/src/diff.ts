@@ -1,5 +1,6 @@
-import { HUNK_WITH_LEFT_RE } from './constants.js';
+import { HUNK_WITH_LEFT_RE, SUPPORTED_SIDES } from './constants.js';
 import { fail } from './errors.js';
+import type { SupportedSide } from './types.js';
 
 /**
  * The line numbers a unified diff touches, split by side.
@@ -56,7 +57,7 @@ export function validateAnchor(
   files: Record<string, string | null>,
   path: string,
   line: number | null | undefined,
-  side: string | null | undefined,
+  side: SupportedSide | null | undefined,
 ): void {
   if (!(path in files)) {
     fail(`path is not part of the PR diff: ${path}`);
@@ -64,12 +65,16 @@ export function validateAnchor(
   if (line === null || line === undefined) {
     return;
   }
+  const resolvedSide = side ?? 'RIGHT';
+  if (!SUPPORTED_SIDES.includes(resolvedSide)) {
+    fail(`side must be one of: ${SUPPORTED_SIDES.join(', ')}`);
+  }
   const patch = files[path];
   if (patch === null || patch === undefined) {
     fail('GitHub omitted the file patch; use --file-level only if defensible');
   }
   const { leftLines, rightLines } = parseDiffLines(patch);
-  const valid = side === 'RIGHT' ? rightLines : leftLines;
+  const valid = resolvedSide === 'RIGHT' ? rightLines : leftLines;
   if (valid.has(line)) {
     return;
   }
@@ -84,6 +89,6 @@ export function validateAnchor(
   const nearest = sortedCandidates.slice(0, 5);
   const candidates = nearest.join(', ') || 'none';
   fail(
-    `line ${line} is not an exact ${side ?? 'RIGHT'} anchor in GitHub's PR patch; nearest valid lines: ${candidates}`,
+    `line ${line} is not an exact ${resolvedSide} anchor in GitHub's PR patch; nearest valid lines: ${candidates}`,
   );
 }

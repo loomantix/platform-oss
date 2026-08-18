@@ -12,7 +12,12 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { PROTOCOL_VERSION, TOKEN_RE } from './constants.js';
+import {
+  PROTOCOL_VERSION,
+  SHA_RE,
+  SUPPORTED_ENGINES,
+  TOKEN_RE,
+} from './constants.js';
 import { fail, LedgerError } from './errors.js';
 import { sha256Bytes, sha256Text } from './hash.js';
 import { readContent, validateContentString } from './protocol.js';
@@ -136,6 +141,19 @@ export function validateResultData(
     }
   }
 
+  if (
+    !SUPPORTED_ENGINES.some((engine) => engine === data['engine']) ||
+    data['round']! < 1 ||
+    typeof data['baseSha'] !== 'string' ||
+    !SHA_RE.test(data['baseSha']) ||
+    typeof data['beforeSha'] !== 'string' ||
+    !SHA_RE.test(data['beforeSha']) ||
+    typeof data['afterSha'] !== 'string' ||
+    !SHA_RE.test(data['afterSha'])
+  ) {
+    fail('review result identity fields are invalid');
+  }
+
   const status = data['status'];
   if (status !== 'clean' && status !== 'changed' && status !== 'blocked') {
     fail('review result status must be clean, changed, or blocked');
@@ -253,7 +271,33 @@ export function writeResultFile(
  */
 export function readResult(resultFile: string): LedgerResult {
   const raw = readResultBytes(resultFile);
-  const data = JSON.parse(raw.toString('utf8')) as LedgerResult;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.toString('utf8'));
+  } catch (error) {
+    throw new LedgerError('review result must contain valid UTF-8 JSON', {
+      cause: error,
+    });
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    fail('review result must be a JSON object');
+  }
+  const candidate = parsed as Record<string, unknown>;
+  const engine = candidate['engine'];
+  const round = candidate['round'];
+  const base = candidate['baseSha'];
+  const before = candidate['beforeSha'];
+  const head = candidate['afterSha'];
+  if (
+    typeof engine !== 'string' ||
+    typeof round !== 'number' ||
+    typeof base !== 'string' ||
+    typeof before !== 'string' ||
+    typeof head !== 'string'
+  ) {
+    fail('review result has missing or invalid identity fields');
+  }
+  const data = validateResultData({ engine, round, base, before, head }, raw);
   data.resultSha256 = sha256Bytes(raw);
   return data;
 }
@@ -296,9 +340,9 @@ export function writeBlockedResult(params: WriteBlockedParams): LedgerResult {
     blocker,
   };
 
-  const raw = Buffer.from(JSON.stringify(value) + '\n', 'utf8');
-  validateResultData(params, raw);
   writeResultFile(params.resultFile, value);
+  const raw = readResultBytes(params.resultFile);
+  validateResultData(params, raw);
 
   return {
     ...(value as unknown as LedgerResult),

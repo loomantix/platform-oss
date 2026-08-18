@@ -51,4 +51,11 @@ describe('diff parsing and anchor validation', () => {
       validateAnchor(files, 'src/app.ts', 999, 'RIGHT'),
     ).toThrowError(/line 999 is not an exact RIGHT anchor/);
   });
+
+  it('rejects an unsupported side at runtime', () => {
+    const files = { 'src/app.ts': samplePatch };
+    expect(() =>
+      validateAnchor(files, 'src/app.ts', 11, 'RIGTH' as 'RIGHT'),
+    ).toThrowError(/side must be one of/);
+  });
 });

@@ -190,7 +190,17 @@ jobs:
           }
           NODE
 
-          if ! publish_output=$(npm publish "$1" --access public --dry-run --ignore-scripts 2>&1); then
+          tarball="$(realpath "$1")"
+          smoke_dir="$RUNNER_TEMP/review-ledger-smoke"
+          mkdir -p "$smoke_dir"
+          cd "$smoke_dir"
+          npm init --yes >/dev/null
+          npm install "$tarball" --ignore-scripts --no-audit --no-fund
+          node --input-type=module --eval "import('@loomantix/review-ledger').then((pkg) => { if (pkg.PROTOCOL_VERSION !== 3 || 'setGitHubRunner' in pkg) process.exit(1); })"
+          node --eval "const pkg = require('@loomantix/review-ledger'); if (pkg.PROTOCOL_VERSION !== 3 || 'setGitHubRunner' in pkg) process.exit(1)"
+          test "$(./node_modules/.bin/review-ledger --protocol-version)" = "3"
+
+          if ! publish_output=$(npm publish "$tarball" --access public --dry-run --ignore-scripts 2>&1); then
             printf '%s\n' "$publish_output"
             case "$publish_output" in
               *"cannot publish over the previously published versions"*)

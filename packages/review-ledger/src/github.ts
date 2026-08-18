@@ -944,15 +944,10 @@ query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
 /**
  * Load the set of comment ids a pass may treat as pre-existing history.
  */
-export function loadHistoricalCommentIds(
-  pathValue?: string,
-): Set<number> | undefined {
+export function loadHistoricalCommentIds(pathValue?: string): Set<number> {
   const finalPath = pathValue || process.env[HISTORICAL_COMMENT_IDS_ENV];
   if (!finalPath) {
-    // Undefined means "no bound was declared", which disables the check.
-    // An empty Set means "a bound was declared and it is empty", which
-    // rejects every historical record -- the two must not be conflated.
-    return undefined;
+    return new Set();
   }
   try {
     const stat = lstatSync(finalPath);

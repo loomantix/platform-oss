@@ -6,6 +6,7 @@
 import { readFileSync } from 'node:fs';
 import {
   PROTOCOL_VERSION,
+  SHA_64_RE,
   SUPPORTED_CLASSIFICATIONS,
   SUPPORTED_ENGINES,
   SUPPORTED_OUTCOMES,
@@ -88,6 +89,17 @@ function writeSortedJson(value: unknown): void {
   process.stdout.write(JSON.stringify(sorted) + '\n');
 }
 
+function parsePositiveInteger(value: string, name: string): number {
+  if (!/^[1-9]\d*$/.test(value)) {
+    fail(`${name} must be a positive integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    fail(`${name} must be a positive safe integer`);
+  }
+  return parsed;
+}
+
 function parseCliArgs(argv: string[]): CliArgs {
   const args: CliArgs = {};
   let i = 0;
@@ -127,7 +139,7 @@ function parseCliArgs(argv: string[]): CliArgs {
         args.repo = parseVal(arg);
         break;
       case '--pr':
-        args.pr = parseInt(parseVal(arg), 10);
+        args.pr = parsePositiveInteger(parseVal(arg), arg);
         break;
       case '--head':
         args.head = parseVal(arg);
@@ -147,13 +159,13 @@ function parseCliArgs(argv: string[]): CliArgs {
         break;
       }
       case '--round':
-        args.round = parseInt(parseVal(arg), 10);
+        args.round = parsePositiveInteger(parseVal(arg), arg);
         break;
       case '--fingerprint':
         args.fingerprint = parseVal(arg);
         break;
       case '--occurrence':
-        args.occurrence = parseInt(parseVal(arg), 10);
+        args.occurrence = parsePositiveInteger(parseVal(arg), arg);
         break;
       case '--severity': {
         const val = parseVal(arg);
@@ -175,7 +187,7 @@ function parseCliArgs(argv: string[]): CliArgs {
         break;
       }
       case '--comment-id':
-        args.commentId = parseInt(parseVal(arg), 10);
+        args.commentId = parsePositiveInteger(parseVal(arg), arg);
         break;
       case '--thread-id':
         args.threadId = parseVal(arg);
@@ -184,7 +196,7 @@ function parseCliArgs(argv: string[]): CliArgs {
         args.path = parseVal(arg);
         break;
       case '--line':
-        args.line = parseInt(parseVal(arg), 10);
+        args.line = parsePositiveInteger(parseVal(arg), arg);
         break;
       case '--side': {
         const val = parseVal(arg);
@@ -275,6 +287,13 @@ function validateArgs(args: CliArgs): void {
     if (val !== undefined) {
       requireSha(val, name === 'resultHead' ? 'result-head' : name);
     }
+  }
+
+  if (
+    args.expectedResultSha256 !== undefined &&
+    !SHA_64_RE.test(args.expectedResultSha256)
+  ) {
+    fail('--expected-result-sha256 must be a lowercase SHA-256 digest');
   }
 
   if (args.round !== undefined && (isNaN(args.round) || args.round < 1)) {
@@ -578,10 +597,11 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         args.round === undefined ||
         !args.base ||
         !args.before ||
-        !args.resultFile
+        !args.resultFile ||
+        !args.expectedResultSha256
       ) {
         fail(
-          'attest requires --repo, --pr, --head, --engine, --round, --base, --before, and --result-file',
+          'attest requires --repo, --pr, --head, --engine, --round, --base, --before, --result-file, and --expected-result-sha256',
         );
       }
       const out = attest({
