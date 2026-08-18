@@ -103,6 +103,15 @@ Sink errors are caught — they never affect the logging pipeline.
    `formatters`, and it is the only layer that reaches `logger.child()`
    bindings (see below).
 
+Name matching is shared with the event sink and `assertPHISafe`, so all three
+enforcement points agree on what counts as a sensitive name — the list and the
+match rule are both single-sourced.
+
+A value that defines `toJSON` is judged by **what that method returns**, since
+that projection is what `JSON.stringify` writes. An ORM document or a
+`class-transformer` DTO that stores `#ssn` privately and exposes `ssn` is
+therefore censored on the exposed name.
+
 The `req` / `res` / `err` keys are walked **inside their serializers** rather
 than by `formatters.log`. pino runs `formatters.log` _before_ its serializers,
 so the walk would otherwise receive your live framework objects instead of the

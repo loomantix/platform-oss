@@ -224,6 +224,64 @@ describe('redactTree', () => {
   });
 });
 
+describe('redactTree and toJSON', () => {
+  it('walks what toJSON produces, not the object that defines it', () => {
+    // `JSON.stringify` serializes the projection, so judging the node by its
+    // own properties inspects a shape that is never written. The class holds
+    // its data under a name that is not on the list and exposes one that is.
+    class Doc {
+      constructor(
+        public id: string,
+        private secretSsn: string,
+      ) {}
+      toJSON() {
+        return { id: this.id, ssn: this.secretSsn, patient: 'Jane' };
+      }
+    }
+    expect(redactTree({ doc: new Doc('d1', '111-22-3333') })).toEqual({
+      doc: { id: 'd1', ssn: CENSOR, patient: CENSOR },
+    });
+  });
+
+  it('never returns the original object, so toJSON cannot run again', () => {
+    class Doc {
+      toJSON() {
+        return { ssn: '111-22-3333' };
+      }
+    }
+    const doc = new Doc();
+    expect(redactTree(doc)).not.toBe(doc);
+  });
+
+  it('censors a toJSON that returns its own receiver', () => {
+    class Self {
+      toJSON(): unknown {
+        return this;
+      }
+    }
+    expect(redactTree({ s: new Self() })).toEqual({ s: '[Circular]' });
+  });
+
+  it('does not let a throwing toJSON escape the walk', () => {
+    class Boom {
+      toJSON(): unknown {
+        throw new Error('toJSON blew up');
+      }
+    }
+    expect(() => redactTree({ b: new Boom() })).not.toThrow();
+    expect(redactTree({ b: new Boom() })).toEqual({
+      b: '[REDACTED: unreadable]',
+    });
+  });
+
+  it('leaves opaque values with a toJSON alone', () => {
+    // `Date` is opaque, so it must reach the serializer intact rather than
+    // being replaced by the string its own toJSON returns.
+    const when = new Date('2020-01-02T03:04:05Z');
+    expect(redactTree({ when })).toEqual({ when });
+  });
+});
+
 describe('sanitizeUrl', () => {
   it('censors sensitive query parameters and keeps the rest', () => {
     expect(sanitizeUrl('/api/e?token=abc&page=2')).toBe(
@@ -273,5 +331,32 @@ describe('sanitizeUrl', () => {
   it('passes non-string values through', () => {
     expect(sanitizeUrl(undefined)).toBe(undefined);
     expect(sanitizeUrl(42)).toBe(42);
+  });
+
+  it('censors an indexed parameter, where the name is the base segment', () => {
+    // `qs` emits this for a repeated parameter under its default
+    // arrayFormat, so it is the standard spelling of `?token=a&token=b`.
+    expect(sanitizeUrl('/x?token[0]=abc&page=2')).toBe(
+      `/x?token[0]=${CENSOR}&page=2`,
+    );
+  });
+
+  it('censors a sensitive segment at any bracket depth', () => {
+    expect(sanitizeUrl('/x?filters[auth][token]=abc')).toBe(
+      `/x?filters[auth][token]=${CENSOR}`,
+    );
+  });
+
+  it('still censors the single-bracket and empty-bracket spellings', () => {
+    expect(sanitizeUrl('/x?token[]=abc')).toBe(`/x?token[]=${CENSOR}`);
+    expect(sanitizeUrl('/x?filters[token]=abc')).toBe(
+      `/x?filters[token]=${CENSOR}`,
+    );
+  });
+
+  it('leaves a bracketed benign parameter alone', () => {
+    expect(sanitizeUrl('/x?filters[status]=open&page=2')).toBe(
+      '/x?filters[status]=open&page=2',
+    );
   });
 });

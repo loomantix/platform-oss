@@ -121,6 +121,50 @@ export const PHI_FIELD_NAMES = [
 ];
 
 /**
+ * Collapse a field name to a case- and separator-insensitive form.
+ *
+ * The stdout walk in `redaction.ts` matches names this way, so the detector
+ * and the event sink must use the same rule or the two channels drift apart
+ * again — which is precisely the defect that made this list the single source
+ * of truth. `patientId`, `PatientId`, `patient_id` and `PATIENT-ID` are one
+ * field wearing four house styles, and a healthcare backend meets all of them:
+ * PascalCase is what .NET and most EMR vendor APIs emit.
+ */
+export function normalizePHIName(name: string): string {
+  return name.toLowerCase().replace(/[_-]/g, '');
+}
+
+const NORMALIZED_PHI_FIELD_NAMES: ReadonlySet<string> = new Set(
+  PHI_FIELD_NAMES.map(normalizePHIName),
+);
+
+/** True when `key` names a PHI/PII field, in any case or separator style. */
+export function isPHIFieldName(key: string): boolean {
+  return NORMALIZED_PHI_FIELD_NAMES.has(normalizePHIName(key));
+}
+
+/**
+ * S3 URL/key field names, matched by the same normalized rule.
+ *
+ * Hoisted out of `logMetadataInner` so the set is built once rather than on
+ * every nested object the sink walks.
+ */
+const NORMALIZED_S3_FIELD_NAMES: ReadonlySet<string> = new Set(
+  [
+    'audioFileUrl',
+    'audioFileKey',
+    'recordingUrl',
+    'downloadUrl',
+    'uploadUrl',
+    'completeAudioFileKey',
+    'inputKey',
+    'outputKey',
+    'compressedKey',
+    'oggKey',
+  ].map(normalizePHIName),
+);
+
+/**
  * JSON.stringify that returns `undefined` instead of throwing on circular
  * references. Request/response objects routinely contain back-refs (e.g.
  * `req.socket.parent === req`), and raw `JSON.stringify` crashes on them;
@@ -209,7 +253,7 @@ function extractPHIFieldsInner(
   const foundFields: string[] = [];
 
   for (const [key, value] of Object.entries(data)) {
-    if (PHI_FIELD_NAMES.includes(key)) {
+    if (isPHIFieldName(key)) {
       foundFields.push(key);
     }
 
@@ -223,10 +267,36 @@ function extractPHIFieldsInner(
 }
 
 /**
- * Longest run of characters accepted as a file extension. An extension is a
- * format hint (`wav`, `ogg`, `json`); anything longer is data wearing a dot.
+ * File extensions that may survive redaction.
+ *
+ * An allowlist rather than a shape test. "Short and alphanumeric" does not
+ * separate a format hint from an identifier: `JaneDoe.MRN9987`,
+ * `recording.20250817` and `note.Smith` all pass such a test, and each
+ * publishes exactly the kind of value the rest of this function exists to
+ * remove. Only a name already known to be a format carries no patient data.
  */
-const MAX_EXTENSION_LENGTH = 10;
+const SAFE_EXTENSIONS: ReadonlySet<string> = new Set([
+  // Audio/video produced by the recording pipeline.
+  'wav',
+  'mp3',
+  'ogg',
+  'oga',
+  'm4a',
+  'aac',
+  'flac',
+  'opus',
+  'webm',
+  'mp4',
+  'mov',
+  // Documents and payloads the pipeline moves alongside them.
+  'json',
+  'txt',
+  'csv',
+  'xml',
+  'pdf',
+  'zip',
+  'gz',
+]);
 
 /**
  * Redact an S3 URL or key for safe logging, keeping only the file extension.
@@ -274,12 +344,8 @@ function redactS3Url(urlOrKey: string): string {
     return '[REDACTED]';
   }
 
-  const extension = filename.slice(dot + 1);
-  if (
-    extension.length === 0 ||
-    extension.length > MAX_EXTENSION_LENGTH ||
-    !/^[A-Za-z0-9]+$/.test(extension)
-  ) {
+  const extension = filename.slice(dot + 1).toLowerCase();
+  if (!SAFE_EXTENSIONS.has(extension)) {
     return '[REDACTED]';
   }
 
@@ -322,29 +388,18 @@ function logMetadataInner(
 
   const metadata: Record<string, unknown> = {};
 
-  // S3-related field names that should be redacted
-  const s3FieldNames = [
-    'audioFileUrl',
-    'audioFileKey',
-    'recordingUrl',
-    'downloadUrl',
-    'uploadUrl',
-    'completeAudioFileKey',
-    'inputKey',
-    'outputKey',
-    'compressedKey',
-    'oggKey',
-  ];
-
   for (const [key, value] of Object.entries(obj)) {
-    // Redact S3 URLs/keys while preserving filename
-    if (s3FieldNames.includes(key) && typeof value === 'string') {
+    // Redact S3 URLs/keys, keeping only a recognized file extension
+    if (
+      NORMALIZED_S3_FIELD_NAMES.has(normalizePHIName(key)) &&
+      typeof value === 'string'
+    ) {
       metadata[key] = redactS3Url(value);
       continue;
     }
 
     // Skip other PHI fields entirely
-    if (PHI_FIELD_NAMES.includes(key)) {
+    if (isPHIFieldName(key)) {
       if (Array.isArray(value)) {
         metadata[`${key}Count`] = value.length;
       } else if (typeof value === 'string') {

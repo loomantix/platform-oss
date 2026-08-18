@@ -598,3 +598,59 @@ describe('logMetadata — S3 redaction', () => {
     }
   });
 });
+
+describe('name matching is case- and separator-insensitive', () => {
+  // The stdout walk matches names this way. When the sink and the detector
+  // used exact matching instead, stdout was protected and the sink was not —
+  // the same drift this list was made the single source of truth to prevent,
+  // with the channels swapped.
+  const spellings = ['PatientId', 'patient_id', 'PATIENT-ID', 'patientId'];
+
+  it.each(spellings)('extractPHIFields finds %s', (name) => {
+    expect(extractPHIFields({ [name]: 'P-1' })).toEqual([name]);
+  });
+
+  it.each(spellings)('hasPHIFields flags %s', (name) => {
+    expect(hasPHIFields({ [name]: 'P-1' })).toBe(true);
+  });
+
+  it.each(spellings)('logMetadata strips %s from the sink payload', (name) => {
+    const out = logMetadata({ [name]: 'P-1' });
+    expect(out[name]).toBeUndefined();
+    expect(out[`${name}Length`]).toBe(3);
+  });
+
+  it('strips a PascalCase clinical field the sink used to forward', () => {
+    const out = logMetadata({ Transcript: 'Patient reports chest pain.' });
+    expect(out['Transcript']).toBeUndefined();
+    expect(out['TranscriptLength']).toBe(27);
+  });
+
+  it('redacts an S3 key named in a different style', () => {
+    expect(logMetadata({ AudioFileKey: 's3://b/e/1/audio.wav' })).toEqual({
+      AudioFileKey: '[REDACTED].wav',
+    });
+  });
+
+  it('leaves an unrelated name alone', () => {
+    expect(logMetadata({ encounterId: 'E-1' })).toEqual({ encounterId: 'E-1' });
+    expect(hasPHIFields({ encounterId: 'E-1' })).toBe(false);
+  });
+});
+
+describe('redactS3Url keeps only a recognized extension', () => {
+  // "Short and alphanumeric" does not separate a format hint from an
+  // identifier: recording keys embed exactly the values this function removes.
+  it.each([
+    ['s3://b/encounters/123/JaneDoe.MRN9987', '[REDACTED]'],
+    ['s3://b/e/recording.20250817', '[REDACTED]'],
+    ['s3://b/e/note.Smith', '[REDACTED]'],
+    ['s3://b/e/audio.wav', '[REDACTED].wav'],
+    ['s3://b/e/audio.OGG', '[REDACTED].ogg'],
+    ['s3://b/e/x.wav?X-Amz-Signature=abc', '[REDACTED].wav'],
+  ])('%s -> %s', (key, expected) => {
+    expect(logMetadata({ audioFileKey: key })).toEqual({
+      audioFileKey: expected,
+    });
+  });
+});

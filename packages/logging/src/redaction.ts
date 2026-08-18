@@ -1,6 +1,6 @@
 /** @format */
 
-import { PHI_FIELD_NAMES } from './phi-detector';
+import { PHI_FIELD_NAMES, normalizePHIName } from './phi-detector';
 
 /** Replacement written in place of a sensitive value. */
 export const CENSOR = '[REDACTED]';
@@ -105,30 +105,21 @@ export const REDACTED_FIELD_NAMES: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
- * Collapse a field name to a case- and separator-insensitive form, so one
- * entry in {@link REDACTED_FIELD_NAMES} covers every spelling of it.
+ * Case- and separator-insensitive forms of every name above.
  *
- * `patientId`, `PatientId`, `patient_id` and `PATIENT-ID` are the same field
- * wearing four different house styles, and a healthcare backend meets all of
- * them: PascalCase is what .NET and most EMR vendor APIs emit. Matching only
- * the exact spelling and its all-lowercase form (which is what this did
- * before) covers single words like `ssn` but silently misses every camelCase
- * name in the list, because `'PatientId'.toLowerCase()` is `patientid` and
- * the set holds `patientId`.
+ * The normalizer itself lives in `phi-detector.ts` so that the stdout walk,
+ * the event sink, and `assertPHISafe` all match names by one rule. Splitting
+ * the rule is how the two channels drifted apart in the first place.
  */
-function normalizeName(name: string): string {
-  return name.toLowerCase().replace(/[_-]/g, '');
-}
-
 const NORMALIZED_FIELD_NAMES: ReadonlySet<string> = new Set(
-  [...REDACTED_FIELD_NAMES].map(normalizeName),
+  [...REDACTED_FIELD_NAMES].map(normalizePHIName),
 );
 
 /** True when `name` names a field whose value must never be logged. */
 function isSensitiveName(name: string): boolean {
   return (
     REDACTED_FIELD_NAMES.has(name) ||
-    NORMALIZED_FIELD_NAMES.has(normalizeName(name))
+    NORMALIZED_FIELD_NAMES.has(normalizePHIName(name))
   );
 }
 
@@ -298,6 +289,28 @@ function redactNode(value: unknown, depth: number, state: WalkState): unknown {
       return redactError(value, depth, state);
     }
 
+    // `toJSON` is what actually reaches the sink: `JSON.stringify` calls it
+    // and serializes its return value, so judging this node by its own
+    // properties inspects a shape that is never written. The method usually
+    // lives on a prototype, so `Object.entries` does not see it, and a class
+    // may hold its data under a private name (`#ssn`, `_ssn`) while the
+    // projection exposes `ssn` — an ORM document or a `class-transformer` DTO
+    // does exactly this. `redact.paths` cannot cover it either: fast-redact
+    // also matches the live object rather than the projection.
+    //
+    // Walking the projection returns an object that is never the original, so
+    // the serializer stringifies the walked shape and cannot re-invoke
+    // `toJSON`. A `toJSON` returning `this` lands on the `seen` guard above
+    // and censors as `[Circular]`, which is the fail-closed answer.
+    const toJson: unknown = (value as { toJSON?: unknown }).toJSON;
+    if (typeof toJson === 'function') {
+      return redactNode(
+        (toJson as (this: unknown) => unknown).call(value),
+        depth,
+        state,
+      );
+    }
+
     if (Array.isArray(value)) {
       let changed = false;
       const out = value.map((item) => {
@@ -363,10 +376,29 @@ function isSensitiveParam(rawName: string): boolean {
   if (isSensitiveName(name)) {
     return true;
   }
-  const unwrapped = name.endsWith('[]')
-    ? name.slice(0, -2)
-    : /^[^[]*\[([^\]]+)\]$/.exec(name)?.[1];
-  return unwrapped !== undefined && isSensitiveName(unwrapped);
+  const bracket = name.indexOf('[');
+  if (bracket === -1) {
+    return false;
+  }
+  // Check the base segment and every bracket segment. Reading only the last
+  // bracket missed both `token[0]` — which is what `qs` emits by default for
+  // a repeated parameter, so the sensitive name is the *base* — and
+  // `filters[auth][token]`, which the previous single-group pattern could not
+  // match at all.
+  if (isSensitiveName(name.slice(0, bracket))) {
+    return true;
+  }
+  for (const match of name.slice(bracket).matchAll(/\[([^\]]*)\]/g)) {
+    const segment = match[1];
+    if (
+      segment !== undefined &&
+      segment.length > 0 &&
+      isSensitiveName(segment)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

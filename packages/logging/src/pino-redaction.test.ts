@@ -435,6 +435,24 @@ describe('pino.config — live framework objects', () => {
     expect(JSON.stringify(captured.lines[1]!)).not.toContain('111-22-3333');
   });
 
+  it('redacts what toJSON produces on the way to stdout', () => {
+    // A plain-object fixture cannot catch this: the projection only exists
+    // because `JSON.stringify` calls the method, downstream of the walk.
+    class Doc {
+      constructor(
+        public id: string,
+        private secretSsn: string,
+      ) {}
+      toJSON() {
+        return { id: this.id, ssn: this.secretSsn };
+      }
+    }
+    captured.logger.info({ doc: new Doc('d1', '111-22-3333') }, 'm');
+    const line = JSON.stringify(captured.lines[0]!);
+    expect(line).not.toContain('111-22-3333');
+    expect(captured.lines[0]!['doc']).toEqual({ id: 'd1', ssn: '[REDACTED]' });
+  });
+
   it('does not let a throwing getter escape the log call', () => {
     const payload: Record<string, unknown> = {};
     Object.defineProperty(payload, 'boom', {
