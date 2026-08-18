@@ -59,7 +59,7 @@ export function validateAnchor(
   line: number | null | undefined,
   side: SupportedSide | null | undefined,
 ): void {
-  if (!(path in files)) {
+  if (!Object.prototype.hasOwnProperty.call(files, path)) {
     fail(`path is not part of the PR diff: ${path}`);
   }
   if (line === null || line === undefined) {

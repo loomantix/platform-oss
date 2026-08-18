@@ -432,7 +432,10 @@ export function getPrFiles(
     pages,
     'PR-files',
   );
-  const files: Record<string, string | null> = {};
+  const files: Record<string, string | null> = Object.create(null) as Record<
+    string,
+    string | null
+  >;
   for (const item of rows) {
     if (typeof item.filename !== 'string') {
       fail('GitHub PR-files item has an unexpected shape');

@@ -52,6 +52,23 @@ describe('diff parsing and anchor validation', () => {
     ).toThrowError(/line 999 is not an exact RIGHT anchor/);
   });
 
+  it('rejects inherited Object.prototype keys as diff paths', () => {
+    const files = { 'src/app.ts': samplePatch };
+    for (const inherited of [
+      'toString',
+      'constructor',
+      'valueOf',
+      'hasOwnProperty',
+    ]) {
+      expect(() => validateAnchor(files, inherited, null, null)).toThrowError(
+        `path is not part of the PR diff: ${inherited}`,
+      );
+      expect(() => validateAnchor(files, inherited, 11, 'RIGHT')).toThrowError(
+        `path is not part of the PR diff: ${inherited}`,
+      );
+    }
+  });
+
   it('rejects an unsupported side at runtime', () => {
     const files = { 'src/app.ts': samplePatch };
     expect(() =>
