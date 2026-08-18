@@ -355,26 +355,12 @@ export function verifyForwardTransition(
   if (before === after) {
     fail('superseding fixed occurrence is not a forward transition');
   }
-  const runner = getGitHubRunner();
-  const comparison = runner.gitCompare
-    ? (runner.gitCompare(repo, before, after) as Record<string, unknown>)
-    : jsonOutput<Record<string, unknown>>([
-        'api',
-        `repos/${repo}/compare/${before}...${after}`,
-      ]);
-  const mergeBase = comparison?.['merge_base_commit'] as
-    | { sha?: string }
-    | undefined;
-  if (
-    typeof comparison !== 'object' ||
-    comparison === null ||
-    comparison['status'] !== 'ahead' ||
-    typeof mergeBase !== 'object' ||
-    mergeBase === null ||
-    mergeBase.sha !== before
-  ) {
-    fail('superseding local-review occurrence is not forward-only');
-  }
+  verifyForwardTransitionOrFail(
+    repo,
+    before,
+    after,
+    'superseding local-review occurrence is not forward-only',
+  );
 }
 
 /**

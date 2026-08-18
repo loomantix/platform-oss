@@ -438,23 +438,12 @@ export function verifyComment(
   commentId: number,
   expectedBody: string,
 ): void {
-  const response = jsonOutput<Record<string, unknown>>([
-    'api',
+  verifyOwnedComment(
     `repos/${repo}/pulls/comments/${commentId}`,
-  ]);
-  const user = (response['user'] ?? response['author']) as
-    | { login?: string }
-    | undefined;
-  if (
-    typeof response !== 'object' ||
-    response === null ||
-    response['body'] !== expectedBody ||
-    typeof user !== 'object' ||
-    user === null ||
-    user.login !== currentActor()
-  ) {
-    fail(`could not verify review comment ${commentId} after posting`);
-  }
+    commentId,
+    expectedBody,
+    'review comment',
+  );
 }
 
 /**
@@ -465,10 +454,21 @@ export function verifyIssueComment(
   commentId: number,
   expectedBody: string,
 ): void {
-  const response = jsonOutput<Record<string, unknown>>([
-    'api',
+  verifyOwnedComment(
     `repos/${repo}/issues/comments/${commentId}`,
-  ]);
+    commentId,
+    expectedBody,
+    'PR comment',
+  );
+}
+
+function verifyOwnedComment(
+  endpoint: string,
+  commentId: number,
+  expectedBody: string,
+  label: string,
+): void {
+  const response = jsonOutput<Record<string, unknown>>(['api', endpoint]);
   const user = (response['user'] ?? response['author']) as
     | { login?: string }
     | undefined;
@@ -480,7 +480,7 @@ export function verifyIssueComment(
     user === null ||
     user.login !== currentActor()
   ) {
-    fail(`could not verify PR comment ${commentId} after posting`);
+    fail(`could not verify ${label} ${commentId} after posting`);
   }
 }
 

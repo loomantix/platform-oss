@@ -79,6 +79,15 @@ interface CliArgs {
   rule?: string | undefined;
 }
 
+function writeSortedJson(value: unknown): void {
+  const source = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(source).sort()) {
+    sorted[key] = source[key];
+  }
+  process.stdout.write(JSON.stringify(sorted) + '\n');
+}
+
 function parseCliArgs(argv: string[]): CliArgs {
   const args: CliArgs = {};
   let i = 0;
@@ -501,12 +510,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         resultFile: args.resultFile,
         resultHead: args.resultHead,
       });
-      const sortedKeys = Object.keys(out).sort();
-      const sortedObj: Record<string, unknown> = {};
-      for (const k of sortedKeys) {
-        sortedObj[k] = (out as unknown as Record<string, unknown>)[k];
-      }
-      process.stdout.write(JSON.stringify(sortedObj) + '\n');
+      writeSortedJson(out);
       break;
     }
     case 'write-result': {
@@ -538,12 +542,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         historicalCommentIdsFile: args.historicalCommentIdsFile,
         classification: args.classification,
       });
-      const sortedKeys = Object.keys(out).sort();
-      const sortedObj: Record<string, unknown> = {};
-      for (const k of sortedKeys) {
-        sortedObj[k] = (out as unknown as Record<string, unknown>)[k];
-      }
-      process.stdout.write(JSON.stringify(sortedObj) + '\n');
+      writeSortedJson(out);
       break;
     }
     case 'write-blocked-result': {
@@ -567,12 +566,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         resultFile: args.resultFile,
         blockerFile: args.blockerFile,
       });
-      const sortedKeys = Object.keys(out).sort();
-      const sortedObj: Record<string, unknown> = {};
-      for (const k of sortedKeys) {
-        sortedObj[k] = (out as unknown as Record<string, unknown>)[k];
-      }
-      process.stdout.write(JSON.stringify(sortedObj) + '\n');
+      writeSortedJson(out);
       break;
     }
     case 'attest': {
@@ -638,12 +632,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         head: args.head,
         fingerprint: args.fingerprint,
       });
-      const sortedKeys = Object.keys(out).sort();
-      const sortedObj: Record<string, unknown> = {};
-      for (const k of sortedKeys) {
-        sortedObj[k] = (out as unknown as Record<string, unknown>)[k];
-      }
-      process.stdout.write(JSON.stringify(sortedObj) + '\n');
+      writeSortedJson(out);
       break;
     }
     case 'verify-ledger': {
@@ -666,12 +655,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         allowedHeadsFile: args.allowedHeadsFile,
         expectedThreadsSha256: args.expectedThreadsSha256,
       });
-      const sortedKeys = Object.keys(out).sort();
-      const sortedObj: Record<string, unknown> = {};
-      for (const k of sortedKeys) {
-        sortedObj[k] = (out as unknown as Record<string, unknown>)[k];
-      }
-      process.stdout.write(JSON.stringify(sortedObj) + '\n');
+      writeSortedJson(out);
       break;
     }
     case 'read-result': {

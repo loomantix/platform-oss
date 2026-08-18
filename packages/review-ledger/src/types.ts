@@ -1,9 +1,4 @@
 /**
- * Protocol version for deterministic review ledger entries.
- */
-export const PROTOCOL_VERSION = 3 as const;
-
-/**
  * A review engine that may own ledger records.
  */
 export type SupportedEngine = 'codex' | 'claude' | 'gemini' | 'antigravity';
