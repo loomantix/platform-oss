@@ -138,9 +138,7 @@ export interface BaseResultParams {
 export interface WriteResultParams extends BaseResultParams {
   repo: string;
   pr: number;
-  threadsFile?: string | undefined;
   allowedHeadsFile?: string | undefined;
-  expectedThreadsSha256?: string | undefined;
   actor?: string | undefined;
   historicalCommentIdsFile?: string | undefined;
   classification?: SupportedClassification | undefined;

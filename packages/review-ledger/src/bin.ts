@@ -12,10 +12,20 @@ import { runCli } from './cli.js';
 try {
   const exitCode = runCli();
   if (exitCode !== 0) {
-    process.exit(exitCode);
+    process.exitCode = exitCode;
   }
 } catch (error: unknown) {
-  const err = error as { message?: string };
-  process.stderr.write(`review-ledger: ${err.message ?? String(error)}\n`);
-  process.exit(1);
+  // console.error + exitCode rather than stderr.write + process.exit: when
+  // stderr is a pipe, process.exit can terminate before the write drains and
+  // the run fails with no diagnostic at all.
+  const err = error as { message?: string; name?: string; cause?: unknown };
+  const kind = err.name === 'LedgerError' ? '' : 'unexpected error: ';
+  const cause =
+    err.cause === undefined
+      ? ''
+      : `\n  caused by: ${(err.cause as { message?: string })?.message ?? String(err.cause)}`;
+  console.error(
+    `review-ledger: ${kind}${err.message ?? String(error)}${cause}`,
+  );
+  process.exitCode = 1;
 }

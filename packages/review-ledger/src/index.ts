@@ -109,7 +109,7 @@ export {
   loadHistoricalCommentIds,
   verifyPseudoV3History,
   loadAllowedHeads,
-  rowsHavePseudoV3,
+  rowsHaveHistoricalMarkers,
 } from './github.js';
 
 export { formatFindings } from './format.js';

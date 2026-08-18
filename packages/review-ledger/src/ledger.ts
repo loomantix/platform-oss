@@ -15,6 +15,8 @@ import {
   assertThreadScope,
   compareIsForward,
   currentActor,
+  deleteIssueComment,
+  findMatchingAttestation,
   findMatchingBody,
   getGitHubRunner,
   getIssueComments,
@@ -26,7 +28,7 @@ import {
   loadHistoricalCommentIds,
   postReviewComment,
   reviewThreads,
-  rowsHavePseudoV3,
+  rowsHaveHistoricalMarkers,
   setThreadState,
   verifyComment,
   verifyGitTransition,
@@ -717,12 +719,11 @@ export function verifyResultEvidence(
  */
 export function writeResult(params: WriteResultParams): LedgerResult {
   assertActor(params.actor);
-  const threads = reviewThreads(
-    params.repo,
-    params.pr,
-    params.threadsFile,
-    params.expectedThreadsSha256,
-  );
+  verifyReviewBase(params.repo, params.pr, params.base, params.before);
+  verifyGitTransition(params.before, params.head, params.head);
+  // Result derivation always reads live threads. A snapshot's seal proves only
+  // that the file did not change after capture, never where it came from.
+  const threads = reviewThreads(params.repo, params.pr);
   const historicalCommentIds = loadHistoricalCommentIds(
     params.historicalCommentIdsFile,
   );
@@ -791,6 +792,13 @@ export function writeResult(params: WriteResultParams): LedgerResult {
     findingFingerprints: dispositions.map(([fingerprint]) => fingerprint),
     finalLaneComplete: true,
   };
+
+  validateResultData(params, Buffer.from(JSON.stringify(value) + '\n', 'utf8'));
+  verifyResultEvidence(params, threads, {
+    data: value as unknown as LedgerResult,
+    allowedHeads,
+    historicalCommentIds,
+  });
 
   writeResultFile(params.resultFile, value);
   const raw = readResultBytes(params.resultFile);
@@ -904,7 +912,7 @@ export function postFinding(params: PostFindingParams): PostFindingResult {
 
   if (isV3) {
     const comments = getReviewComments(params.repo, params.pr);
-    if (rowsHavePseudoV3(comments)) {
+    if (rowsHaveHistoricalMarkers(comments)) {
       verifyHistoricalThreads(params.repo, params.pr);
     }
     const existing = findMatchingBody(
@@ -988,7 +996,7 @@ export function reopenOccurrence(
 
   verifyHead(params.repo, params.pr, params.head);
   const comments = getReviewComments(params.repo, params.pr);
-  if (rowsHavePseudoV3(comments)) {
+  if (rowsHaveHistoricalMarkers(comments)) {
     verifyHistoricalThreads(params.repo, params.pr);
   }
 
@@ -1026,20 +1034,17 @@ export function reopenOccurrence(
     }
   }
 
-  if (existing === null) {
-    const occurrences = records
-      .map((entry) => entry.match.occurrence)
-      .sort((a, b) => a - b);
-    const expected = Array.from(
-      { length: params.occurrence - 1 },
-      (_, i) => i + 1,
-    );
-    const matchSeq =
-      occurrences.length === expected.length &&
-      occurrences.every((v, i) => v === expected[i]);
-    if (!matchSeq) {
-      fail('finding occurrences are missing, duplicated, or out of sequence');
-    }
+  // Checked on the replay path as well: a retry after a lost response is the
+  // most likely moment for the occurrence history to be partially written.
+  const occurrences = records
+    .map((entry) => entry.match.occurrence)
+    .sort((a, b) => a - b);
+  const expectedLength = params.occurrence - (existing === null ? 1 : 0);
+  const matchSeq =
+    occurrences.length === expectedLength &&
+    occurrences.every((v, i) => v === i + 1);
+  if (!matchSeq) {
+    fail('finding occurrences are missing, duplicated, or out of sequence');
   }
 
   const { commentId, replayed } = postReviewComment(
@@ -1055,6 +1060,7 @@ export function reopenOccurrence(
     params.threadId,
     false,
     params.commentId,
+    { repo: params.repo, pr: params.pr },
   );
   verifyHead(params.repo, params.pr, params.head);
 
@@ -1089,7 +1095,7 @@ export function dispose(params: DisposeParams): DisposeResult {
 
   verifyHead(params.repo, params.pr, params.head);
   const comments = getReviewComments(params.repo, params.pr);
-  if (rowsHavePseudoV3(comments)) {
+  if (rowsHaveHistoricalMarkers(comments)) {
     verifyHistoricalThreads(params.repo, params.pr);
   }
 
@@ -1149,6 +1155,7 @@ export function dispose(params: DisposeParams): DisposeResult {
     params.threadId,
     true,
     params.commentId,
+    { repo: params.repo, pr: params.pr },
   );
   verifyHead(params.repo, params.pr, params.head);
 
@@ -1258,13 +1265,15 @@ export function attest(params: AttestParams): AttestResult {
   const body = `${marker}\n${content}`;
   verifyHead(params.repo, params.pr, params.head);
 
-  const existing = findMatchingBody(
+  const existing = findMatchingAttestation(
     getIssueComments(params.repo, params.pr),
-    marker,
+    params.engine,
+    params.round,
     body,
   );
   let commentId: number;
   let replayed = existing !== null;
+  let created = existing === null;
 
   if (existing === null) {
     try {
@@ -1288,6 +1297,7 @@ export function attest(params: AttestParams): AttestResult {
         if (recovered === null) throw error;
         commentId = recovered;
         replayed = true;
+        created = false;
       } else {
         throw error;
       }
@@ -1296,8 +1306,28 @@ export function attest(params: AttestParams): AttestResult {
     commentId = existing;
   }
 
-  verifyIssueComment(params.repo, commentId, body);
-  verifyHead(params.repo, params.pr, params.head);
+  // An attestation that fails its own read-back must not survive: the marker is
+  // what later rounds read to decide whether this round happened.
+  try {
+    verifyIssueComment(params.repo, commentId, body);
+    verifyReviewBase(params.repo, params.pr, params.base, params.before);
+    verifyHead(params.repo, params.pr, params.head);
+  } catch (error) {
+    if (created) {
+      try {
+        deleteIssueComment(params.repo, params.pr, commentId);
+      } catch (rollbackError) {
+        throw new LedgerError(
+          `attestation verification failed and rollback could not be verified: ${
+            (rollbackError as { message?: string }).message ??
+            String(rollbackError)
+          }`,
+          { cause: error },
+        );
+      }
+    }
+    throw error;
+  }
 
   return {
     comment_id: commentId,
@@ -1313,7 +1343,10 @@ export function attest(params: AttestParams): AttestResult {
 export function resolve(params: ResolveParams): ResolveResult {
   verifyHead(params.repo, params.pr, params.head);
   assertThreadIdsInScope(params.repo, params.pr, [params.threadId]);
-  setThreadState(params.threadId, true);
+  setThreadState(params.threadId, true, undefined, {
+    repo: params.repo,
+    pr: params.pr,
+  });
   verifyHead(params.repo, params.pr, params.head);
   return { thread_id: params.threadId, resolved: true };
 }
@@ -1330,7 +1363,10 @@ export function resolveThreads(params: {
   verifyHead(params.repo, params.pr, params.head);
   assertThreadIdsInScope(params.repo, params.pr, params.threadIds);
   for (const threadId of params.threadIds) {
-    setThreadState(threadId, true);
+    setThreadState(threadId, true, undefined, {
+      repo: params.repo,
+      pr: params.pr,
+    });
   }
   verifyHead(params.repo, params.pr, params.head);
   return { threadIds: params.threadIds, resolved: true };
@@ -1353,7 +1389,7 @@ function assertThreadIdsInScope(
 export function reconcile(params: ReconcileParams): ReconcileResult {
   verifyHead(params.repo, params.pr, params.head);
   const comments = getReviewComments(params.repo, params.pr);
-  if (rowsHavePseudoV3(comments)) {
+  if (rowsHaveHistoricalMarkers(comments)) {
     verifyHistoricalThreads(params.repo, params.pr);
   }
 
@@ -1375,16 +1411,22 @@ export function reconcile(params: ReconcileParams): ReconcileResult {
   const occurrences = findingRows
     .map((row) => row['occurrence'] as number)
     .sort((a, b) => a - b);
-  const sequenceValid =
-    occurrences.length > 0 && occurrences.every((val, idx) => val === idx + 1);
+  // An empty occurrence list is a valid sequence: it is what a fingerprint that
+  // has never been posted looks like, which is the case reconcile exists for.
+  const sequenceValid = occurrences.every((val, idx) => val === idx + 1);
+
+  const identity = (row: Record<string, unknown>): string =>
+    `${String(row['engine'])}|${String(row['round'])}|${String(row['fingerprint'])}|${String(row['occurrence'])}`;
+  const findingKeys = new Set(findingRows.map(identity));
+  const dispositionKeys = dispositionRows.map(identity);
 
   const disposed = new Set(
     dispositionRows.map((row) => row['occurrence'] as number),
   );
   const ledgerValid =
     sequenceValid &&
-    disposed.size === dispositionRows.length &&
-    [...disposed].every((occ) => occurrences.includes(occ));
+    new Set(dispositionKeys).size === dispositionKeys.length &&
+    dispositionKeys.every((key) => findingKeys.has(key));
 
   const undisposed = occurrences.filter((occ) => !disposed.has(occ));
   const nextAction = !ledgerValid

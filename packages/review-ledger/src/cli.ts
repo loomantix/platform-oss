@@ -14,6 +14,7 @@ import {
   SUPPORTED_SIDES,
 } from './constants.js';
 import { fail } from './errors.js';
+import { assertRegularFile, parseJsonOrFail } from './io.js';
 import { requireSha } from './hash.js';
 import {
   attest,
@@ -75,9 +76,6 @@ interface CliArgs {
   classification?: SupportedClassification | undefined;
   jsonFile?: string | undefined;
   file?: string | undefined;
-  message?: string | undefined;
-  rootCause?: string | undefined;
-  rule?: string | undefined;
 }
 
 function writeSortedJson(value: unknown): void {
@@ -242,15 +240,6 @@ function parseCliArgs(argv: string[]): CliArgs {
         break;
       case '--json-file':
         args.jsonFile = parseVal(arg);
-        break;
-      case '--message':
-        args.message = parseVal(arg);
-        break;
-      case '--root-cause':
-        args.rootCause = parseVal(arg);
-        break;
-      case '--rule':
-        args.rule = parseVal(arg);
         break;
       default:
         fail(`unknown argument: ${arg}`);
@@ -530,9 +519,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         resultFile: args.resultFile,
         repo: args.repo,
         pr: args.pr,
-        threadsFile: args.threadsFile,
         allowedHeadsFile: args.allowedHeadsFile,
-        expectedThreadsSha256: args.expectedThreadsSha256,
         actor: args.actor,
         historicalCommentIdsFile: args.historicalCommentIdsFile,
         classification: args.classification,
@@ -668,9 +655,24 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
       if (!jsonPath) {
         fail('format-findings requires --json-file or --file');
       }
-      const raw = readFileSync(jsonPath, 'utf8');
-      const findings = JSON.parse(raw) as ReviewFinding[];
-      const formatted = formatFindings(findings);
+      assertRegularFile(
+        jsonPath,
+        'findings file must be a regular non-symlink file',
+      );
+      const parsed = parseJsonOrFail(
+        readFileSync(jsonPath, 'utf8'),
+        'findings file must contain valid UTF-8 JSON',
+      );
+      if (
+        !Array.isArray(parsed) ||
+        parsed.some(
+          (row) =>
+            typeof row !== 'object' || row === null || Array.isArray(row),
+        )
+      ) {
+        fail('findings file must contain a JSON array of finding objects');
+      }
+      const formatted = formatFindings(parsed as ReviewFinding[]);
       process.stdout.write(formatted + '\n');
       break;
     }

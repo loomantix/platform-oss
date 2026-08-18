@@ -7,6 +7,9 @@ import {
   EXPECTED_ACTOR_ENV,
   EXPECTED_THREADS_SHA256_ENV,
   HISTORICAL_COMMENT_IDS_ENV,
+  DISPOSITION_V1,
+  FINDING_V1,
+  FINDING_V3_OPENER,
   FINDING_V3_RE,
   PSEUDO_V3_RE,
   SHA_64_RE,
@@ -63,11 +66,7 @@ export class DefaultGitHubRunner implements GitHubRunner {
     if (this.actor !== null) {
       return this.actor;
     }
-    const output = this.runGh(['api', 'user', '--jq', '.login']).trim();
-    if (!output) {
-      fail('could not resolve the authenticated GitHub actor');
-    }
-    this.actor = output;
+    this.actor = resolveLoginOrFail(this.runGh(['api', 'user']));
     return this.actor;
   }
 
@@ -196,6 +195,33 @@ export function compareIsForward(
 }
 
 /**
+ * Parse a `gh api user` response and require a non-empty string `login`.
+ *
+ * Reading `--jq .login` instead would accept the literal `null` jq prints for a
+ * missing field. A wrong-but-non-empty actor is the dangerous case: it matches
+ * no comment, so every actor-owned collection empties and every "for all
+ * threads" rule passes vacuously.
+ */
+function resolveLoginOrFail(raw: string): string {
+  const response = parseJsonOrFail<Record<string, unknown>>(
+    raw,
+    'GitHub returned an invalid authenticated-user response',
+  );
+  const login = response?.['login'];
+  if (
+    typeof response !== 'object' ||
+    response === null ||
+    typeof login !== 'string'
+  ) {
+    fail('GitHub returned an invalid authenticated-user response');
+  }
+  if (!login) {
+    fail('GitHub returned an empty authenticated user');
+  }
+  return login;
+}
+
+/**
  * Resolve the authenticated GitHub login, honouring the actor pin.
  */
 export function currentActor(): string {
@@ -204,11 +230,7 @@ export function currentActor(): string {
     login = activeRunner.currentActor();
   } else {
     if (defaultActor === null) {
-      const actor = runGh(['api', 'user', '--jq', '.login']).trim();
-      if (!actor) {
-        fail('could not resolve the authenticated GitHub actor');
-      }
-      defaultActor = actor;
+      defaultActor = resolveLoginOrFail(runGh(['api', 'user']));
     }
     login = defaultActor;
   }
@@ -509,6 +531,76 @@ function verifyOwnedComment(
 }
 
 /**
+ * Find a prior attestation for this engine and round, whatever head it names.
+ *
+ * Attestation identity is `(engine, round)`, not the full marker: a second
+ * attestation naming a different head, classification, fingerprint set or
+ * result digest is a contradiction to reject, not a new record to append.
+ */
+export function findMatchingAttestation(
+  rows: Array<Record<string, unknown>>,
+  engine: string,
+  round: number,
+  body: string,
+): number | null {
+  const prefixes = [
+    `<!-- local-review-pass:v3 engine=${engine} round=${round} `,
+    `<!-- local-review-complete:v3 engine=${engine} round=${round} `,
+  ];
+  const matches = rows.filter((row) =>
+    prefixes.some((prefix) => String(row['body'] ?? '').startsWith(prefix)),
+  );
+  if (matches.length === 0) {
+    return null;
+  }
+  if (matches.length !== 1) {
+    fail('local-review attestation identity is duplicated');
+  }
+  const row = matches[0]!;
+  if (row['body'] !== body || typeof row['id'] !== 'number') {
+    fail('local-review attestation identity conflicts with existing evidence');
+  }
+  return row['id'] as number;
+}
+
+/**
+ * Report whether an issue comment is still present on the pull request.
+ */
+export function issueCommentExists(
+  repo: string,
+  pr: number,
+  commentId: number,
+): boolean {
+  return getIssueComments(repo, pr).some((row) => row['id'] === commentId);
+}
+
+/**
+ * Delete an issue comment and confirm it is gone.
+ */
+export function deleteIssueComment(
+  repo: string,
+  pr: number,
+  commentId: number,
+): void {
+  try {
+    runGh([
+      'api',
+      '-X',
+      'DELETE',
+      `repos/${repo}/issues/comments/${commentId}`,
+    ]);
+  } catch (error) {
+    if (issueCommentExists(repo, pr, commentId)) {
+      throw error;
+    }
+    return;
+  }
+  if (issueCommentExists(repo, pr, commentId)) {
+    fail(`could not verify rollback of PR comment ${commentId}`);
+  }
+}
+
+/**
  * Extract the comment id from a create-comment response.
  */
 export function getPostedCommentId(response: unknown): number {
@@ -622,13 +714,19 @@ export function postReviewComment(
 /**
  * Report whether a review thread is currently resolved.
  */
-export function getThreadState(threadId: string, commentId?: number): boolean {
+export function getThreadState(
+  threadId: string,
+  commentId?: number,
+  scope?: { repo: string; pr: number },
+): boolean {
   const query = `
 query($threadId: ID!) {
   node(id: $threadId) {
     ... on PullRequestReviewThread {
       id
       isResolved
+      repository { nameWithOwner }
+      pullRequest { number }
       comments(first: 100) {
         nodes { databaseId }
         pageInfo { hasNextPage }
@@ -647,6 +745,8 @@ query($threadId: ID!) {
     | {
         id?: unknown;
         isResolved?: unknown;
+        repository?: { nameWithOwner?: unknown };
+        pullRequest?: { number?: unknown };
         comments?: {
           nodes?: Array<{ databaseId?: unknown }>;
           pageInfo?: { hasNextPage?: unknown };
@@ -656,6 +756,22 @@ query($threadId: ID!) {
 
   if (typeof thread !== 'object' || thread === null || thread.id !== threadId) {
     fail(`could not verify review thread ${threadId}`);
+  }
+  if (scope) {
+    const repository = thread.repository;
+    const pullRequest = thread.pullRequest;
+    if (
+      typeof repository !== 'object' ||
+      repository === null ||
+      repository.nameWithOwner !== scope.repo ||
+      typeof pullRequest !== 'object' ||
+      pullRequest === null ||
+      pullRequest.number !== scope.pr
+    ) {
+      fail(
+        `review thread ${threadId} does not belong to ${scope.repo}#${scope.pr}`,
+      );
+    }
   }
   if (typeof thread.isResolved !== 'boolean') {
     fail(`review thread ${threadId} has invalid resolution state`);
@@ -677,8 +793,8 @@ query($threadId: ID!) {
       fail('review thread comments are incomplete');
     }
     const ids = nodes.map((node) => node.databaseId);
-    if (!ids.includes(commentId)) {
-      fail('--comment-id does not belong to --thread-id');
+    if (ids.length === 0 || ids[0] !== commentId) {
+      fail('--comment-id is not the root comment of --thread-id');
     }
   }
 
@@ -692,8 +808,9 @@ export function setThreadState(
   threadId: string,
   resolved: boolean,
   commentId?: number,
+  scope?: { repo: string; pr: number },
 ): boolean {
-  if (getThreadState(threadId, commentId) === resolved) {
+  if (getThreadState(threadId, commentId, scope) === resolved) {
     return true;
   }
   const field = resolved ? 'resolveReviewThread' : 'unresolveReviewThread';
@@ -742,9 +859,9 @@ mutation($threadId: ID!) {
 
   let verified: boolean;
   try {
-    verified = getThreadState(threadId, commentId);
+    verified = getThreadState(threadId, commentId, scope);
   } catch {
-    verified = getThreadState(threadId, commentId);
+    verified = getThreadState(threadId, commentId, scope);
   }
   if (verified !== resolved) {
     fail(`could not verify review thread ${threadId} resolved=${resolved}`);
@@ -1110,6 +1227,17 @@ export function loadAllowedHeads(
 /**
  * Report whether any row carries a historical pseudo-v3 marker.
  */
-export function rowsHavePseudoV3(rows: Array<{ body?: unknown }>): boolean {
-  return rows.some((row) => PSEUDO_V3_RE.test(String(row.body ?? '')));
+export function rowsHaveHistoricalMarkers(
+  rows: Array<{ body?: unknown }>,
+): boolean {
+  return rows.some((row) => {
+    const body = String(row.body ?? '');
+    if (body.includes(FINDING_V1) || body.includes(DISPOSITION_V1)) {
+      return true;
+    }
+    if (body.includes(FINDING_V3_OPENER) && !FINDING_V3_RE.test(body)) {
+      return true;
+    }
+    return PSEUDO_V3_RE.test(body);
+  });
 }

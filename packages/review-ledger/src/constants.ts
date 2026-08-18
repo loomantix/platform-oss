@@ -71,6 +71,9 @@ export const LEGACY_THREAD_MARKER_RE =
 
 export const FINDING_V1 = '<!-- local-review:v1 ';
 export const DISPOSITION_V1 = '<!-- local-review-disposition:v1 ';
+
+/** Opening token of a v3 finding marker, used to spot malformed v3 records. */
+export const FINDING_V3_OPENER = '<!-- local-review:v3';
 export const PR_V1_MARKERS: readonly string[] = [
   '<!-- local-review-refactor:v1 ',
   '<!-- local-review-pass:v1 ',

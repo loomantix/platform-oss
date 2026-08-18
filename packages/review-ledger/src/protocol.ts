@@ -66,9 +66,13 @@ export function readContent(path: string): string {
   }
   assertRegularFile(path, 'content file must be a regular non-symlink file');
 
+  // Decoded strictly: readFileSync(path, 'utf8') never throws on invalid bytes,
+  // it substitutes U+FFFD. The marker would then seal text nobody wrote.
   let content: string;
   try {
-    content = readFileSync(path, 'utf8');
+    content = new TextDecoder('utf-8', { fatal: true }).decode(
+      readFileSync(path),
+    );
   } catch (error) {
     throw new LedgerError('content file must be valid UTF-8', { cause: error });
   }
