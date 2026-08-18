@@ -10,6 +10,19 @@ import type {
 export const PROTOCOL_VERSION = 3;
 
 /**
+ * Version of this package, injected at build time by tsup's `define`.
+ *
+ * It cannot be read from `package.json` at runtime: the single-file build is
+ * vendored into consumer repos on its own, with no package around it. The
+ * `typeof` guard keeps the source runnable under vitest and `tsx`, where no
+ * define is applied; a published build that somehow reached a consumer with
+ * this fallback would be a build bug, so the publish workflow asserts the
+ * built bundle reports the real version before it ships.
+ */
+export const PACKAGE_VERSION: string =
+  typeof __PACKAGE_VERSION__ === 'string' ? __PACKAGE_VERSION__ : '0.0.0-dev';
+
+/**
  * Output ceiling for every `gh` and `git` subprocess.
  *
  * Node caps `execFileSync` output at 1 MiB by default and fails the call with
