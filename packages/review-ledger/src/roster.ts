@@ -44,22 +44,36 @@ export function parseReviewers(
   if (raw === 'none') {
     return [];
   }
-  const parts = raw.split(',');
-  const reviewers: SupportedEngine[] = [];
-  for (const part of parts) {
-    if (!SUPPORTED_ENGINES.includes(part as SupportedEngine)) {
+  return validateReviewers(raw.split(','), author);
+}
+
+/**
+ * Apply the three roster rules to a reviewer list: every entry is a supported
+ * engine, none of them is the author, and no engine appears twice.
+ *
+ * The builder and the parser share this so a roster this package writes is one
+ * this package will read back. A rule enforced on only one side would let a
+ * marker exist that its own reader rejects.
+ */
+function validateReviewers(
+  reviewers: readonly string[],
+  author: SupportedEngine,
+): SupportedEngine[] {
+  const validated: SupportedEngine[] = [];
+  for (const candidate of reviewers) {
+    if (!SUPPORTED_ENGINES.includes(candidate as SupportedEngine)) {
       fail(`reviewer must be one of: ${SUPPORTED_ENGINES.join(', ')}`);
     }
-    const engine = part as SupportedEngine;
+    const engine = candidate as SupportedEngine;
     if (engine === author) {
       fail('the author engine cannot also be listed as a reviewer');
     }
-    if (reviewers.includes(engine)) {
+    if (validated.includes(engine)) {
       fail('reviewers must be distinct');
     }
-    reviewers.push(engine);
+    validated.push(engine);
   }
-  return reviewers;
+  return validated;
 }
 
 /**
@@ -93,17 +107,7 @@ export function buildRosterBody(params: {
   if (!SUPPORTED_ENGINES.includes(params.author)) {
     fail(`author must be one of: ${SUPPORTED_ENGINES.join(', ')}`);
   }
-  for (const reviewer of params.reviewers) {
-    if (!SUPPORTED_ENGINES.includes(reviewer)) {
-      fail(`reviewer must be one of: ${SUPPORTED_ENGINES.join(', ')}`);
-    }
-    if (reviewer === params.author) {
-      fail('the author engine cannot also be listed as a reviewer');
-    }
-  }
-  if (new Set(params.reviewers).size !== params.reviewers.length) {
-    fail('reviewers must be distinct');
-  }
+  validateReviewers(params.reviewers, params.author);
   const reviewers =
     params.reviewers.length === 0 ? 'none' : params.reviewers.join(',');
   const marker =
