@@ -23,6 +23,8 @@ class MockRunner implements GitHubRunner {
   public issueComments: Array<Record<string, unknown>> = [];
   public commentIdSeq = 500;
   public prHead = HEAD;
+  public concurrentRosterBody: string | null = null;
+  public moveHeadAfterCommentRead = false;
 
   runGh(args: string[], payload?: unknown): string {
     const cmd = args.join(' ');
@@ -33,7 +35,16 @@ class MockRunner implements GitHubRunner {
       return this.prHead;
     }
     if (cmd.includes('/issues/') && cmd.includes('/comments?per_page=100')) {
-      return JSON.stringify([this.issueComments]);
+      const response = JSON.stringify([this.issueComments]);
+      if (this.moveHeadAfterCommentRead) {
+        this.prHead = OLD_HEAD;
+      }
+      return response;
+    }
+    if (cmd.includes('-X DELETE') && cmd.includes('/issues/comments/')) {
+      const id = parseInt(args.at(-1)!.split('/').pop()!, 10);
+      this.issueComments = this.issueComments.filter((c) => c['id'] !== id);
+      return '';
     }
     if (cmd.includes('/issues/comments/')) {
       const id = parseInt(args[1]!.split('/').pop()!, 10);
@@ -43,6 +54,14 @@ class MockRunner implements GitHubRunner {
       );
     }
     if (cmd.includes('-X POST') && cmd.includes('/issues/')) {
+      if (this.concurrentRosterBody !== null) {
+        this.issueComments.push({
+          id: this.commentIdSeq++,
+          user: { login: this.actor },
+          body: this.concurrentRosterBody,
+        });
+        this.concurrentRosterBody = null;
+      }
       const id = this.commentIdSeq++;
       const body = (payload as { body?: string })?.body ?? '';
       this.issueComments.push({ id, user: { login: this.actor }, body });
@@ -115,6 +134,12 @@ describe('parseReviewers', () => {
     expect(() => parseReviewers('codex,codex', 'claude')).toThrow(/distinct/);
     expect(() => parseReviewers('copilot', 'claude')).toThrow(/must be one of/);
   });
+
+  it('rejects more than two reviewers', () => {
+    expect(() => parseReviewers('codex,gemini,antigravity', 'claude')).toThrow(
+      /at most two reviewers/,
+    );
+  });
 });
 
 describe('buildRosterBody', () => {
@@ -137,6 +162,16 @@ describe('buildRosterBody', () => {
         content: 'x',
       }),
     ).toThrow(/author must be one of/);
+  });
+
+  it('refuses a roster with more than two reviewers', () => {
+    expect(() =>
+      buildRosterBody({
+        author: 'claude',
+        reviewers: ['codex', 'gemini', 'antigravity'],
+        content: 'Too many reviewers.',
+      }),
+    ).toThrow(/at most two reviewers/);
   });
 
   it('emits none rather than an empty value for a solo relay', () => {
@@ -236,6 +271,26 @@ describe('postRoster', () => {
       }),
     ).toThrow(/conflicting content/);
   });
+
+  it('converges concurrent identical posts onto one roster', () => {
+    const declaration = {
+      author: 'claude' as const,
+      reviewers: ['codex'] as const,
+      content: 'Codex reviews this one.',
+    };
+    runner.concurrentRosterBody = buildRosterBody(declaration).body;
+
+    const posted = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: HEAD,
+      ...declaration,
+    });
+
+    expect(posted).toMatchObject({ comment_id: 500, replayed: true });
+    expect(runner.issueComments).toHaveLength(1);
+    expect(readRoster({ repo: 'o/r', pr: 1 }).commentId).toBe(500);
+  });
 });
 
 describe('attestationsAtHead', () => {
@@ -291,6 +346,18 @@ describe('attestationsAtHead', () => {
       { engine: 'codex', round: 2, status: 'changed' },
     ]);
   });
+
+  it('rejects conflicting attestations with the same engine-round identity', () => {
+    expect(() =>
+      attestationsAtHead(
+        [
+          { body: passMarker('codex', 1, OLD_HEAD) },
+          { body: completeMarker('codex', 1, HEAD) },
+        ],
+        HEAD,
+      ),
+    ).toThrow(/attestation identity is duplicated/);
+  });
 });
 
 describe('coverageTier', () => {
@@ -335,6 +402,17 @@ describe('coverage', () => {
     expect(report.roundComplete).toBe(true);
   });
 
+  it('does not count undeclared engines towards the coverage tier', () => {
+    declareRoster('claude', ['codex']);
+    addComment(passMarker('codex', 1, HEAD));
+    addComment(passMarker('gemini', 1, HEAD));
+
+    const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
+    expect(report.attestedAtHead).toEqual(['codex', 'gemini']);
+    expect(report.nonAuthorAttested).toEqual(['codex']);
+    expect(report.tier).toBe('cross');
+  });
+
   it('drops an engine whose attestation names a superseded head', () => {
     declareRoster('claude', ['codex', 'gemini']);
     addComment(passMarker('codex', 1, HEAD));
@@ -374,6 +452,33 @@ describe('coverage', () => {
     expect(report.tier).toBe('solo');
     expect(report.soloAcknowledged).toBe(true);
     expect(report.roundComplete).toBe(true);
+  });
+
+  it('does not report a zero-attestation solo relay as complete', () => {
+    declareRoster('claude', []);
+    const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
+    expect(report.soloAcknowledged).toBe(true);
+    expect(report.authorAttested).toBe(false);
+    expect(report.roundComplete).toBe(false);
+  });
+
+  it('asserts the actor before reading actor-owned evidence', () => {
+    declareRoster('claude', ['codex']);
+    expect(() =>
+      coverage({ repo: 'o/r', pr: 1, head: HEAD, actor: 'other-actor' }),
+    ).toThrow(/authenticated GitHub actor changed/);
+    expect(() =>
+      readRoster({ repo: 'o/r', pr: 1, actor: 'other-actor' }),
+    ).toThrow(/authenticated GitHub actor changed/);
+  });
+
+  it('rechecks the exact head after reading coverage evidence', () => {
+    declareRoster('claude', ['codex']);
+    addComment(passMarker('codex', 1, HEAD));
+    runner.moveHeadAfterCommentRead = true;
+    expect(() => coverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
+      /PR head mismatch/,
+    );
   });
 });
 

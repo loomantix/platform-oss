@@ -118,7 +118,7 @@ export const DISPOSITION_V3_RE =
 export const ROSTER_V1_MARKER = '<!-- local-review-roster:v1';
 
 export const ROSTER_V1_RE =
-  /^<!-- local-review-roster:v1 author=(?<author>codex|claude|gemini|antigravity) reviewers=(?<reviewers>none|(?:codex|claude|gemini|antigravity)(?:,(?:codex|claude|gemini|antigravity))*) content-sha256=(?<content_sha>[0-9a-f]{64}) -->$/m;
+  /^<!-- local-review-roster:v1 author=(?<author>codex|claude|gemini|antigravity) reviewers=(?<reviewers>none|(?:codex|claude|gemini|antigravity)(?:,(?:codex|claude|gemini|antigravity))?) content-sha256=(?<content_sha>[0-9a-f]{64}) -->$/m;
 
 export const PASS_V3_RE =
   /^<!-- local-review-pass:v3 engine=(?<engine>codex|claude|gemini|antigravity) round=(?<round>[1-9][0-9]*) base=(?<base>[0-9a-f]{40}) head=(?<head>[0-9a-f]{40}) result-sha256=(?<result_sha>[0-9a-f]{64}) -->$/m;

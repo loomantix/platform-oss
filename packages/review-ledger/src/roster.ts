@@ -60,6 +60,9 @@ function validateReviewers(
   reviewers: readonly string[],
   author: SupportedEngine,
 ): SupportedEngine[] {
+  if (reviewers.length > 2) {
+    fail('a roster may declare at most two reviewers');
+  }
   const validated: SupportedEngine[] = [];
   for (const candidate of reviewers) {
     if (!SUPPORTED_ENGINES.includes(candidate as SupportedEngine)) {
@@ -118,19 +121,8 @@ export function buildRosterBody(params: {
   return { marker, body: `${marker}\n${params.content}` };
 }
 
-/**
- * Read the actor-owned roster declared on a pull request.
- *
- * A pull request carries at most one roster. Two conflicting declarations are a
- * contradiction to reject rather than a history to reconcile: every downstream
- * completeness answer depends on which one is authoritative.
- */
-export function readRoster(params: {
-  repo: string;
-  pr: number;
-  rows?: Array<Record<string, unknown>> | undefined;
-}): RosterReport {
-  const rows = params.rows ?? getIssueComments(params.repo, params.pr);
+/** Parse the unique roster from an authenticated actor-owned row set. */
+function readRosterRows(rows: Array<Record<string, unknown>>): RosterReport {
   const candidates = rows.filter((row) =>
     String(row['body'] ?? '').includes(ROSTER_V1_MARKER),
   );
@@ -150,6 +142,50 @@ export function readRoster(params: {
     author: parsed.author,
     reviewers: parsed.reviewers,
     commentId: row['id'] as number,
+  };
+}
+
+/**
+ * Read the actor-owned roster declared on a pull request.
+ *
+ * An authenticated actor carries at most one roster. Two conflicting
+ * declarations are a contradiction to reject rather than a history to
+ * reconcile: every downstream completeness answer depends on which one is
+ * authoritative.
+ */
+export function readRoster(params: {
+  repo: string;
+  pr: number;
+  actor?: string | undefined;
+}): RosterReport {
+  assertActor(params.actor);
+  return readRosterRows(getIssueComments(params.repo, params.pr));
+}
+
+function reconcileConcurrentRoster(
+  repo: string,
+  pr: number,
+  body: string,
+  postedCommentId: number,
+): { commentId: number; usedPostedComment: boolean } {
+  const rows = getIssueComments(repo, pr).filter((row) =>
+    String(row['body'] ?? '').includes(ROSTER_V1_MARKER),
+  );
+  if (
+    rows.length === 0 ||
+    rows.some((row) => row['body'] !== body || typeof row['id'] !== 'number')
+  ) {
+    fail('local-review roster conflicts with concurrent evidence');
+  }
+
+  const ids = rows.map((row) => row['id'] as number).sort((a, b) => a - b);
+  const canonical = ids[0]!;
+  for (const duplicate of ids.slice(1)) {
+    deleteIssueComment(repo, pr, duplicate);
+  }
+  return {
+    commentId: canonical,
+    usedPostedComment: canonical === postedCommentId,
   };
 }
 
@@ -208,7 +244,22 @@ export function postRoster(params: PostRosterParams): PostRosterResult {
   }
 
   try {
+    if (created) {
+      const reconciled = reconcileConcurrentRoster(
+        params.repo,
+        params.pr,
+        body,
+        commentId,
+      );
+      commentId = reconciled.commentId;
+      replayed = replayed || !reconciled.usedPostedComment;
+      created = reconciled.usedPostedComment;
+    }
     verifyIssueComment(params.repo, commentId, body);
+    const roster = readRosterRows(getIssueComments(params.repo, params.pr));
+    if (roster.commentId !== commentId) {
+      fail('could not verify a unique local-review roster after posting');
+    }
     verifyHead(params.repo, params.pr, params.head);
   } catch (error) {
     if (created) {
@@ -269,25 +320,27 @@ export function attestationsAtHead(
   head: string,
 ): AttestationAtHead[] {
   const found: AttestationAtHead[] = [];
+  const identities = new Set<string>();
   for (const row of rows) {
     const body = String(row['body'] ?? '');
     const pass = matchAttestationMarker(body, PASS_V3_RE);
-    if (pass?.groups) {
-      if (pass.groups['head'] === head) {
-        found.push({
-          engine: pass.groups['engine'] as SupportedEngine,
-          round: parseInt(pass.groups['round']!, 10),
-          status: 'clean',
-        });
-      }
+    const complete = matchAttestationMarker(body, COMPLETE_V3_RE);
+    const match = pass ?? complete;
+    if (!match?.groups) {
       continue;
     }
-    const complete = matchAttestationMarker(body, COMPLETE_V3_RE);
-    if (complete?.groups && complete.groups['head'] === head) {
+    const engine = match.groups['engine'] as SupportedEngine;
+    const round = parseInt(match.groups['round']!, 10);
+    const identity = `${engine}|${round}`;
+    if (identities.has(identity)) {
+      fail('local-review attestation identity is duplicated');
+    }
+    identities.add(identity);
+    if (match.groups['head'] === head) {
       found.push({
-        engine: complete.groups['engine'] as SupportedEngine,
-        round: parseInt(complete.groups['round']!, 10),
-        status: 'changed',
+        engine,
+        round,
+        status: pass === match ? 'clean' : 'changed',
       });
     }
   }
@@ -311,26 +364,28 @@ export function coverageTier(count: number): CoverageTier {
  * opposite of the cold read the relay exists to obtain.
  */
 export function coverage(params: CoverageParams): CoverageResult {
+  assertActor(params.actor);
   verifyHead(params.repo, params.pr, params.head);
   const rows = getIssueComments(params.repo, params.pr);
-  const roster = readRoster({ repo: params.repo, pr: params.pr, rows });
+  const roster = readRosterRows(rows);
   const attested = attestationsAtHead(rows, params.head);
 
   const attestedEngines = [
     ...new Set(attested.map((row) => row.engine)),
   ].sort();
-  // An absent roster names no author, so no attestation can be attributed to a
-  // non-author engine. Filtering against `null` would count the author's own
-  // pass as cross-model coverage.
-  const nonAuthorAttested =
-    roster.author === null
-      ? []
-      : attestedEngines.filter((engine) => engine !== roster.author);
+  // Only declared reviewers contribute to coverage. Other actor-owned
+  // attestations remain visible in attestedAtHead for diagnostics.
+  const nonAuthorAttested = roster.reviewers.filter((engine) =>
+    attestedEngines.includes(engine),
+  );
   const missingReviewers = roster.reviewers.filter(
     (engine) => !attestedEngines.includes(engine),
   );
 
-  return {
+  const authorAttested =
+    roster.author !== null && attestedEngines.includes(roster.author);
+  const soloAcknowledged = roster.present && roster.reviewers.length === 0;
+  const report: CoverageResult = {
     head: params.head,
     rosterPresent: roster.present,
     author: roster.author,
@@ -338,13 +393,17 @@ export function coverage(params: CoverageParams): CoverageResult {
     attestedAtHead: attestedEngines,
     nonAuthorAttested,
     missingReviewers,
-    authorAttested:
-      roster.author !== null && attestedEngines.includes(roster.author),
+    authorAttested,
     tier: coverageTier(nonAuthorAttested.length),
-    soloAcknowledged: roster.present && roster.reviewers.length === 0,
-    roundComplete: roster.present && missingReviewers.length === 0,
+    soloAcknowledged,
+    roundComplete:
+      roster.present &&
+      missingReviewers.length === 0 &&
+      (!soloAcknowledged || authorAttested),
     verified: true,
   };
+  verifyHead(params.repo, params.pr, params.head);
+  return report;
 }
 
 /**

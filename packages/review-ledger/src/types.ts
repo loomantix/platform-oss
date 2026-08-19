@@ -528,6 +528,8 @@ export interface CoverageParams {
   repo: string;
   pr: number;
   head: string;
+  /** Asserted against the live authenticated actor; never used to set it. */
+  actor?: string | undefined;
 }
 
 /**

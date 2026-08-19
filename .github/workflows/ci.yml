@@ -194,6 +194,21 @@ jobs:
             requireExport: './dist/index.cjs',
           };
 
+          const packagedProtocol = join(
+            process.env.PACKAGE_ROOT,
+            'protocol/local-review-ledger.md',
+          );
+          const sourceProtocol = join(
+            process.env.GITHUB_WORKSPACE,
+            'packages/review-ledger/protocol/local-review-ledger.md',
+          );
+          if (
+            !existsSync(packagedProtocol) ||
+            !readFileSync(packagedProtocol).equals(readFileSync(sourceProtocol))
+          ) {
+            throw new Error('published protocol is missing or differs from source');
+          }
+
           for (const [name, expectedPath] of Object.entries(expected)) {
             if (entries[name] !== expectedPath) {
               throw new Error(`${name} is ${String(entries[name])}, expected ${expectedPath}`);

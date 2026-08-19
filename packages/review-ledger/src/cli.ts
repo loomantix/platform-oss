@@ -700,7 +700,11 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
       if (!args.repo || args.pr === undefined) {
         fail('read-roster requires --repo and --pr');
       }
-      const out = readRoster({ repo: args.repo, pr: args.pr });
+      const out = readRoster({
+        repo: args.repo,
+        pr: args.pr,
+        actor: args.actor,
+      });
       writeSortedJson(out);
       break;
     }
@@ -710,7 +714,12 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         fail(`${args.command} requires --repo, --pr, and --head`);
       }
       const run = args.command === 'coverage' ? coverage : verifyCoverage;
-      const out = run({ repo: args.repo, pr: args.pr, head: args.head });
+      const out = run({
+        repo: args.repo,
+        pr: args.pr,
+        head: args.head,
+        actor: args.actor,
+      });
       writeSortedJson(out);
       break;
     }

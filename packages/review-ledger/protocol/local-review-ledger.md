@@ -53,10 +53,11 @@ It writes one marker to the pull request:
 <!-- local-review-roster:v1 author=<engine> reviewers=<engine[,engine]|none> content-sha256=<hash> -->
 ```
 
-A pull request carries exactly one roster. Re-posting the identical declaration
-replays; posting a conflicting one fails, because every downstream completeness
-answer depends on which roster is authoritative. `read-roster` returns the
-current declaration.
+The authenticated relay actor carries exactly one roster on a pull request, and
+every local engine in the relay must use that same pinned actor. Re-posting the
+identical declaration replays; posting a conflicting one fails, because every
+downstream completeness answer depends on which roster is authoritative.
+`read-roster` returns the current actor-owned declaration.
 
 ### How many reviewers
 
