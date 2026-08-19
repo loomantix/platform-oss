@@ -130,7 +130,7 @@ Each engine gets **one** refactor pass per PR. Before running one, search the PR
 for a marker naming this engine:
 
 ```text
-<!-- local-review-refactor:v1 engine=<codex|claude> head=<sha> outcome=<committed|no-op> -->
+<!-- local-review-refactor:v1 engine=<codex|claude|gemini|antigravity> head=<sha> outcome=<committed|no-op> -->
 ```
 
 If one exists, skip the cleanup lanes, say so in the pass output, and go straight
@@ -234,9 +234,24 @@ finding into the PR.
 
 ### Use the deterministic ledger helper
 
-Use `.claude/skills/critique/scripts/review-ledger.py` for every local-review
+Use `.claude/skills/critique/scripts/review-ledger.js` for every local-review
 finding, disposition reply, thread resolution, and pass marker. Do not
 hand-compose `gh api` form arguments for these mutations.
+
+Invoke it as `node .claude/skills/critique/scripts/review-ledger.js` — it
+requires Node.js and is not executable, so `./review-ledger.js` will not run.
+The bundle is ESM; the sibling `package.json` in that directory declares
+`"type": "module"` so it resolves the same way regardless of what the
+surrounding repository's root manifest says.
+The file is a build artifact of [`@loomantix/review-ledger`](https://www.npmjs.com/package/@loomantix/review-ledger),
+vendored verbatim from the published tarball at the version recorded in
+`review-ledger.version`, with that tarball's sha512 in `review-ledger.integrity`.
+`node review-ledger.js --version` reports the version it was built from, so a
+copy can always identify itself without trusting the pin file beside it.
+Never edit or reformat it: fixes belong upstream in the package. The byte-compare
+that enforces this runs in `claude-platform`'s own CI, not here — in a consumer
+repository an accidental edit is silently restored by the next sync rather than
+caught locally, so treat the file as read-only and keep it out of any formatter.
 
 The v3 helper verifies the current PR head before and after each mutation,
 constructs markers and JSON itself, reads mutations back, and reconciles retries
@@ -255,14 +270,14 @@ preserves literal backticks, dollar expressions, quotes, Unicode, CRLF, and a
 missing final newline:
 
 ```bash
-python3 .claude/skills/critique/scripts/review-ledger.py preflight-anchor \
+node .claude/skills/critique/scripts/review-ledger.js preflight-anchor \
   --repo <owner/repo> --pr <number> --head <full-head-sha> \
   --path <repository-relative-path> --line <right-side-line>
 
-python3 .claude/skills/critique/scripts/review-ledger.py post-finding \
+node .claude/skills/critique/scripts/review-ledger.js post-finding \
   --repo <owner/repo> --pr <number> --head <full-head-sha> \
   --path <repository-relative-path> --line <right-side-line> \
-  --engine <codex|claude> --round <n> --fingerprint <stable-id> \
+  --engine <codex|claude|gemini|antigravity> --round <n> --fingerprint <stable-id> \
   --occurrence 1 --severity <blocking|major|minor|nit> --lens <lens> \
   --content-file <regular-utf8-file>
 ```
@@ -271,9 +286,9 @@ When the same fingerprint recurs on a later reviewed head, append a new numbered
 occurrence to its existing root comment and reopen that thread atomically:
 
 ```bash
-python3 .claude/skills/critique/scripts/review-ledger.py reopen-occurrence \
+node .claude/skills/critique/scripts/review-ledger.js reopen-occurrence \
   --repo <owner/repo> --pr <number> --head <reviewed-sha> \
-  --engine <codex|claude> --round <n> --fingerprint <stable-id> \
+  --engine <codex|claude|gemini|antigravity> --round <n> --fingerprint <stable-id> \
   --occurrence <next-number> --severity <severity> --lens <lens> \
   --comment-id <root-comment-id> --thread-id <graphql-thread-id> \
   --content-file <regular-utf8-file>
@@ -287,9 +302,9 @@ identical command again reuses completed work and finishes only the missing
 state transition:
 
 ```bash
-python3 .claude/skills/critique/scripts/review-ledger.py dispose \
+node .claude/skills/critique/scripts/review-ledger.js dispose \
   --repo <owner/repo> --pr <number> --head <full-fix-sha> \
-  --engine <codex|claude> --round <n> --fingerprint <stable-id> \
+  --engine <codex|claude|gemini|antigravity> --round <n> --fingerprint <stable-id> \
   --occurrence <number> --outcome <fixed|dismissed|deferred> \
   --comment-id <root-comment-id> --thread-id <graphql-thread-id> \
   --content-file <regular-utf8-file>
@@ -304,9 +319,31 @@ actor-owned v3 ledger at the exact head. This rejects unresolved threads,
 unstructured replies, cross-occurrence dispositions, and incomplete pagination:
 
 ```bash
-python3 .claude/skills/critique/scripts/review-ledger.py verify-ledger \
+node .claude/skills/critique/scripts/review-ledger.js verify-ledger \
   --repo <owner/repo> --pr <number> --head <full-head-sha>
 ```
+
+### Blocking outcomes
+
+A `blocking` finding may not end `deferred`. Both `fixed` and `dismissed` are
+valid terminal outcomes — a blocker judged on inspection not to be a defect is
+dismissed, and that dismissal is attestable. Only deferral, which carries a live
+blocker past the review, is refused.
+
+The rule is evaluated on the **latest** occurrence of a fingerprint. Occurrences
+are a sequential history of one root cause, so the highest occurrence is its
+current state, and a recorded disposition is immutable by design. Evaluating
+every occurrence independently would make a blocker that was deferred once and
+later fixed permanently unattestable, leaving only two ways out — rewriting
+history or forging the marker — which are the two things the ledger exists to
+prevent. When a later occurrence clears an earlier blocking deferral, that
+recurrence and its fix must also form strict forward Git transitions.
+
+The same-round **result evidence** paths are deliberately stricter: there a
+blocking finding must be `fixed`, not merely not-deferred. That rule governs
+what a review result may claim as same-round evidence, which is a different
+question from whether the ledger is internally consistent. Do not collapse the
+two.
 
 ## Fix, reply, and resolve
 
@@ -332,7 +369,7 @@ atomically writes the canonical result. Supply `--classification
 minor|material` only when the head moved:
 
 ```bash
-python3 .claude/skills/critique/scripts/review-ledger.py write-result \
+node .claude/skills/critique/scripts/review-ledger.js write-result \
   --repo "$GH_REPO" --pr "$AGENT_LOOP_PR_NUMBER" \
   --head "$(git rev-parse HEAD)" --engine "$AGENT_LOOP_REVIEW_ENGINE" \
   --round "$AGENT_LOOP_REVIEW_ROUND" --base "$AGENT_LOOP_REVIEW_BASE_SHA" \
@@ -348,7 +385,7 @@ For a blocked pass, put one short public-safe blocker in an owner-only regular
 file and call `write-blocked-result` instead of constructing JSON:
 
 ```bash
-python3 .claude/skills/critique/scripts/review-ledger.py write-blocked-result \
+node .claude/skills/critique/scripts/review-ledger.js write-blocked-result \
   --head "$(git rev-parse HEAD)" --engine "$AGENT_LOOP_REVIEW_ENGINE" \
   --round "$AGENT_LOOP_REVIEW_ROUND" --base "$AGENT_LOOP_REVIEW_BASE_SHA" \
   --before "$AGENT_LOOP_PR_HEAD_SHA" \
@@ -363,7 +400,7 @@ exactly this contract:
 {
   "version": 3,
   "status": "clean|changed|blocked",
-  "engine": "codex|claude",
+  "engine": "codex|claude|gemini|antigravity",
   "round": 1,
   "baseSha": "<sha>",
   "beforeSha": "<sha>",
