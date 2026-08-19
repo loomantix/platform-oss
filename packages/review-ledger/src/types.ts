@@ -459,3 +459,93 @@ export interface GitHubRunner {
   runGit?(args: string[]): string;
   isAncestor?(ancestor: string, descendant: string): boolean;
 }
+
+/**
+ * How many distinct non-author engines reviewed the exact head.
+ *
+ * `solo` is permitted but must be declared; `cross` is the recommended floor;
+ * `full` is two or more independent non-author engines.
+ */
+export type CoverageTier = 'solo' | 'cross' | 'full';
+
+/**
+ * A parsed `local-review-roster:v1` marker.
+ */
+export interface RosterV1Match {
+  author: SupportedEngine;
+  reviewers: SupportedEngine[];
+  contentSha: string;
+}
+
+/**
+ * The roster declared on a pull request, or its declared absence.
+ */
+export interface RosterReport {
+  present: boolean;
+  author: SupportedEngine | null;
+  reviewers: SupportedEngine[];
+  commentId: number | null;
+}
+
+/**
+ * Parameters for `postRoster`.
+ */
+export interface PostRosterParams {
+  repo: string;
+  pr: number;
+  head: string;
+  /** Asserted against the live authenticated actor; never used to set it. */
+  actor?: string | undefined;
+  author: SupportedEngine;
+  reviewers: readonly SupportedEngine[];
+  content: string;
+}
+
+/**
+ * The result of `postRoster`.
+ */
+export interface PostRosterResult {
+  comment_id: number;
+  author: SupportedEngine;
+  reviewers: SupportedEngine[];
+  replayed: boolean;
+  verified: true;
+}
+
+/**
+ * One actor-owned attestation naming the exact head under examination.
+ */
+export interface AttestationAtHead {
+  engine: SupportedEngine;
+  round: number;
+  status: 'clean' | 'changed';
+}
+
+/**
+ * Parameters for `coverage` and `verifyCoverage`.
+ */
+export interface CoverageParams {
+  repo: string;
+  pr: number;
+  head: string;
+  /** Asserted against the live authenticated actor; never used to set it. */
+  actor?: string | undefined;
+}
+
+/**
+ * The result of `coverage`.
+ */
+export interface CoverageResult {
+  head: string;
+  rosterPresent: boolean;
+  author: SupportedEngine | null;
+  reviewers: SupportedEngine[];
+  attestedAtHead: SupportedEngine[];
+  nonAuthorAttested: SupportedEngine[];
+  missingReviewers: SupportedEngine[];
+  authorAttested: boolean;
+  tier: CoverageTier;
+  soloAcknowledged: boolean;
+  roundComplete: boolean;
+  verified: true;
+}
