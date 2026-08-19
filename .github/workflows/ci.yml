@@ -59,6 +59,20 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r --if-present run build
+      - name: Vendorable bundle reports its real version
+        # A `define` that silently stopped applying would ship a bundle
+        # reporting `0.0.0-dev`, and the engine repos pin their vendored copy
+        # by exactly this output. Fail the build instead.
+        working-directory: packages/review-ledger
+        run: |
+          set -euo pipefail
+          expected="$(node -p "require('./package.json').version")"
+          actual="$(node dist/review-ledger.bundle.js --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::bundle reports version $actual, package.json says $expected"
+            exit 1
+          fi
+          [ "$(node dist/review-ledger.bundle.js --protocol-version)" = 3 ]
       - name: Verify web-update-check publish artifact
         env:
           PACKAGE_ROOT: ${{ runner.temp }}/package/package

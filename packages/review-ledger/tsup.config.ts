@@ -1,4 +1,13 @@
 import { defineConfig } from 'tsup';
+import { createRequire } from 'node:module';
+
+// Read at build time so the version travels inside the artifact. The
+// single-file build is vendored away from this package.json, so nothing can
+// resolve it at runtime.
+const { version } = createRequire(import.meta.url)('./package.json') as {
+  version: string;
+};
+const define = { __PACKAGE_VERSION__: JSON.stringify(version) };
 
 export default defineConfig([
   {
@@ -8,6 +17,7 @@ export default defineConfig([
     clean: true,
     sourcemap: true,
     target: 'es2022',
+    define,
   },
   // Single-file, self-contained build of the CLI. Engine repos vendor this one
   // artifact verbatim and run it as `node review-ledger.js`, so it must not
@@ -23,5 +33,6 @@ export default defineConfig([
     splitting: false,
     minify: false,
     target: 'es2022',
+    define,
   },
 ]);

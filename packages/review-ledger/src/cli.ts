@@ -5,6 +5,7 @@
 
 import { readFileSync } from 'node:fs';
 import {
+  PACKAGE_VERSION,
   PROTOCOL_VERSION,
   SHA_64_RE,
   SUPPORTED_CLASSIFICATIONS,
@@ -44,6 +45,7 @@ import type {
 interface CliArgs {
   command?: string | undefined;
   protocolVersion?: boolean | undefined;
+  version?: boolean | undefined;
   repo?: string | undefined;
   pr?: number | undefined;
   head?: string | undefined;
@@ -118,6 +120,12 @@ function parseCliArgs(argv: string[]): CliArgs {
 
     if (arg === '--protocol-version') {
       args.protocolVersion = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--version') {
+      args.version = true;
       i++;
       continue;
     }
@@ -316,6 +324,11 @@ function validateArgs(args: CliArgs): void {
 export function runCli(argv: string[] = process.argv.slice(2)): number {
   resetGitHubRunner();
   const args = parseCliArgs(argv);
+
+  if (args.version) {
+    process.stdout.write(`${PACKAGE_VERSION}\n`);
+    return 0;
+  }
 
   if (args.protocolVersion) {
     process.stdout.write(`${PROTOCOL_VERSION}\n`);

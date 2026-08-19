@@ -29,7 +29,8 @@ session. File-only result validation and `--protocol-version` do not use GitHub.
 The published tarball also ships `dist/review-ledger.bundle.js`: the whole CLI
 as one self-contained, unminified ES module with a `#!/usr/bin/env node`
 shebang. It imports no sibling chunk and needs no `node_modules`, so it can be
-copied anywhere and run as `node review-ledger.js`. Invoke it through `node`
+copied anywhere and run as `node review-ledger.js`. It answers `--version` with
+the version it was built from, so a vendored copy can always identify itself. Invoke it through `node`
 rather than executing it directly: npm normalises non-`bin` files to mode 0644
 in the tarball, so the extracted file is not executable even though the shebang
 is present.
@@ -50,6 +51,19 @@ bytes extracted from the published tarball are comparable.
 ## CLI Usage
 
 The `review-ledger` binary exposes all subcommands:
+
+### Check Versions
+
+```bash
+review-ledger --version           # e.g. 1.0.2 — this package's version
+review-ledger --protocol-version  # 3 — the ledger protocol it speaks
+```
+
+The two are independent: `--protocol-version` is the cross-engine compatibility
+gate that must agree with every other implementation, while `--version`
+identifies this build. `--version` is baked in at build time rather than read
+from `package.json`, so it still answers correctly for a vendored single-file
+build sitting on its own in a consumer repo.
 
 ### Check Protocol Version
 

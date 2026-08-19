@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runCli } from '../cli.js';
-import { PROTOCOL_VERSION } from '../constants.js';
+import { PACKAGE_VERSION, PROTOCOL_VERSION } from '../constants.js';
 
 describe('CLI command parser and execution', () => {
   it('outputs protocol version when requested', () => {
@@ -10,6 +10,26 @@ describe('CLI command parser and execution', () => {
     const code = runCli(['--protocol-version']);
     expect(code).toBe(0);
     expect(stdoutSpy).toHaveBeenCalledWith(`${PROTOCOL_VERSION}\n`);
+    stdoutSpy.mockRestore();
+  });
+
+  it('outputs the package version when requested', () => {
+    const stdoutSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+    const code = runCli(['--version']);
+    expect(code).toBe(0);
+    expect(stdoutSpy).toHaveBeenCalledWith(`${PACKAGE_VERSION}\n`);
+    stdoutSpy.mockRestore();
+  });
+
+  it('reports the package version without requiring a subcommand', () => {
+    // `--version` has to answer for a vendored single file with no package
+    // around it, so it must never fall through to subcommand validation.
+    const stdoutSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+    expect(() => runCli(['--version'])).not.toThrow();
     stdoutSpy.mockRestore();
   });
 
