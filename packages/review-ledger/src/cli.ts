@@ -32,7 +32,13 @@ import {
   writeResult,
 } from './ledger.js';
 import { readResult, validateResult, writeBlockedResult } from './result.js';
-import { coverage, postRoster, readRoster, verifyCoverage } from './roster.js';
+import {
+  coverage,
+  parseReviewers,
+  postRoster,
+  readRoster,
+  verifyCoverage,
+} from './roster.js';
 import { formatFindings } from './format.js';
 import { resetGitHubRunner } from './github.js';
 import type {
@@ -80,7 +86,7 @@ interface CliArgs {
   classification?: SupportedClassification | undefined;
   jsonFile?: string | undefined;
   author?: SupportedEngine | undefined;
-  reviewers?: SupportedEngine[] | undefined;
+  reviewers?: string | undefined;
   file?: string | undefined;
 }
 
@@ -257,13 +263,7 @@ function parseCliArgs(argv: string[]): CliArgs {
         args.author = parseEnum(arg, parseVal(arg), SUPPORTED_ENGINES);
         break;
       case '--reviewers': {
-        const raw = parseVal(arg);
-        args.reviewers =
-          raw === 'none'
-            ? []
-            : raw
-                .split(',')
-                .map((part) => parseEnum(arg, part, SUPPORTED_ENGINES));
+        args.reviewers = parseVal(arg);
         break;
       }
       default:
@@ -690,7 +690,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         head: args.head,
         actor: args.actor,
         author: args.author,
-        reviewers: args.reviewers,
+        reviewers: parseReviewers(args.reviewers, args.author),
         content: readContent(args.contentFile),
       });
       writeSortedJson(out);

@@ -11,7 +11,7 @@ import {
   verifyCoverage,
 } from '../index.js';
 import { resetGitHubRunner, setGitHubRunner } from '../github.js';
-import type { GitHubRunner } from '../types.js';
+import type { GitHubRunner, SupportedEngine } from '../types.js';
 
 const HEAD = '1111111111111111111111111111111111111111';
 const OLD_HEAD = '3333333333333333333333333333333333333333';
@@ -75,10 +75,13 @@ function addComment(body: string): number {
   return id;
 }
 
-function declareRoster(author: string, reviewers: string[]): void {
+function declareRoster(
+  author: SupportedEngine,
+  reviewers: readonly SupportedEngine[],
+): void {
   const { body } = buildRosterBody({
-    author: author as never,
-    reviewers: reviewers as never,
+    author,
+    reviewers,
     content: 'Roster for this relay.',
   });
   addComment(body);

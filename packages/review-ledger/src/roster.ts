@@ -236,15 +236,7 @@ export function postRoster(params: PostRosterParams): PostRosterResult {
   };
 }
 
-/**
- * Collect the actor-owned pass and completion attestations naming an exact head.
- *
- * Attestation evidence is per-head by construction, so this is also the
- * invalidation rule: an engine whose newest attestation names an earlier commit
- * has not reviewed what the pull request currently contains, and an engine
- * whose attestation names this commit has, regardless of what moved the head or
- * how many rounds preceded it.
- */
+/** Match one attestation whose marker is the first complete line. */
 function matchAttestationMarker(
   body: string,
   pattern: RegExp,
@@ -264,7 +256,13 @@ function matchAttestationMarker(
 }
 
 /**
+ * Collect the actor-owned pass and completion attestations naming an exact head.
  *
+ * Attestation evidence is per-head by construction, so this is also the
+ * invalidation rule: an engine whose newest attestation names an earlier commit
+ * has not reviewed what the pull request currently contains, and an engine
+ * whose attestation names this commit has, regardless of what moved the head or
+ * how many rounds preceded it.
  */
 export function attestationsAtHead(
   rows: Array<Record<string, unknown>>,
