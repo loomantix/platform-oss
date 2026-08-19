@@ -688,6 +688,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         repo: args.repo,
         pr: args.pr,
         head: args.head,
+        actor: args.actor,
         author: args.author,
         reviewers: args.reviewers,
         content: readContent(args.contentFile),

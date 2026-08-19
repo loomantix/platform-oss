@@ -7,6 +7,7 @@ import {
 } from './constants.js';
 import { fail, LedgerError } from './errors.js';
 import {
+  assertActor,
   deleteIssueComment,
   findMatchingBody,
   getIssueComments,
@@ -16,7 +17,7 @@ import {
   verifyIssueComment,
 } from './github.js';
 import { sha256Text } from './hash.js';
-import { matchProtocol } from './protocol.js';
+import { matchProtocol, validateContentString } from './protocol.js';
 import type {
   AttestationAtHead,
   CoverageParams,
@@ -107,6 +108,7 @@ export function buildRosterBody(params: {
   if (!SUPPORTED_ENGINES.includes(params.author)) {
     fail(`author must be one of: ${SUPPORTED_ENGINES.join(', ')}`);
   }
+  validateContentString(params.content);
   validateReviewers(params.reviewers, params.author);
   const reviewers =
     params.reviewers.length === 0 ? 'none' : params.reviewers.join(',');
@@ -160,6 +162,7 @@ export function readRoster(params: {
  * is complete or merely unfinished.
  */
 export function postRoster(params: PostRosterParams): PostRosterResult {
+  assertActor(params.actor);
   const { marker, body } = buildRosterBody({
     author: params.author,
     reviewers: params.reviewers,
@@ -242,6 +245,27 @@ export function postRoster(params: PostRosterParams): PostRosterResult {
  * whose attestation names this commit has, regardless of what moved the head or
  * how many rounds preceded it.
  */
+function matchAttestationMarker(
+  body: string,
+  pattern: RegExp,
+): RegExpExecArray | null {
+  const match = pattern.exec(body);
+  if (!match || !match.groups || match.index !== 0) {
+    return null;
+  }
+  const matchEnd = match[0].length;
+  if (!body.slice(matchEnd).startsWith('\n')) {
+    return null;
+  }
+  if (!body.slice(matchEnd + 1).trim()) {
+    return null;
+  }
+  return match;
+}
+
+/**
+ *
+ */
 export function attestationsAtHead(
   rows: Array<Record<string, unknown>>,
   head: string,
@@ -249,7 +273,7 @@ export function attestationsAtHead(
   const found: AttestationAtHead[] = [];
   for (const row of rows) {
     const body = String(row['body'] ?? '');
-    const pass = PASS_V3_RE.exec(body);
+    const pass = matchAttestationMarker(body, PASS_V3_RE);
     if (pass?.groups) {
       if (pass.groups['head'] === head) {
         found.push({
@@ -260,7 +284,7 @@ export function attestationsAtHead(
       }
       continue;
     }
-    const complete = COMPLETE_V3_RE.exec(body);
+    const complete = matchAttestationMarker(body, COMPLETE_V3_RE);
     if (complete?.groups && complete.groups['head'] === head) {
       found.push({
         engine: complete.groups['engine'] as SupportedEngine,
@@ -297,9 +321,13 @@ export function coverage(params: CoverageParams): CoverageResult {
   const attestedEngines = [
     ...new Set(attested.map((row) => row.engine)),
   ].sort();
-  const nonAuthorAttested = attestedEngines.filter(
-    (engine) => engine !== roster.author,
-  );
+  // An absent roster names no author, so no attestation can be attributed to a
+  // non-author engine. Filtering against `null` would count the author's own
+  // pass as cross-model coverage.
+  const nonAuthorAttested =
+    roster.author === null
+      ? []
+      : attestedEngines.filter((engine) => engine !== roster.author);
   const missingReviewers = roster.reviewers.filter(
     (engine) => !attestedEngines.includes(engine),
   );
@@ -338,6 +366,14 @@ export function verifyCoverage(params: CoverageParams): CoverageResult {
   if (report.missingReviewers.length > 0) {
     fail(
       `declared reviewers have not attested this head: ${report.missingReviewers.join(', ')}`,
+    );
+  }
+  // Solo review is review without a second engine, not the absence of review.
+  // Without this the gate passes on a pull request carrying no attestation at
+  // all, because a solo roster has no reviewer that can be missing.
+  if (report.soloAcknowledged && !report.authorAttested) {
+    fail(
+      'a declared solo relay still requires the author engine to attest this head',
     );
   }
   return report;

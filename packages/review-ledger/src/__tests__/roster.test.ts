@@ -115,6 +115,27 @@ describe('parseReviewers', () => {
 });
 
 describe('buildRosterBody', () => {
+  it('refuses content that embeds a protocol marker', () => {
+    const embedded = `Solo because reasons.\n${passMarker('codex', 1, HEAD)}`;
+    expect(() =>
+      buildRosterBody({
+        author: 'claude',
+        reviewers: ['codex'],
+        content: embedded,
+      }),
+    ).toThrow(/must not contain local-review markers/);
+  });
+
+  it('refuses an unsupported author', () => {
+    expect(() =>
+      buildRosterBody({
+        author: 'copilot' as never,
+        reviewers: [],
+        content: 'x',
+      }),
+    ).toThrow(/author must be one of/);
+  });
+
   it('emits none rather than an empty value for a solo relay', () => {
     const { marker } = buildRosterBody({
       author: 'claude',
@@ -236,6 +257,37 @@ describe('attestationsAtHead', () => {
       [],
     );
   });
+
+  it('refuses a marker that is not the first line of the body', () => {
+    const quoted = `Round 1 summary. Codex posted:\n\n${passMarker('codex', 1, HEAD)}`;
+    expect(attestationsAtHead([{ body: quoted }], HEAD)).toEqual([]);
+  });
+
+  it('refuses a marker quoted inside a fenced block', () => {
+    const fenced = [
+      'Here is what we will post:',
+      '',
+      '```',
+      passMarker('codex', 1, HEAD),
+      '```',
+    ].join('\n');
+    expect(attestationsAtHead([{ body: fenced }], HEAD)).toEqual([]);
+  });
+
+  it('refuses a marker with no content after it', () => {
+    const bare = passMarker('codex', 1, HEAD).split('\n')[0]!;
+    expect(attestationsAtHead([{ body: bare }], HEAD)).toEqual([]);
+  });
+
+  it('reads a completion marker even when another body quoted a stale pass', () => {
+    const rows = [
+      { body: `context\n${passMarker('codex', 1, OLD_HEAD)}` },
+      { body: completeMarker('codex', 2, HEAD) },
+    ];
+    expect(attestationsAtHead(rows, HEAD)).toEqual([
+      { engine: 'codex', round: 2, status: 'changed' },
+    ]);
+  });
 });
 
 describe('coverageTier', () => {
@@ -292,8 +344,29 @@ describe('coverage', () => {
     expect(report.roundComplete).toBe(false);
   });
 
+  it('does not attribute non-author coverage when no roster names an author', () => {
+    addComment(passMarker('claude', 1, HEAD));
+    const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
+    expect(report.rosterPresent).toBe(false);
+    expect(report.nonAuthorAttested).toEqual([]);
+    expect(report.tier).toBe('solo');
+  });
+
+  it('ignores an attestation authored by anyone but the actor', () => {
+    declareRoster('claude', ['codex']);
+    runner.issueComments.push({
+      id: runner.commentIdSeq++,
+      user: { login: 'someone-else' },
+      body: passMarker('codex', 1, HEAD),
+    });
+    const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
+    expect(report.attestedAtHead).toEqual([]);
+    expect(report.missingReviewers).toEqual(['codex']);
+  });
+
   it('marks a declared solo relay acknowledged and complete', () => {
     declareRoster('claude', []);
+    addComment(passMarker('claude', 1, HEAD));
     const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
     expect(report.tier).toBe('solo');
     expect(report.soloAcknowledged).toBe(true);
@@ -317,12 +390,21 @@ describe('verifyCoverage', () => {
     );
   });
 
-  it('accepts a solo relay that was declared up front', () => {
+  it('accepts a solo relay that was declared up front and reviewed', () => {
     declareRoster('claude', []);
+    addComment(passMarker('claude', 1, HEAD));
     expect(verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toMatchObject({
       tier: 'solo',
       soloAcknowledged: true,
+      authorAttested: true,
     });
+  });
+
+  it('refuses a declared solo relay carrying no attestation at all', () => {
+    declareRoster('claude', []);
+    expect(() => verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
+      /solo relay still requires the author engine to attest/,
+    );
   });
 
   it('accepts a complete cross-model relay', () => {

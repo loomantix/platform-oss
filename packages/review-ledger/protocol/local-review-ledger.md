@@ -127,6 +127,11 @@ the shared definition for the pinned `<base-sha>..<head-sha>` review range:
 
 - **Source code** — `.ts`, `.tsx`, `.js`, `.jsx`, `.py`, `.rs`, `.go`, `.java`,
   `.cpp`, `.c`, `.h`, `.cs`, `.rb`, `.swift`, `.kt`, `.sh`, `.bash`.
+- **Prompt surface — source, whatever the extension.** Every path under the
+  engine's prompt directory, including its Markdown. These files are read by the
+  model as instructions and sync to every consumer, so a defect in them ships
+  exactly like a code defect. Classifying them as docs would make the review-tier
+  triggers unreachable for the surface they were written to protect.
 - **Docs, inert config, or fixtures** — `.md`, `.txt`, `.gitignore`,
   `.gitattributes`, `LICENSE`, `CHANGELOG`, `README`,
   `.env.example`, paths under `docs/`, `*.fixture.*`, and snapshot files.
@@ -229,7 +234,7 @@ needed file, or weakening verification.
 ## Record the review tier once per PR
 
 The tier decides which lanes run and how many rounds are owed. Resolve it
-before the first reviewer per [`../REVIEW_WORKFLOW.md`](../REVIEW_WORKFLOW.md)
+before the first reviewer per your `REVIEW_WORKFLOW.md`
 and record it on the PR, so a later round in a fresh session reads it instead of
 re-deriving it.
 
@@ -238,7 +243,7 @@ re-deriving it.
 ```
 
 `trigger=` carries **every** trigger the change matched, as the comma-separated
-ordinals from [`../REVIEW_WORKFLOW.md`](../REVIEW_WORKFLOW.md) — `trigger=3`,
+ordinals from your `REVIEW_WORKFLOW.md` — `trigger=3`,
 `trigger=1,3`, or `trigger=none`. Recording only one lets a clean result from
 that trigger's lens de-escalate the PR while an unrecorded trigger still stands.
 
@@ -337,7 +342,12 @@ one level up, where the whole set is visible and the orchestrator decides what
 the PR changes, what merits an urgent follow-up issue, and what should add
 nothing to an already deep backlog.
 
-Convergence rounds do not extend the round cap — they are how rounds 3 and 4 are
+The stance schedule above is the Deep schedule. At Lean the cap is two rounds:
+round 1 is adversarial, and round 2 runs only if round 1 made a material fix, in
+convergence mode. At both tiers, stop as soon as a complete round produces no
+material fix — the cap is a ceiling, not a target.
+
+Convergence rounds do not extend the round cap — they are how the last rounds are
 spent. Reaching the cap in convergence mode with open non-blocking findings means
 ship the PR and carry the issues, not open a fifth round.
 
@@ -556,6 +566,13 @@ For each published finding:
    reviewed head.
 4. Let `dispose` verify the reply and resolution as one resumable transaction.
 
+Write the commit message with the file-editing tool into the same owner-only
+temporary directory used for ledger content, then commit with
+`git commit -F <file>`. Run each git command as its own plain command. A
+worktree-isolated session refuses a git command carrying a heredoc, redirect, or
+`&&` chain because it cannot statically verify that the command stays inside the
+worktree, and that refusal aborts the pass mid-fix.
+
 If posting, replying, pushing, or resolving fails, stop. Leave the PR draft and
 report the exact unresolved thread; do not silently continue.
 
@@ -709,7 +726,8 @@ prevent a false green remains material. Defer non-material polish without growin
 the backlog, and create a tracking issue only for a concrete, high-impact
 follow-up that should be scheduled within roughly two weeks.
 
-Stop after four rounds by default. Leave the PR draft and report non-convergence
+Stop at the tier's round cap — four at Deep, two at Lean. Leave the PR draft and
+report non-convergence
 instead of continuing an unbounded cycle.
 
 The next reviewer must read the ledger before reviewing the new head. That

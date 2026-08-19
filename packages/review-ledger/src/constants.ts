@@ -103,6 +103,7 @@ export const PR_V1_MARKERS: readonly string[] = [
   '<!-- local-review-refactor:v1 ',
   '<!-- local-review-pass:v1 ',
   '<!-- local-review-complete:v1 ',
+  '<!-- local-review-tier:v1 ',
 ] as const;
 
 export const FINDING_V3_RE =
