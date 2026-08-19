@@ -8,6 +8,8 @@ The review ledger uses an open draft pull request as a durable ledger of actor-o
 
 - **Strict Protocol Validation**: Deterministic v3 marker serialization, SHA-256 content hashing, sequential occurrence verification, and blocker resolution enforcement.
 - **Multi-Engine Support**: Unified contract for `codex`, `claude`, `gemini`, and `antigravity` reviewer engines.
+- **Declared Rosters & Coverage**: A pull request declares its author engine and zero, one, or two reviewer engines; coverage is then derived from attestations naming the exact current head.
+- **Published Protocol**: The engine-neutral contract every engine follows ships in the tarball at [`protocol/local-review-ledger.md`](./protocol/local-review-ledger.md), so each platform repository vendors one source of truth instead of maintaining its own copy.
 - **Standalone CLI & TypeScript API**: Zero npm runtime dependencies, dual ESM/CJS distribution, and CLI executable (`review-ledger`).
 
 ## Installation
@@ -155,6 +157,40 @@ review-ledger write-blocked-result \
   --blocker-file ./blocked-reason.txt
 ```
 
+### Declare the Roster & Check Coverage
+
+Participation is declared, never inferred: an engine that has not attested is
+otherwise indistinguishable from one that was never going to run.
+
+```bash
+# Claude wrote the change; Codex and Gemini will review it
+review-ledger post-roster --repo owner/repo --pr 123 --head <sha> \
+  --author claude --reviewers codex,gemini --content-file ./roster-reason.txt
+
+# Solo review is allowed, but must be declared with a recorded reason
+review-ledger post-roster --repo owner/repo --pr 123 --head <sha> \
+  --author claude --reviewers none --content-file ./solo-reason.txt
+
+review-ledger read-roster --repo owner/repo --pr 123
+
+# Report coverage at the exact current head
+review-ledger coverage --repo owner/repo --pr 123 --head <sha>
+
+# ...or fail when no roster is declared or a declared reviewer is missing
+review-ledger verify-coverage --repo owner/repo --pr 123 --head <sha>
+```
+
+`coverage` reports a `tier` over distinct **non-author** engines that attested
+the exact head: `solo` (none), `cross` (one), `full` (two or more). The author
+engine's own pass is reported as `authorAttested` but never counted — it re-reads
+a change while still holding the rationale that produced it.
+
+Because coverage is keyed to the exact head, it is also the invalidation rule.
+An engine whose newest attestation names an earlier commit has not reviewed what
+the pull request currently contains; an engine whose attestation names the
+current commit has, whatever moved the head. A fix therefore invalidates only
+the attestations that named the old head, rather than restarting a whole round.
+
 ### Reconcile & Verify Ledger
 
 ```bash
@@ -197,6 +233,10 @@ import {
   formatFindings,
   verifyLedger,
   reconcile,
+  postRoster,
+  readRoster,
+  coverage,
+  verifyCoverage,
 } from '@loomantix/review-ledger';
 
 // Format findings table

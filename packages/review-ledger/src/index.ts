@@ -21,6 +21,10 @@ export {
   DISPOSITION_V1_RE,
   PROTOCOL_THREAD_MARKER_RE,
   LEGACY_THREAD_MARKER_RE,
+  ROSTER_V1_MARKER,
+  ROSTER_V1_RE,
+  PASS_V3_RE,
+  COMPLETE_V3_RE,
   EXPECTED_ACTOR_ENV,
   EXPECTED_THREADS_SHA256_ENV,
   HISTORICAL_COMMENT_IDS_ENV,
@@ -115,6 +119,18 @@ export {
   rowsHaveHistoricalMarkers,
 } from './github.js';
 
+export {
+  parseReviewers,
+  matchRoster,
+  buildRosterBody,
+  readRoster,
+  postRoster,
+  attestationsAtHead,
+  coverageTier,
+  coverage,
+  verifyCoverage,
+} from './roster.js';
+
 export { formatFindings } from './format.js';
 
 export type {
@@ -158,4 +174,12 @@ export type {
   GitHubReviewCommentNode,
   GitHubReviewThreadNode,
   GitHubRunner,
+  CoverageTier,
+  RosterV1Match,
+  RosterReport,
+  PostRosterParams,
+  PostRosterResult,
+  AttestationAtHead,
+  CoverageParams,
+  CoverageResult,
 } from './types.js';

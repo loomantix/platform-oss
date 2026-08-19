@@ -16,6 +16,7 @@ import {
 } from './constants.js';
 import { fail } from './errors.js';
 import { assertRegularFile, parseJsonOrFail } from './io.js';
+import { readContent } from './protocol.js';
 import { requireSha } from './hash.js';
 import {
   attest,
@@ -31,6 +32,7 @@ import {
   writeResult,
 } from './ledger.js';
 import { readResult, validateResult, writeBlockedResult } from './result.js';
+import { coverage, postRoster, readRoster, verifyCoverage } from './roster.js';
 import { formatFindings } from './format.js';
 import { resetGitHubRunner } from './github.js';
 import type {
@@ -77,6 +79,8 @@ interface CliArgs {
   blockerFile?: string | undefined;
   classification?: SupportedClassification | undefined;
   jsonFile?: string | undefined;
+  author?: SupportedEngine | undefined;
+  reviewers?: SupportedEngine[] | undefined;
   file?: string | undefined;
 }
 
@@ -249,6 +253,19 @@ function parseCliArgs(argv: string[]): CliArgs {
       case '--json-file':
         args.jsonFile = parseVal(arg);
         break;
+      case '--author':
+        args.author = parseEnum(arg, parseVal(arg), SUPPORTED_ENGINES);
+        break;
+      case '--reviewers': {
+        const raw = parseVal(arg);
+        args.reviewers =
+          raw === 'none'
+            ? []
+            : raw
+                .split(',')
+                .map((part) => parseEnum(arg, part, SUPPORTED_ENGINES));
+        break;
+      }
       default:
         fail(`unknown argument: ${arg}`);
     }
@@ -651,6 +668,48 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
         allowedHeadsFile: args.allowedHeadsFile,
         expectedThreadsSha256: args.expectedThreadsSha256,
       });
+      writeSortedJson(out);
+      break;
+    }
+    case 'post-roster': {
+      if (
+        !args.repo ||
+        args.pr === undefined ||
+        !args.head ||
+        !args.author ||
+        args.reviewers === undefined ||
+        !args.contentFile
+      ) {
+        fail(
+          'post-roster requires --repo, --pr, --head, --author, --reviewers, and --content-file',
+        );
+      }
+      const out = postRoster({
+        repo: args.repo,
+        pr: args.pr,
+        head: args.head,
+        author: args.author,
+        reviewers: args.reviewers,
+        content: readContent(args.contentFile),
+      });
+      writeSortedJson(out);
+      break;
+    }
+    case 'read-roster': {
+      if (!args.repo || args.pr === undefined) {
+        fail('read-roster requires --repo and --pr');
+      }
+      const out = readRoster({ repo: args.repo, pr: args.pr });
+      writeSortedJson(out);
+      break;
+    }
+    case 'coverage':
+    case 'verify-coverage': {
+      if (!args.repo || args.pr === undefined || !args.head) {
+        fail(`${args.command} requires --repo, --pr, and --head`);
+      }
+      const run = args.command === 'coverage' ? coverage : verifyCoverage;
+      const out = run({ repo: args.repo, pr: args.pr, head: args.head });
       writeSortedJson(out);
       break;
     }
