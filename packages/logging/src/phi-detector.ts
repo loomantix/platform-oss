@@ -45,17 +45,26 @@ const PHI_PATTERNS = [
 /**
  * Field names that commonly contain PHI/PII and should never be logged.
  *
- * Enforced in two places:
+ * Enforced in three places:
  * 1. `extractPHIFields` / `detectPHI` — used by `assertPHISafe` to catch
  *    leaks at authoring time.
  * 2. `emitToEventSink` — before forwarding to any registered sink, values
  *    at these keys are stripped (see `logMetadata`).
+ * 3. `redaction.ts` — `REDACTED_FIELD_NAMES` is built from this list, and
+ *    `pino.config.ts` censors those names at every depth on the way to
+ *    stdout.
  *
- * This list is a superset of `pino.redact.paths` in `pino.config.ts`:
- * pino.redact covers stdout; this list additionally covers the event-sink
- * path, which would otherwise leak auth/PII fields to external queues.
+ * This list plus {@link CREDENTIAL_FIELD_NAMES} — together
+ * {@link SENSITIVE_FIELD_NAMES} — are the single source of truth for all
+ * three. This one is the PHI half: it is what `detectPHI` classifies as
+ * clinical. It used to cover only
+ * the event sink while `pino.redact.paths` carried its own shorter list,
+ * which meant the clinical fields below (`transcript`, `soapNote`, the S3
+ * keys) were stripped from the audit sink but written to stdout — and
+ * stdout is what ships to log aggregation. Adding a name here now protects
+ * both channels; do not reintroduce a second list.
  */
-const PHI_FIELD_NAMES = [
+export const PHI_FIELD_NAMES = [
   // Healthcare / transcription PHI
   'text',
   'words',
@@ -113,6 +122,114 @@ const PHI_FIELD_NAMES = [
   'compressedKey',
   'oggKey',
 ];
+
+/**
+ * Collapse a field name to a case- and separator-insensitive form.
+ *
+ * The stdout walk in `redaction.ts` matches names this way, so the detector
+ * and the event sink must use the same rule or the two channels drift apart
+ * again — which is precisely the defect that made this list the single source
+ * of truth. `patientId`, `PatientId`, `patient_id` and `PATIENT-ID` are one
+ * field wearing four house styles, and a healthcare backend meets all of them:
+ * PascalCase is what .NET and most EMR vendor APIs emit.
+ */
+export function normalizePHIName(name: string): string {
+  return name.toLowerCase().replace(/[_-]/g, '');
+}
+
+const NORMALIZED_PHI_FIELD_NAMES: ReadonlySet<string> = new Set(
+  PHI_FIELD_NAMES.map(normalizePHIName),
+);
+
+/** True when `key` names a PHI/PII field, in any case or separator style. */
+export function isPHIFieldName(key: string): boolean {
+  return NORMALIZED_PHI_FIELD_NAMES.has(normalizePHIName(key));
+}
+
+/**
+ * Field names that carry credentials rather than PHI.
+ *
+ * These live here, beside {@link PHI_FIELD_NAMES}, because both the stdout
+ * walk and the event sink have to match them. Keeping them in `redaction.ts`
+ * made the superset stdout-only: `hasPHIFields` returned `false` for an entry
+ * whose only sensitive field was one of these, so the sink forwarded the raw
+ * entry — the same stdout/sink drift this module exists to prevent, with the
+ * channels swapped.
+ *
+ * They are a separate list from `PHI_FIELD_NAMES` because they are not PHI:
+ * only the PHI list drives the clinical classification `detectPHI` reports.
+ * Both lists feed {@link isSensitiveFieldName}, which is what decides whether
+ * a value may be written.
+ */
+export const CREDENTIAL_FIELD_NAMES = [
+  // Request/response headers.
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'x-auth-token',
+  'proxy-authorization',
+  // snake_case spellings whose normalized form has no camelCase counterpart
+  // in PHI_FIELD_NAMES. (`api_key` and `session_id` normalize onto `apiKey`
+  // and `sessionId`, so they need no entry.)
+  'accessToken',
+  'refreshToken',
+  'idToken',
+  'clientSecret',
+  'privateKey',
+  // Signing material that travels in query strings. A presigned S3 link is a
+  // bearer credential: anyone holding the signature can fetch the object until
+  // it expires, and those links point at recordings.
+  'signature',
+  'sig',
+  'x-amz-signature',
+  'x-amz-credential',
+  'x-amz-security-token',
+];
+
+/**
+ * Every field name that must never be written in cleartext, on any channel.
+ *
+ * The stdout walk, the event sink, and `assertPHISafe` all match against this
+ * union so a name added to either list protects all three at once.
+ */
+export const SENSITIVE_FIELD_NAMES = [
+  ...PHI_FIELD_NAMES,
+  ...CREDENTIAL_FIELD_NAMES,
+];
+
+const NORMALIZED_SENSITIVE_FIELD_NAMES: ReadonlySet<string> = new Set(
+  SENSITIVE_FIELD_NAMES.map(normalizePHIName),
+);
+
+/**
+ * True when `key` names a field whose value must never be logged — PHI or
+ * credential — in any case or separator style.
+ */
+export function isSensitiveFieldName(key: string): boolean {
+  return NORMALIZED_SENSITIVE_FIELD_NAMES.has(normalizePHIName(key));
+}
+
+/**
+ * S3 URL/key field names, matched by the same normalized rule.
+ *
+ * Hoisted out of `logMetadataInner` so the set is built once rather than on
+ * every nested object the sink walks.
+ */
+const NORMALIZED_S3_FIELD_NAMES: ReadonlySet<string> = new Set(
+  [
+    'audioFileUrl',
+    'audioFileKey',
+    'recordingUrl',
+    'downloadUrl',
+    'uploadUrl',
+    'completeAudioFileKey',
+    'inputKey',
+    'outputKey',
+    'compressedKey',
+    'oggKey',
+  ].map(normalizePHIName),
+);
 
 /**
  * JSON.stringify that returns `undefined` instead of throwing on circular
@@ -203,7 +320,7 @@ function extractPHIFieldsInner(
   const foundFields: string[] = [];
 
   for (const [key, value] of Object.entries(data)) {
-    if (PHI_FIELD_NAMES.includes(key)) {
+    if (isSensitiveFieldName(key)) {
       foundFields.push(key);
     }
 
@@ -217,19 +334,63 @@ function extractPHIFieldsInner(
 }
 
 /**
- * Redact an S3 URL or key for safe logging
- * Shows only filename and extension while hiding the full path
+ * File extensions that may survive redaction.
+ *
+ * An allowlist rather than a shape test. "Short and alphanumeric" does not
+ * separate a format hint from an identifier: `JaneDoe.MRN9987`,
+ * `recording.20250817` and `note.Smith` all pass such a test, and each
+ * publishes exactly the kind of value the rest of this function exists to
+ * remove. Only a name already known to be a format carries no patient data.
+ */
+const SAFE_EXTENSIONS: ReadonlySet<string> = new Set([
+  // Audio/video produced by the recording pipeline.
+  'wav',
+  'mp3',
+  'ogg',
+  'oga',
+  'm4a',
+  'aac',
+  'flac',
+  'opus',
+  'webm',
+  'mp4',
+  'mov',
+  // Documents and payloads the pipeline moves alongside them.
+  'json',
+  'txt',
+  'csv',
+  'xml',
+  'pdf',
+  'zip',
+  'gz',
+]);
+
+/**
+ * Redact an S3 URL or key for safe logging, keeping only the file extension.
+ *
+ * The filename is dropped, not preserved. Recording filenames routinely embed
+ * exactly the identifiers this function exists to remove — an object key like
+ * `encounters/123/JaneDoe-MRN9987-dob1975.wav` carries a patient name, an MRN
+ * and a date of birth in the last path segment, so returning
+ * `[REDACTED]/JaneDoe-MRN9987-dob1975.wav` redacted the part that was already
+ * safe and published the part that was not.
+ *
+ * The extension survives because it is the only piece with diagnostic value
+ * (which pipeline stage produced the object) and no identifying content.
  *
  * @param urlOrKey - S3 URL or key to redact
- * @returns Redacted string showing only the filename
+ * @returns `[REDACTED]` plus the extension, when one is present
  *
  * @example
  * ```typescript
  * redactS3Url('s3://bucket/encounters/123/audio.wav');
- * // Returns: '[REDACTED]/audio.wav'
+ * // Returns: '[REDACTED].wav'
  *
- * redactS3Url('https://bucket.s3.amazonaws.com/encounters/123/audio.wav?signature=...');
- * // Returns: '[REDACTED]/audio.wav'
+ * redactS3Url('https://bucket.s3.amazonaws.com/e/123/a.wav?X-Amz-Signature=...');
+ * // Returns: '[REDACTED].wav'
+ *
+ * redactS3Url('s3://bucket/encounters/123/no-extension');
+ * // Returns: '[REDACTED]'
  * ```
  */
 function redactS3Url(urlOrKey: string): string {
@@ -237,14 +398,25 @@ function redactS3Url(urlOrKey: string): string {
     return '[REDACTED]';
   }
 
-  // Extract filename from URL or key
-  const parts = urlOrKey.split('/');
-  const filename = parts[parts.length - 1];
+  // Drop the presigned query string and any fragment before looking at the
+  // path — a signature is credential material, not part of the filename.
+  const withoutQuery = urlOrKey.split(/[?#]/)[0] ?? '';
+  const parts = withoutQuery.split('/');
+  const filename = parts[parts.length - 1] ?? '';
 
-  // Remove query parameters from presigned URLs
-  const cleanFilename = filename?.split('?')[0] || '';
+  const dot = filename.lastIndexOf('.');
+  // `dot < 1` covers both "no extension" and a dotfile like `.env`, whose
+  // leading dot introduces a name rather than a format.
+  if (dot < 1) {
+    return '[REDACTED]';
+  }
 
-  return `[REDACTED]/${cleanFilename}`;
+  const extension = filename.slice(dot + 1).toLowerCase();
+  if (!SAFE_EXTENSIONS.has(extension)) {
+    return '[REDACTED]';
+  }
+
+  return `[REDACTED].${extension}`;
 }
 
 /**
@@ -283,29 +455,18 @@ function logMetadataInner(
 
   const metadata: Record<string, unknown> = {};
 
-  // S3-related field names that should be redacted
-  const s3FieldNames = [
-    'audioFileUrl',
-    'audioFileKey',
-    'recordingUrl',
-    'downloadUrl',
-    'uploadUrl',
-    'completeAudioFileKey',
-    'inputKey',
-    'outputKey',
-    'compressedKey',
-    'oggKey',
-  ];
-
   for (const [key, value] of Object.entries(obj)) {
-    // Redact S3 URLs/keys while preserving filename
-    if (s3FieldNames.includes(key) && typeof value === 'string') {
+    // Redact S3 URLs/keys, keeping only a recognized file extension
+    if (
+      NORMALIZED_S3_FIELD_NAMES.has(normalizePHIName(key)) &&
+      typeof value === 'string'
+    ) {
       metadata[key] = redactS3Url(value);
       continue;
     }
 
-    // Skip other PHI fields entirely
-    if (PHI_FIELD_NAMES.includes(key)) {
+    // Skip other sensitive fields entirely
+    if (isSensitiveFieldName(key)) {
       if (Array.isArray(value)) {
         metadata[`${key}Count`] = value.length;
       } else if (typeof value === 'string') {

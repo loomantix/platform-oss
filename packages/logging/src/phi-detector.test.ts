@@ -522,3 +522,194 @@ describe('PHI Detector', () => {
     });
   });
 });
+
+/**
+ * Regression tests for the S3 filename leak found in the August 2026 security
+ * review: `redactS3Url` hid the object path and kept the filename, which is
+ * where recording pipelines put patient names, MRNs and dates of birth.
+ */
+describe('logMetadata — S3 redaction', () => {
+  it('drops the filename and keeps only the extension', () => {
+    expect(
+      logMetadata({
+        audioFileKey: 'encounters/123/JaneDoe-MRN9987-dob1975.wav',
+      }),
+    ).toEqual({ audioFileKey: '[REDACTED].wav' });
+  });
+
+  it('does not leak identifiers from the filename', () => {
+    const out = JSON.stringify(
+      logMetadata({ audioFileUrl: 's3://b/e/JohnDoe-MRN4471-1980-05-02.wav' }),
+    );
+    expect(out).not.toContain('JohnDoe');
+    expect(out).not.toContain('MRN4471');
+    expect(out).not.toContain('1980-05-02');
+  });
+
+  it('drops presigned query parameters', () => {
+    const out = JSON.stringify(
+      logMetadata({
+        recordingUrl:
+          'https://b.s3.amazonaws.com/e/1/a.wav?X-Amz-Signature=deadbeef',
+      }),
+    );
+    expect(out).not.toContain('deadbeef');
+    expect(out).toContain('[REDACTED].wav');
+  });
+
+  it('returns a bare marker when there is no extension', () => {
+    expect(logMetadata({ inputKey: 'encounters/123/JaneDoe-MRN9987' })).toEqual(
+      { inputKey: '[REDACTED]' },
+    );
+  });
+
+  it('treats a dotfile as having no extension', () => {
+    expect(logMetadata({ inputKey: 'some/path/.env' })).toEqual({
+      inputKey: '[REDACTED]',
+    });
+  });
+
+  it('rejects an over-long or non-alphanumeric extension', () => {
+    // A crafted key could otherwise smuggle data through as an "extension".
+    expect(
+      logMetadata({ outputKey: 'p/a.JaneDoeMRN9987DobNineteenSeventyFive' }),
+    ).toEqual({ outputKey: '[REDACTED]' });
+    expect(logMetadata({ outputKey: 'p/a.wav-MRN9987' })).toEqual({
+      outputKey: '[REDACTED]',
+    });
+  });
+
+  it('still applies to every S3 field name', () => {
+    for (const field of [
+      'audioFileUrl',
+      'audioFileKey',
+      'recordingUrl',
+      'downloadUrl',
+      'uploadUrl',
+      'completeAudioFileKey',
+      'inputKey',
+      'outputKey',
+      'compressedKey',
+      'oggKey',
+    ]) {
+      expect(logMetadata({ [field]: 'a/b/Secret-Name.ogg' })).toEqual({
+        [field]: '[REDACTED].ogg',
+      });
+    }
+  });
+});
+
+describe('name matching is case- and separator-insensitive', () => {
+  // The stdout walk matches names this way. When the sink and the detector
+  // used exact matching instead, stdout was protected and the sink was not —
+  // the same drift this list was made the single source of truth to prevent,
+  // with the channels swapped.
+  const spellings = ['PatientId', 'patient_id', 'PATIENT-ID', 'patientId'];
+
+  it.each(spellings)('extractPHIFields finds %s', (name) => {
+    expect(extractPHIFields({ [name]: 'P-1' })).toEqual([name]);
+  });
+
+  it.each(spellings)('hasPHIFields flags %s', (name) => {
+    expect(hasPHIFields({ [name]: 'P-1' })).toBe(true);
+  });
+
+  it.each(spellings)('logMetadata strips %s from the sink payload', (name) => {
+    const out = logMetadata({ [name]: 'P-1' });
+    expect(out[name]).toBeUndefined();
+    expect(out[`${name}Length`]).toBe(3);
+  });
+
+  it('strips a PascalCase clinical field the sink used to forward', () => {
+    const out = logMetadata({ Transcript: 'Patient reports chest pain.' });
+    expect(out['Transcript']).toBeUndefined();
+    expect(out['TranscriptLength']).toBe(27);
+  });
+
+  it('redacts an S3 key named in a different style', () => {
+    expect(logMetadata({ AudioFileKey: 's3://b/e/1/audio.wav' })).toEqual({
+      AudioFileKey: '[REDACTED].wav',
+    });
+  });
+
+  it('leaves an unrelated name alone', () => {
+    expect(logMetadata({ encounterId: 'E-1' })).toEqual({ encounterId: 'E-1' });
+    expect(hasPHIFields({ encounterId: 'E-1' })).toBe(false);
+  });
+});
+
+describe('redactS3Url keeps only a recognized extension', () => {
+  // "Short and alphanumeric" does not separate a format hint from an
+  // identifier: recording keys embed exactly the values this function removes.
+  it.each([
+    ['s3://b/encounters/123/JaneDoe.MRN9987', '[REDACTED]'],
+    ['s3://b/e/recording.20250817', '[REDACTED]'],
+    ['s3://b/e/note.Smith', '[REDACTED]'],
+    ['s3://b/e/audio.wav', '[REDACTED].wav'],
+    ['s3://b/e/audio.OGG', '[REDACTED].ogg'],
+    ['s3://b/e/x.wav?X-Amz-Signature=abc', '[REDACTED].wav'],
+  ])('%s -> %s', (key, expected) => {
+    expect(logMetadata({ audioFileKey: key })).toEqual({
+      audioFileKey: expected,
+    });
+  });
+});
+
+describe('credential field names on the event-sink path', () => {
+  // The credential names used to live only in redaction.ts, so they were
+  // censored on stdout and forwarded to the event sink in cleartext — the
+  // stdout/sink drift this package exists to prevent, with the channels
+  // swapped. Both channels now match the same union.
+  it('reports a credential-only payload as sensitive', () => {
+    // hasPHIFields gates whether emitToEventSink redacts at all: false here
+    // meant the raw entry was forwarded untouched.
+    expect(hasPHIFields({ authorization: 'Bearer abc' })).toBe(true);
+    expect(hasPHIFields({ 'x-api-key': 'k' })).toBe(true);
+    expect(hasPHIFields({ clientSecret: 's' })).toBe(true);
+  });
+
+  it('extracts credential field names', () => {
+    expect(extractPHIFields({ authorization: 'Bearer abc' })).toContain(
+      'authorization',
+    );
+    expect(extractPHIFields({ ctx: { accessToken: 'a' } })).toContain(
+      'ctx.accessToken',
+    );
+  });
+
+  it('summarizes credentials instead of copying them', () => {
+    expect(
+      logMetadata({
+        authorization: 'Bearer ab',
+        clientSecret: 'cs',
+        accessToken: 'at',
+        refreshToken: 'rt',
+        signature: 'sg',
+        encounterId: 'enc-1',
+      }),
+    ).toEqual({
+      authorizationLength: 9,
+      clientSecretLength: 2,
+      accessTokenLength: 2,
+      refreshTokenLength: 2,
+      signatureLength: 2,
+      encounterId: 'enc-1',
+    });
+  });
+
+  it('matches credential names in any case or separator style', () => {
+    expect(hasPHIFields({ Authorization: 'x' })).toBe(true);
+    expect(hasPHIFields({ ACCESS_TOKEN: 'x' })).toBe(true);
+    expect(hasPHIFields({ 'x-amz-signature': 'x' })).toBe(true);
+    expect(hasPHIFields({ xAmzSignature: 'x' })).toBe(true);
+  });
+
+  it('still passes a non-sensitive name through', () => {
+    expect(hasPHIFields({ requestId: 'r-1' })).toBe(false);
+    expect(logMetadata({ requestId: 'r-1' })).toEqual({ requestId: 'r-1' });
+  });
+
+  it('assertPHISafe rejects a credential payload', () => {
+    expect(() => assertPHISafe({ authorization: 'Bearer abc' })).toThrow();
+  });
+});

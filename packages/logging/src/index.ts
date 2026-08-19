@@ -8,7 +8,17 @@ export {
   logMetadata,
   assertPHISafe,
   hasPHIFields,
+  PHI_FIELD_NAMES,
 } from './phi-detector';
+export {
+  CENSOR,
+  MAX_REDACT_DEPTH,
+  MAX_REDACT_NODES,
+  REDACTED_FIELD_NAMES,
+  type RedactOptions,
+  redactTree,
+  sanitizeUrl,
+} from './redaction';
 export { createLogger } from './logger-factory';
 export {
   type EventSinkFn,
