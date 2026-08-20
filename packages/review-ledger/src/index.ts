@@ -38,6 +38,7 @@ export { LedgerError, fail } from './errors.js';
 export { sha256Text, sha256Bytes, requireToken, requireSha } from './hash.js';
 
 export { parseDiffLines, validateAnchor, type DiffLines } from './diff.js';
+export { classifyRangeEffect, type RangeEffect } from './effect.js';
 
 export {
   readLegacyBody,

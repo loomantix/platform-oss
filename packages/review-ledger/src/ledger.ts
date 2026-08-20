@@ -10,6 +10,7 @@ import {
   PROTOCOL_VERSION,
   SUBPROCESS_MAX_BUFFER,
 } from './constants.js';
+import { classifyRangeEffect } from './effect.js';
 import { fail, LedgerError } from './errors.js';
 import {
   assertActor,
@@ -494,6 +495,11 @@ export function verifyThreadDispositions(
  * Derive this round's fix evidence from the verified finding/disposition pairs.
  *
  * Returns `[fingerprint, hasFix, hasMajorFix, hasNonblockingFix]` per fingerprint, sorted.
+ *
+ * `hasMajorFix` is reported for callers that summarise a ledger. It is not an
+ * input to the `minor` / `material` decision: severity describes a finding and
+ * says nothing about what its fix moved, so classification reads the change
+ * range instead. See `classifyRangeEffect`.
  */
 export function sameRoundDispositions(
   args: { engine: SupportedEngine; round: number; repo?: string | undefined },
@@ -702,10 +708,10 @@ export function verifyResultEvidence(
     fail('changed review results require ledger evidence');
   }
   if (
-    evidence.some(([, , hasMajorFix]) => hasMajorFix) &&
-    data.classification !== 'material'
+    data.classification === 'minor' &&
+    classifyRangeEffect(args.before, resultHead(args)) === 'behavioral'
   ) {
-    fail('fixed blocking or major findings require material classification');
+    fail('minor classification requires a non-behavioral change range');
   }
   if (!evidence.some(([, hasFix]) => hasFix)) {
     fail('changed review results require a fixed ledger finding');
@@ -762,6 +768,10 @@ export function writeResult(params: WriteResultParams): LedgerResult {
   if (!changed && params.classification !== undefined) {
     fail('clean review result cannot have a classification');
   }
+  // A consequence of the convergence rule below, not an independent judgement:
+  // a convergence round may only fix a `blocking` finding, and no `blocking`
+  // defect can be cleared by a comment or test edit, so any legitimate round-3+
+  // fix moves behavior. Re-derive this if the blocking-only rule ever relaxes.
   if (changed && params.round >= 3 && params.classification !== 'material') {
     fail('round 3+ changed review results require material classification');
   }
@@ -771,6 +781,11 @@ export function writeResult(params: WriteResultParams): LedgerResult {
   if (changed && !dispositions.some(([, hasFix]) => hasFix)) {
     fail('changed review results require a fixed ledger finding');
   }
+  // This one reads severity on purpose. It enforces a disposition rule — what a
+  // convergence round may change — not a classification, so decoupling
+  // classification from severity leaves it alone. A convergence round therefore
+  // still cannot fix a wrong comment; that is intended, because round 3+ exists
+  // to land the change.
   if (
     changed &&
     params.round >= 3 &&
@@ -780,10 +795,10 @@ export function writeResult(params: WriteResultParams): LedgerResult {
   }
   if (
     changed &&
-    params.classification !== 'material' &&
-    dispositions.some(([, , hasMajorFix]) => hasMajorFix)
+    params.classification === 'minor' &&
+    classifyRangeEffect(params.before, params.head) === 'behavioral'
   ) {
-    fail('fixed blocking or major findings require material classification');
+    fail('minor classification requires a non-behavioral change range');
   }
 
   const value: Record<string, unknown> = {
