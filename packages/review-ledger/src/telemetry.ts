@@ -231,7 +231,7 @@ function validateChangeset(value: unknown): Changeset {
     languages[key] = requireCount(raw, `changeset.linesByLanguage.${key}`);
   }
 
-  return {
+  const validated: Changeset = {
     classifierVersion: requireCount(
       source['classifierVersion'],
       'changeset.classifierVersion',
@@ -252,6 +252,26 @@ function validateChangeset(value: unknown): Changeset {
     linesChanged,
     linesByLanguage: languages,
   };
+  const totalFiles = Object.values(validated.files).reduce(
+    (total, count) => total + count,
+    0,
+  );
+  const requiredReviewFiles = validated.files.app + validated.files.test;
+  if (
+    !Number.isSafeInteger(totalFiles) ||
+    !Number.isSafeInteger(requiredReviewFiles)
+  ) {
+    fail('telemetry changeset file totals must be safe integers');
+  }
+  if (
+    validated.reviewSignificantFiles < requiredReviewFiles ||
+    validated.reviewSignificantFiles > totalFiles
+  ) {
+    fail(
+      'telemetry changeset.reviewSignificantFiles must cover app/test files and not exceed total files',
+    );
+  }
+  return validated;
 }
 
 function validateFindings(value: unknown): TelemetryFindings {
@@ -363,7 +383,8 @@ export function validateTelemetryRecord(value: unknown): TelemetryRecord {
   if (
     typeof emittedAt !== 'string' ||
     !UTC_TIMESTAMP_RE.test(emittedAt) ||
-    Number.isNaN(Date.parse(emittedAt))
+    Number.isNaN(Date.parse(emittedAt)) ||
+    new Date(emittedAt).toISOString().replace('.000Z', 'Z') !== emittedAt
   ) {
     fail('telemetry emittedAt must be an RFC 3339 UTC timestamp');
   }
@@ -675,9 +696,9 @@ export function buildTelemetryBody(record: TelemetryRecord): string {
 /**
  * Parse the telemetry record out of a comment body, or return null.
  *
- * A body carrying a telemetry marker that does not parse fails rather than
- * reading as absent: a corrupted record is a defect to see, not a data point
- * to lose silently.
+ * A direct parse of a body carrying a telemetry marker fails rather than
+ * reading as absent. Sinks may skip malformed replay candidates so an older
+ * bad record cannot prevent a new pass from emitting valid telemetry.
  */
 export function matchTelemetry(body: string): TelemetryRecord | null {
   if (!isTelemetryComment(body)) {
@@ -707,6 +728,39 @@ export function matchTelemetry(body: string): TelemetryRecord | null {
   );
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === undefined) {
+    return 'undefined';
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (typeof value === 'object' && value !== null) {
+    const source = value as Record<string, unknown>;
+    return `{${Object.keys(source)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function replayFingerprint(record: TelemetryRecord): string {
+  const known = knownTelemetryRecord(record);
+  return canonicalJson({
+    ...known,
+    emittedAt: null,
+    tokens: [...known.tokens].sort((left, right) =>
+      canonicalJson(left).localeCompare(canonicalJson(right)),
+    ),
+    lanes: known.lanes
+      ? [...known.lanes].sort((left, right) =>
+          canonicalJson(left).localeCompare(canonicalJson(right)),
+        )
+      : undefined,
+  });
+}
+
 /**
  * The reference sink: one new comment per pass on the pull request.
  *
@@ -716,9 +770,9 @@ export function matchTelemetry(body: string): TelemetryRecord | null {
  * external sinks are consumers of these markers, never dependencies for
  * writing them.
  *
- * One comment per pass rather than one edited comment per engine: the protocol
- * treats an edited marker as untrustworthy and fails closed on it, so appending
- * is the consistent choice even though it costs comment volume.
+ * One comment per pass rather than one edited comment per engine keeps the
+ * immutable history readable. Malformed replay candidates are ignored so they
+ * cannot poison later emission.
  */
 export function prCommentSink(target: {
   repo: string;
@@ -740,12 +794,7 @@ export function prCommentSink(target: {
           continue;
         }
         if (parsed?.idempotencyKey === record.idempotencyKey) {
-          const replayRecord = knownTelemetryRecord(parsed);
-          const candidateRecord = knownTelemetryRecord(record);
-          if (
-            JSON.stringify({ ...replayRecord, emittedAt: null }) !==
-            JSON.stringify({ ...candidateRecord, emittedAt: null })
-          ) {
+          if (replayFingerprint(parsed) !== replayFingerprint(record)) {
             fail('telemetry idempotency key conflicts with an existing record');
           }
           return { sink: 'pr-comment', reference: String(row['id'] ?? '') };

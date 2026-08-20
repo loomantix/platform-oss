@@ -776,9 +776,9 @@ export interface TelemetryFindingsInput {
 /**
  * One review pass, measured.
  *
- * Enumerated fields and integers only: no finding titles, no file paths, no
- * summaries. The record is designed to be publishable on a public repository,
- * which it can only be if nothing in it can carry prose.
+ * Structured identifiers and integers only: no finding titles or summaries.
+ * Token validation is syntactic, so callers must still supply public-safe,
+ * non-sensitive model, lane, version, and idempotency identifiers.
  */
 export interface TelemetryRecord {
   version: 1;

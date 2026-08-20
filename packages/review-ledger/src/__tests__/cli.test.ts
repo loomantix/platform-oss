@@ -120,4 +120,18 @@ describe('CLI command parser and execution', () => {
       }
     },
   );
+
+  it('keeps telemetry non-failing when boolean flags precede the command', () => {
+    const stdoutSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+    try {
+      expect(runCli(['--truncated', 'emit-telemetry', '--unknown'])).toBe(0);
+      expect(stdoutSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/"emitted":false/),
+      );
+    } finally {
+      stdoutSpy.mockRestore();
+    }
+  });
 });

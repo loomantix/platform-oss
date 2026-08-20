@@ -425,6 +425,9 @@ export function classifyFiles(
       fail(`changed file ${file.path} reports an invalid churn count`);
     }
     const churn = file.added + file.deleted;
+    if (!Number.isSafeInteger(churn)) {
+      fail(`changed file ${file.path} reports an invalid churn total`);
+    }
     const blank = file.blank ?? 0;
     if (!Number.isSafeInteger(blank) || blank < 0 || blank > churn) {
       fail(`changed file ${file.path} reports an invalid blank count`);
@@ -511,11 +514,16 @@ function headerPath(rest: string): string | null {
   if (quoted) {
     return stripSide(quoted[2]!);
   }
-  const split = rest.lastIndexOf(' b/');
-  if (split === -1) {
+  const splits: number[] = [];
+  let split = rest.indexOf(' b/');
+  while (split !== -1) {
+    splits.push(split);
+    split = rest.indexOf(' b/', split + 1);
+  }
+  if (splits.length !== 1) {
     return null;
   }
-  return stripSide(rest.slice(split + 1));
+  return stripSide(rest.slice(splits[0]! + 1));
 }
 
 function stripSide(raw: string): string | null {
@@ -524,6 +532,15 @@ function stripSide(raw: string): string | null {
   }
   const unquoted = unquotePath(raw);
   return unquoted.replace(/^[ab]\//, '');
+}
+
+function markerPath(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('"')) {
+    const quoted = /^("(?:[^"\\]|\\.)*")/.exec(trimmed);
+    return quoted ? stripSide(quoted[1]!) : null;
+  }
+  return stripSide(trimmed.split('\t', 1)[0]!);
 }
 
 /**
@@ -541,14 +558,23 @@ export function parseDiffPatch(patch: string): ChangedFile[] {
   const files: ChangedFile[] = [];
   let current: ChangedFile | null = null;
   let inHunk = false;
+  let headerComplete = false;
+  let currentFromGit = false;
+  let oldLinesRemaining = 0;
+  let newLinesRemaining = 0;
 
   const push = (): void => {
     if (current !== null) {
+      if (!headerComplete) {
+        fail('unified diff contains an incomplete file header');
+      }
       files.push(current);
     }
   };
 
-  for (const rawLine of patch.split(/\r?\n/)) {
+  const lines = patch.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index++) {
+    const rawLine = lines[index]!;
     if (rawLine.startsWith('diff --git ')) {
       push();
       current = {
@@ -558,6 +584,25 @@ export function parseDiffPatch(patch: string): ChangedFile[] {
         blank: 0,
       };
       inHunk = false;
+      headerComplete = true;
+      currentFromGit = true;
+      continue;
+    }
+    if (
+      !inHunk &&
+      !currentFromGit &&
+      rawLine.startsWith('--- ') &&
+      lines[index + 1]?.startsWith('+++ ')
+    ) {
+      if (current !== null) {
+        push();
+      }
+      const left = markerPath(rawLine.slice(4));
+      const right = markerPath(lines[index + 1]!.slice(4));
+      current = { path: right ?? left ?? '', added: 0, deleted: 0, blank: 0 };
+      headerComplete = true;
+      currentFromGit = false;
+      index += 1;
       continue;
     }
     if (current === null) {
@@ -571,13 +616,20 @@ export function parseDiffPatch(patch: string): ChangedFile[] {
       continue;
     }
     if (!inHunk && rawLine.startsWith('+++ ')) {
-      const right = stripSide(rawLine.slice(4).trim());
+      const right = markerPath(rawLine.slice(4));
       if (right !== null) {
         current.path = right;
       }
+      headerComplete = true;
       continue;
     }
     if (rawLine.startsWith('@@')) {
+      const range = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(rawLine);
+      if (!range) {
+        fail('unified diff contains an unreadable hunk header');
+      }
+      oldLinesRemaining = Number(range[1] ?? '1');
+      newLinesRemaining = Number(range[2] ?? '1');
       inHunk = true;
       continue;
     }
@@ -585,20 +637,37 @@ export function parseDiffPatch(patch: string): ChangedFile[] {
       continue;
     }
     const prefix = rawLine.slice(0, 1);
-    if (prefix !== '+' && prefix !== '-') {
+    if (prefix === ' ') {
+      oldLinesRemaining -= 1;
+      newLinesRemaining -= 1;
+    } else if (prefix === '+') {
+      newLinesRemaining -= 1;
+    } else if (prefix === '-') {
+      oldLinesRemaining -= 1;
+    } else {
       continue;
     }
-    const content = rawLine.slice(1);
     if (prefix === '+') {
       current.added += 1;
-    } else {
+    } else if (prefix === '-') {
       current.deleted += 1;
     }
-    if (content.trim() === '') {
+    if ((prefix === '+' || prefix === '-') && rawLine.slice(1).trim() === '') {
       current.blank = (current.blank ?? 0) + 1;
     }
+    if (oldLinesRemaining < 0 || newLinesRemaining < 0) {
+      fail('unified diff hunk contains more lines than its header declares');
+    }
+    inHunk = oldLinesRemaining > 0 || newLinesRemaining > 0;
+  }
+  if (inHunk) {
+    fail('unified diff hunk ended before its declared line counts');
   }
   push();
+
+  if (files.length === 0 && patch.trim() !== '') {
+    fail('unified diff contains no readable file records');
+  }
 
   const named = files.filter((file) => file.path !== '');
   if (named.length !== files.length) {

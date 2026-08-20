@@ -1088,12 +1088,29 @@ function runCliCommand(argv: string[]): number {
   return 0;
 }
 
-/**
- * Parse argv, dispatch the requested subcommand, and return an exit code.
- */
+/** Locate the command token without validating command-specific arguments. */
+function commandFromArgv(argv: readonly string[]): string | undefined {
+  const booleanFlags = new Set([
+    '--protocol-version',
+    '--version',
+    '--file-level',
+    '--truncated',
+    '--dry-run',
+  ]);
+  for (let i = 0; i < argv.length; ) {
+    const arg = argv[i]!;
+    if (!arg.startsWith('-')) {
+      return arg;
+    }
+    i += booleanFlags.has(arg) ? 1 : 2;
+  }
+  return undefined;
+}
+
+/** Parse argv, dispatch the requested subcommand, and return an exit code. */
 export function runCli(argv: string[] = process.argv.slice(2)): number {
   resetGitHubRunner();
-  if (argv[0] !== 'emit-telemetry') {
+  if (commandFromArgv(argv) !== 'emit-telemetry') {
     return runCliCommand(argv);
   }
   try {

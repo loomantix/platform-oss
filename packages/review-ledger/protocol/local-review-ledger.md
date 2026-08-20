@@ -781,7 +781,7 @@ spend the refactor latch.
 
 ## Record what the pass cost
 
-Every pass emits one `local-review-telemetry:v1` marker: adversarial reviews,
+Every pass attempts to emit one `local-review-telemetry:v1` marker: adversarial reviews,
 cleanup passes, hosted lanes, and passes that skipped or were blocked. A skip
 still spends tokens reading and classifying the pull request, and a pass whose
 cost vanished from the record would have its churn attributed to nobody.
@@ -791,9 +791,10 @@ extension of the attestation. The attestation body is byte-verified and hashed;
 a telemetry defect must never fail a review that found real defects. For the
 same reason emission failure is logged and skipped, never raised.
 
-The record writer emits known enumerated fields and integers only — no finding
-titles, file paths, or summaries — so its output is publishable on a public
-repository as evidence the review chain ran. It never carries money: rates move, and on a
+The record writer emits known structured fields and integers only — no finding
+titles or summaries. Token validation is syntactic: callers must keep model,
+lane, version, and idempotency identifiers public-safe and non-sensitive before
+publishing the marker. It never carries money: rates move, and on a
 subscription plan the marginal cost of a pass is zero, so tokens are stored and
 priced downstream against a dated table.
 

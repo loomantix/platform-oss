@@ -154,16 +154,61 @@ describe('classifyFiles', () => {
       /invalid churn count/,
     );
   });
+
+  it('rejects churn whose component sum is not a safe integer', () => {
+    expect(() =>
+      classifyFiles([
+        { path: 'src/a.ts', added: Number.MAX_SAFE_INTEGER, deleted: 1 },
+      ]),
+    ).toThrow(/invalid churn total/);
+  });
 });
 
 describe('parseDiffPatch', () => {
+  it('parses a standard unified diff without Git extension headers', () => {
+    const patch = [
+      '--- a/src/a.ts',
+      '+++ b/src/a.ts',
+      '@@ -1 +1 @@',
+      '-const oldValue = 1;',
+      '+const newValue = 1;',
+    ].join('\n');
+    expect(parseDiffPatch(patch)).toEqual([
+      { path: 'src/a.ts', added: 1, deleted: 1, blank: 0 },
+    ]);
+  });
+
+  it('parses multiple files in a standard unified diff', () => {
+    const patch = [
+      '--- a/src/a.ts',
+      '+++ b/src/a.ts',
+      '@@ -1 +1 @@',
+      '-old a',
+      '+new a',
+      '--- a/src/b.ts',
+      '+++ b/src/b.ts',
+      '@@ -0,0 +1 @@',
+      '+new b',
+    ].join('\n');
+    expect(parseDiffPatch(patch)).toEqual([
+      { path: 'src/a.ts', added: 1, deleted: 1, blank: 0 },
+      { path: 'src/b.ts', added: 1, deleted: 0, blank: 0 },
+    ]);
+  });
+
+  it('rejects non-empty input with no readable file records', () => {
+    expect(() => parseDiffPatch('not a unified diff')).toThrow(
+      /no readable file records/,
+    );
+  });
+
   it('counts churn and blank churn per file', () => {
     const patch = [
       'diff --git a/src/a.ts b/src/a.ts',
       'index 111..222 100644',
       '--- a/src/a.ts',
       '+++ b/src/a.ts',
-      '@@ -1,3 +1,4 @@',
+      '@@ -1,2 +1,4 @@',
       ' const kept = 1;',
       '-const gone = 2;',
       '+const added = 2;',
@@ -209,6 +254,14 @@ describe('parseDiffPatch', () => {
     expect(parseDiffPatch(patch)).toEqual([
       { path: 'assets/logo.png', added: 0, deleted: 0, blank: 0 },
     ]);
+  });
+
+  it('rejects an ambiguous unquoted binary path instead of truncating it', () => {
+    const patch = [
+      'diff --git a/foo b/bar b/foo b/bar',
+      'Binary files a/foo b/bar and b/foo b/bar differ',
+    ].join('\n');
+    expect(() => parseDiffPatch(patch)).toThrow(/no readable path/);
   });
 
   it('decodes a quoted path', () => {

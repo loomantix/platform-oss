@@ -291,6 +291,9 @@ describe('validateTelemetryRecord', () => {
     expect(() =>
       buildTelemetryRecord(params({ emittedAt: '2026-08-20T05:12:33-04:00' })),
     ).toThrow(/emittedAt/);
+    expect(() =>
+      buildTelemetryRecord(params({ emittedAt: '2026-02-31T05:12:33Z' })),
+    ).toThrow(/emittedAt/);
   });
 
   it('rejects a repo that is not owner/name', () => {
@@ -351,6 +354,21 @@ describe('validateTelemetryRecord', () => {
     expect(() =>
       buildTelemetryRecord(params({ status: 'skipped', changeset: lockfile })),
     ).toThrow(/skipped pass cannot carry review-significant files/);
+
+    expect(() =>
+      buildTelemetryRecord(
+        params({
+          status: 'skipped',
+          changeset: { ...CHANGESET, reviewSignificantFiles: 0 },
+        }),
+      ),
+    ).toThrow(/must cover app\/test files/);
+
+    expect(() =>
+      buildTelemetryRecord(
+        params({ changeset: { ...CHANGESET, reviewSignificantFiles: 3 } }),
+      ),
+    ).toThrow(/not exceed total files/);
   });
 
   it('rejects two buckets for the same model and effort', () => {
@@ -538,6 +556,50 @@ describe('prCommentSink', () => {
     expect(emitTelemetry({ record: conflict, sink })).toMatchObject({
       emitted: false,
       error: expect.stringMatching(/idempotency key conflicts/),
+    });
+    expect(runner.posts).toBe(1);
+  });
+
+  it('replays semantically identical buckets and lanes in another order', () => {
+    const runner = new MockRunner();
+    setGitHubRunner(runner);
+    const sink = prCommentSink({ repo: 'owner/repo', pr: 123 });
+    const first = buildTelemetryRecord(
+      params({
+        tokens: [
+          {
+            model: 'model-b',
+            input: 2,
+            providerBuckets: { zeta: 2, alpha: 1 },
+          },
+          { model: 'model-a', input: 1 },
+        ],
+        lanes: [
+          { lens: 'security', model: 'model-b', output: 2 },
+          { lens: 'correctness', model: 'model-a', output: 1 },
+        ],
+      }),
+    );
+    const replay = buildTelemetryRecord(
+      params({
+        tokens: [
+          { model: 'model-a', input: 1 },
+          {
+            model: 'model-b',
+            input: 2,
+            providerBuckets: { alpha: 1, zeta: 2 },
+          },
+        ],
+        lanes: [
+          { lens: 'correctness', model: 'model-a', output: 1 },
+          { lens: 'security', model: 'model-b', output: 2 },
+        ],
+      }),
+    );
+    expect(emitTelemetry({ record: first, sink }).emitted).toBe(true);
+    expect(emitTelemetry({ record: replay, sink })).toMatchObject({
+      emitted: true,
+      reference: '901',
     });
     expect(runner.posts).toBe(1);
   });
