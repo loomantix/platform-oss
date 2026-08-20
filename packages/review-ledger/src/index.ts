@@ -31,6 +31,20 @@ export {
   EXPECTED_ACTOR_ENV,
   EXPECTED_THREADS_SHA256_ENV,
   HISTORICAL_COMMENT_IDS_ENV,
+  TELEMETRY_VERSION,
+  TELEMETRY_MARKER_PREFIX,
+  TELEMETRY_V1_MARKER,
+  TELEMETRY_PASS_TYPES,
+  TELEMETRY_REVIEW_TIERS,
+  TELEMETRY_TRIGGERS,
+  TELEMETRY_STANCES,
+  TELEMETRY_STATUSES,
+  TELEMETRY_TOKEN_SOURCES,
+  CANONICAL_TOKEN_BUCKETS,
+  OPEN_TOKEN_RE,
+  PROVIDER_BUCKET_KEY_RE,
+  REPO_RE,
+  UTC_TIMESTAMP_RE,
 } from './constants.js';
 
 export { LedgerError, fail } from './errors.js';
@@ -138,6 +152,27 @@ export {
 } from './roster.js';
 
 export { formatFindings } from './format.js';
+
+export {
+  CHANGESET_CLASSIFIER_VERSION,
+  DEFAULT_PROMPT_SURFACES,
+  classifyFiles,
+  classifyPath,
+  classifyRange,
+  parseDiffPatch,
+} from './changeset.js';
+
+export {
+  buildTelemetryBody,
+  buildTelemetryRecord,
+  emitTelemetry,
+  excludeTelemetryComments,
+  isTelemetryComment,
+  matchTelemetry,
+  prCommentSink,
+  telemetryIdempotencyKey,
+  validateTelemetryRecord,
+} from './telemetry.js';
 
 export type {
   SupportedEngine,

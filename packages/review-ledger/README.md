@@ -211,6 +211,61 @@ the pull request currently contains; an engine whose attestation names the
 current commit has, whatever moved the head. A fix therefore invalidates only
 the attestations that named the old head, rather than restarting a whole round.
 
+### Classify the Changeset
+
+The source-versus-docs rule every lane skips on is executable code rather than
+prose, so four skills reading the same paragraph cannot drift into four
+different answers.
+
+```bash
+# Which classes does the pinned review range touch, and may the pass skip?
+review-ledger classify-changeset --base <base-sha> --head <head-sha>
+
+# Classify a diff captured elsewhere, e.g. in CI
+review-ledger classify-changeset --diff-file ./range.diff \
+  --prompt-surface prompts/
+```
+
+Two answers come back per file and they are independent. `class` is what kind
+of work a line represents — `app`, `test`, `docsConfig`, `generated` — which is
+what makes tokens-per-application-line comparable. `reviewSignificant` is
+whether a lane must run at all. A lockfile proves they cannot be one field: it
+must be reviewed and it must stay out of every ratio.
+
+### Record What a Pass Cost
+
+```bash
+review-ledger emit-telemetry --repo owner/repo --pr 123 \
+  --engine claude --engine-version 2.1.237 \
+  --pass-type review --review-tier deep --trigger interactive \
+  --round 3 --stance convergence --status changed \
+  --base <base-sha> --head <head-sha> \
+  --token-source session-log-delta --tokens-file ./tokens.json \
+  --findings-file ./findings.json --duration-seconds 512
+
+# Render the record without posting it
+review-ledger emit-telemetry ... --dry-run
+```
+
+The marker is `local-review-telemetry:v1` followed by a JSON payload. Four
+properties are load-bearing:
+
+- **Numbers arrive as arguments.** This package never reads a session
+  transcript, a home directory, or any other ambient state. Each engine
+  extracts its own usage and passes it in.
+- **`engine` and `lens` are open tokens** and the payload is versioned JSON
+  validated against a schema, not regex-parsed inline attributes. Instrumenting
+  a new engine needs no release of this package.
+- **Unavailable never becomes zero.** A missing measurement is `null` and a
+  measured zero is `0`; the two never collapse, and nothing is zero-filled.
+- **Emission never fails a review.** A telemetry error is reported on stdout
+  and the command still exits 0.
+
+Records are written, never read back into a review: a pass must not see prior
+telemetry. Readers exclude them by marker prefix — `isTelemetryComment` and
+`excludeTelemetryComments` — so a record type added later is excluded by
+default rather than leaking into reviewer context until someone notices.
+
 ### Reconcile & Verify Ledger
 
 ```bash
@@ -257,6 +312,10 @@ import {
   readRoster,
   coverage,
   verifyCoverage,
+  classifyRange,
+  buildTelemetryRecord,
+  emitTelemetry,
+  prCommentSink,
 } from '@loomantix/review-ledger';
 
 // Format findings table

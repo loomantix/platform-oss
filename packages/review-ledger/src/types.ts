@@ -594,3 +594,247 @@ export interface CoverageResult {
   roundComplete: boolean;
   verified: true;
 }
+
+/** The value a changed line represents, for the telemetry denominator. */
+export type ChangesetClass = 'app' | 'test' | 'docsConfig' | 'generated';
+
+/** Options that tune path classification for a repository. */
+export interface ClassifyOptions {
+  /**
+   * Path prefixes and exact paths whose contents are prompt surface.
+   *
+   * Defaults to the engine prompt directories the protocol names. A repository
+   * that keeps its prompts elsewhere passes its own; the rule is about the role
+   * of the file, not about a directory name.
+   */
+  promptSurfaces?: readonly string[] | undefined;
+}
+
+/** One changed file and its churn over the pinned review range. */
+export interface ChangedFile {
+  path: string;
+  added: number;
+  deleted: number;
+  /** Blank-line churn, or null when the caller could not measure it. */
+  blank?: number | null | undefined;
+}
+
+/** How one path classified, on both the value axis and the review axis. */
+export interface FileClassification {
+  path: string;
+  class: ChangesetClass;
+  /** True when this file alone obliges a lane to run. */
+  reviewSignificant: boolean;
+  /** Key used in `linesByLanguage`, or null for an unmapped extension. */
+  language: string | null;
+}
+
+/** Churn split by class. `comment` is null until a lexer ships. */
+export interface ChangesetLines {
+  app: number;
+  test: number;
+  comment: number | null;
+  docsConfig: number;
+  generated: number;
+  blank: number;
+}
+
+/** The changeset a telemetry record carries. */
+export interface Changeset {
+  classifierVersion: number;
+  files: Record<ChangesetClass, number>;
+  linesChanged: ChangesetLines;
+  linesByLanguage: Record<string, number>;
+}
+
+/** The classifier's full answer: the record, the gate, and the per-file detail. */
+export interface ChangesetReport {
+  changeset: Changeset;
+  classifications: FileClassification[];
+  reviewSignificantFiles: number;
+  /** True when nothing in the range obliges a lane to run. */
+  skip: boolean;
+}
+
+/** What kind of pass spent the tokens. */
+export type TelemetryPassType = 'review' | 'refactor' | 'hosted';
+
+/** Which lens depth the pass ran at, or null when the pass has no tier. */
+export type TelemetryReviewTier = 'lean' | 'deep';
+
+/** Whether a human drove the pass or a loop did. */
+export type TelemetryTrigger = 'autonomous' | 'interactive';
+
+/** Adversarial rounds versus land-only convergence rounds. */
+export type TelemetryStance = 'adversarial' | 'convergence';
+
+/** How the pass ended, including the two outcomes that spend without finding. */
+export type TelemetryStatus = 'clean' | 'changed' | 'blocked' | 'skipped';
+
+/**
+ * Where the token counts came from, and therefore how far they can be trusted.
+ *
+ * `session-log-delta` and `stream-json` are measured. `unscoped-session` is
+ * measured but over-counts, so it is an upper bound. `unavailable` means no
+ * data at all — never zero.
+ */
+export type TelemetryTokenSource =
+  | 'session-log-delta'
+  | 'stream-json'
+  | 'unscoped-session'
+  | 'unavailable';
+
+/**
+ * Token counts for one exact model id.
+ *
+ * Every count is nullable and null means unmeasured. Gemini has no cache-write
+ * bucket at all, so a zero there would report perfect cache behaviour for a
+ * provider that never reported any.
+ */
+export interface TelemetryTokenBucket {
+  model: string;
+  effort: string | null;
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  reasoning: number | null;
+  /**
+   * Provider-specific integer buckets that do not map onto the canonical five.
+   *
+   * An open key space of integers carries no leak risk, which is what keeps it
+   * inside the no-free-form-text rule.
+   */
+  providerBuckets: Record<string, number>;
+}
+
+/** Per-lens spend. Engine-specific, and never used for cross-engine rollups. */
+export interface TelemetryLane {
+  lens: string;
+  model: string | null;
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  reasoning: number | null;
+}
+
+/** How one severity's findings were dispositioned. */
+export interface TelemetryOutcomeCounts {
+  validFixed: number;
+  validDeferred: number;
+  invalidDismissed: number;
+}
+
+/** Findings posted by the pass and what became of them. */
+export interface TelemetryFindings {
+  posted: number;
+  bySeverityAndOutcome: Record<SupportedSeverity, TelemetryOutcomeCounts>;
+  /**
+   * New defects whose cause is code the review chain itself introduced.
+   *
+   * Distinct from a recurrence, which is an unfixed defect still present.
+   * Averaging the two together would hide the expensive one.
+   */
+  chainInducedRegressions: number;
+}
+
+/**
+ * One review pass, measured.
+ *
+ * Enumerated fields and integers only: no finding titles, no file paths, no
+ * summaries. The record is designed to be publishable on a public repository,
+ * which it can only be if nothing in it can carry prose.
+ */
+export interface TelemetryRecord {
+  version: number;
+  emittedAt: string;
+  repo: string;
+  pr: number;
+  idempotencyKey: string;
+
+  engine: string;
+  engineVersion: string | null;
+  passType: TelemetryPassType;
+  reviewTier: TelemetryReviewTier | null;
+  trigger: TelemetryTrigger;
+  round: number;
+  stance: TelemetryStance;
+  status: TelemetryStatus;
+
+  baseSha: string;
+  headSha: string;
+
+  promptStackSha256: string | null;
+  promptStackVersion: string | null;
+  repoInstructionsSha256: string | null;
+
+  tokenSource: TelemetryTokenSource;
+  tokens: TelemetryTokenBucket[];
+  /** Absent, never empty, when per-lane spend is unattributable. */
+  lanes?: TelemetryLane[];
+
+  truncated: boolean;
+  durationSeconds: number | null;
+
+  changeset: Changeset;
+  findings: TelemetryFindings;
+}
+
+/** The fields `buildTelemetryRecord` needs to assemble a record. */
+export interface BuildTelemetryParams {
+  emittedAt: string;
+  repo: string;
+  pr: number;
+  idempotencyKey?: string | undefined;
+  engine: string;
+  engineVersion?: string | null | undefined;
+  passType: TelemetryPassType;
+  reviewTier?: TelemetryReviewTier | null | undefined;
+  trigger: TelemetryTrigger;
+  round: number;
+  stance: TelemetryStance;
+  status: TelemetryStatus;
+  baseSha: string;
+  headSha: string;
+  promptStackSha256?: string | null | undefined;
+  promptStackVersion?: string | null | undefined;
+  repoInstructionsSha256?: string | null | undefined;
+  tokenSource: TelemetryTokenSource;
+  tokens?: readonly Partial<TelemetryTokenBucket>[] | undefined;
+  lanes?: readonly Partial<TelemetryLane>[] | undefined;
+  truncated: boolean;
+  durationSeconds?: number | null | undefined;
+  changeset: Changeset;
+  findings?: Partial<TelemetryFindings> | undefined;
+}
+
+/**
+ * Where an emitted record goes.
+ *
+ * The pull request comment is the reference implementation, not the contract.
+ * Welding emission to `gh` would discard the schema and the classification for
+ * anyone on another forge, and would foreclose git notes as a second sink.
+ */
+export interface TelemetrySink {
+  /** Stable identifier for the sink, echoed in the emission result. */
+  name: string;
+  emit(input: { record: TelemetryRecord; body: string }): TelemetrySinkResult;
+}
+
+/** What a sink reports back about one emission. */
+export interface TelemetrySinkResult {
+  sink: string;
+  /** Sink-specific handle for the written record, when it has one. */
+  reference: string | null;
+}
+
+/** The outcome of an emission attempt. Never throws; never fails a review. */
+export interface EmitTelemetryResult {
+  emitted: boolean;
+  sink: string | null;
+  reference: string | null;
+  idempotencyKey: string | null;
+  /** Why emission was skipped, when it was. */
+  error: string | null;
+}

@@ -214,6 +214,18 @@ the shared definition for the pinned `<base-sha>..<head-sha>` review range:
 Zero source files means skip; one or more means run the full pass. A mixed
 changeset is not a partial skip.
 
+The rules above are executable: `review-ledger classify-changeset --base <sha>
+--head <sha>` returns `skip` alongside per-file classifications, and every lane
+decides from that rather than from its own reading of this paragraph. Four
+skills interpreting the same prose independently is four chances to disagree
+about whether a pass was owed.
+
+The same call returns the class each file's churn belongs to — `app`, `test`,
+`docsConfig`, `generated` — which is a separate axis from whether the file is
+review-significant. A lockfile is both generated and review-significant: the
+dependency bump must be reviewed, and its line count must stay out of every
+ratio.
+
 ## Build one immutable review packet
 
 Review fan-out must use one canonical description of the changeset. Without an
@@ -766,6 +778,36 @@ Docs/config-only skips follow the same rule with a `clean` result whose
 `beforeSha` and `afterSha` both name the reviewed head. A skip returns only
 after wrapper result creation or standalone attestation succeeds; it does not
 spend the refactor latch.
+
+## Record what the pass cost
+
+Every pass emits one `local-review-telemetry:v1` marker: adversarial reviews,
+cleanup passes, hosted lanes, and passes that skipped or were blocked. A skip
+still spends tokens reading and classifying the pull request, and a pass whose
+cost vanished from the record would have its churn attributed to nobody.
+
+The marker is a separate comment carrying a versioned JSON payload, never an
+extension of the attestation. The attestation body is byte-verified and hashed;
+a telemetry defect must never fail a review that found real defects. For the
+same reason emission failure is logged and skipped, never raised.
+
+The record carries enumerated fields and integers only — no finding titles, no
+file paths, no summaries — so it is publishable on a public repository as
+evidence the review chain ran. It never carries money: rates move, and on a
+subscription plan the marginal cost of a pass is zero, so tokens are stored and
+priced downstream against a dated table.
+
+Two rules bind readers:
+
+- **A pass must not read prior telemetry.** Markers are excluded from the
+  ledger read a reviewer performs, and no reviewer prompt, packet, or context
+  assembly may include them. Visible history and a readable trend are what turn
+  a cost measurement into a target to optimise toward. Filter on the marker
+  prefix, not on an allowlist of known markers, so a record type added later is
+  excluded by default.
+- **Unavailable is not zero.** A pass with no usable usage data records
+  `tokenSource: "unavailable"` and no buckets. A zero would make that engine
+  look free and skew every average in its favour.
 
 ## Converge
 
