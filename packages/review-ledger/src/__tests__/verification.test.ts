@@ -123,6 +123,10 @@ class ConfigurableRunner implements GitHubRunner {
   compareMergeBase: string | null = null;
   revList: string[] | null = null;
   commentIdSeq = 900;
+  /** `git diff --name-status` body for the pass's change range. */
+  diffNameStatus = '';
+  /** `git diff --unified=0` body, keyed by path. */
+  diffPatches: Record<string, string> = {};
 
   runGh(args: string[], payload?: unknown): string {
     const cmd = args.join(' ');
@@ -215,6 +219,12 @@ class ConfigurableRunner implements GitHubRunner {
     if (args[0] === 'rev-parse' && args[1] === 'HEAD') return this.localHead;
     if (args[0] === 'rev-parse' && args[1] === '--verify') {
       return args[2]!.replace(/\^\{commit\}$/, '');
+    }
+    if (args[0] === 'diff' && args.includes('--name-status')) {
+      return this.diffNameStatus;
+    }
+    if (args[0] === 'diff') {
+      return this.diffPatches[args[args.length - 1]!] ?? '';
     }
     return '';
   }
@@ -374,7 +384,17 @@ describe('result evidence is matched against real ledger evidence', () => {
     ).toThrow('do not equal the complete same-round disposition set');
   });
 
-  it('rejects a fixed major finding classified as minor', () => {
+  it('accepts a fixed major finding classified as minor when the fix moved no executing line', () => {
+    // Severity describes the finding; classification describes the diff. A
+    // comment correction is `minor` however serious the thread was.
+    runner.diffNameStatus = 'M\tinfra/eks/main.tf\n';
+    runner.diffPatches = {
+      'infra/eks/main.tf': [
+        '@@ -3 +3 @@',
+        '-# the node floor is 3',
+        '+# the node floor is 2',
+      ].join('\n'),
+    };
     const file = writeResultJson(changedResult({ classification: 'minor' }));
     expect(() =>
       verifyLedger({
@@ -387,9 +407,58 @@ describe('result evidence is matched against real ledger evidence', () => {
         before: BEFORE,
         resultFile: file,
       }),
-    ).toThrow(
-      'fixed blocking or major findings require material classification',
-    );
+    ).not.toThrow();
+  });
+
+  it('rejects a minor classification whose range moved an executing line', () => {
+    runner.diffNameStatus = 'M\tinfra/eks/main.tf\n';
+    runner.diffPatches = {
+      'infra/eks/main.tf': [
+        '@@ -8 +8 @@',
+        '-  min_size = 3',
+        '+  min_size = 2',
+      ].join('\n'),
+    };
+    const file = writeResultJson(changedResult({ classification: 'minor' }));
+    expect(() =>
+      verifyLedger({
+        repo: REPO,
+        pr: PR,
+        head: HEAD,
+        engine: 'claude',
+        round: 1,
+        base: BASE,
+        before: BEFORE,
+        resultFile: file,
+      }),
+    ).toThrow('minor classification requires a non-behavioral change range');
+  });
+
+  it('rejects a minor classification for a behavioral range whatever the severity', () => {
+    // The evasion the old severity coupling could not close: posting the
+    // finding `nit` and attesting `minor` after editing a conditional.
+    runner.threadNodes = [fixedThread('fp1', 'nit')];
+    runner.diffNameStatus = 'M\tsrc/user.ts\n';
+    runner.diffPatches = {
+      'src/user.ts': [
+        '@@ -4 +4 @@',
+        '-  return name.trim();',
+        '+  return name.trim().toLowerCase();',
+      ].join('\n'),
+    };
+    const file = writeResultJson(changedResult({ classification: 'minor' }));
+    expect(() =>
+      verifyLedger({
+        repo: REPO,
+        pr: PR,
+        head: HEAD,
+        engine: 'claude',
+        round: 1,
+        base: BASE,
+        before: BEFORE,
+        resultFile: file,
+      }),
+    ).toThrow('minor classification requires a non-behavioral change range');
   });
 
   it('rejects a convergence round that fixed a non-blocking finding', () => {
@@ -501,6 +570,28 @@ describe('writeResult rejects results its evidence does not support', () => {
     ).toThrow(
       'round 3+ changed review results require material classification',
     );
+  });
+
+  it('rejects a minor write whose range moved an executing line', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/user.ts\n';
+    runner.diffPatches = {
+      'src/user.ts': ['@@ -4 +4 @@', '-  return a;', '+  return b;'].join('\n'),
+    };
+    expect(() => writeResult(params({ classification: 'minor' }))).toThrow(
+      'minor classification requires a non-behavioral change range',
+    );
+  });
+
+  it('writes a minor result when the fix moved no executing line', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/user.ts\n';
+    runner.diffPatches = {
+      'src/user.ts': ['@@ -4 +4 @@', '-// old note', '+// new note'].join('\n'),
+    };
+    const out = writeResult(params({ classification: 'minor' }));
+    expect(out.status).toBe('changed');
+    expect(out.classification).toBe('minor');
   });
 
   it('writes a result the ledger supports', () => {
