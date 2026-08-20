@@ -7,14 +7,15 @@ disable-model-invocation: true
 
 # /codex-review — independent Codex cross-review
 
-You are getting an **independent opinion** on an open PR from the [Codex CLI](https://github.com/openai/codex), run locally. Codex is a different model family from the Claude review chain (`/critique`, `/deepcritique`). In the bounded local loop, Codex runs first in each round and reads the complete PR ledger cold; Claude `/deepcritique` follows on the resulting head.
+You are getting an **independent opinion** on an open PR from the [Codex CLI](https://github.com/openai/codex), run locally. Codex is a different model family from the Claude review chain (`/critique`, `/deepcritique`). In the bounded local loop, Codex runs first in each round and reads the complete PR ledger cold; the Claude lane for the resolved tier follows on the resulting head — `/critique` at Lean, `/deepcritique` at Deep.
 
 Codex runs **read-only by default** — it can read the tree and reason, but cannot modify files, so it is a safe reviewer. This skill never lets Codex edit code. Findings come back to _you_; you verify each against the source and fix only the confirmed ones.
 
 ## When to use
 
-- Before `/deepcritique` in each bounded local round, including after any material
-  Claude fix restarts the loop.
+- Before the round's Claude lane (`/critique` at Lean, `/deepcritique` at Deep)
+  in each bounded local round, including after any material Claude fix restarts
+  the loop.
 - Standalone, when you want a fresh cold read of a PR.
 - Skip on docs/config-only changesets — there is nothing for an adversarial reviewer to find.
 
@@ -50,7 +51,8 @@ Codex runs **read-only by default** — it can read the tree and reason, but can
    - If the changeset is docs/config-only per the ledger's classification,
      finalize a scoped clean v3 result using the ledger's wrapper/standalone
      ownership rule, then exit.
-   - Resolve the Codex engine's round number per the ledger: `$AGENT_LOOP_REVIEW_ROUND` when the runner set it, otherwise one past the count of `local-review-pass:v3` and `local-review-complete:v3` markers on the PR naming `engine=codex`. Rounds 1–2 are adversarial; round 3 and later are convergence rounds, and the prompt and dispositions change accordingly. The result's `baseSha` and the prompt range must name `REVIEW_BASE` exactly.
+   - Resolve the review tier before starting Codex. Resolve the effective PR `local-review-tier:v1` marker under the ledger's authenticated, forward-only transition rule; if none exists, classify against the tier triggers in [`../../REVIEW_WORKFLOW.md`](../../REVIEW_WORKFLOW.md) and post the marker, Lean being the tier when no trigger matches. Reviewer order within a round is a scheduling choice, not a protocol rule, so tier resolution belongs to whichever reviewer runs first; an unresolved tier leaves the whole round unresolved. State the tier and its triggers in the pass output.
+   - Resolve the Codex engine's round number per the ledger: `$AGENT_LOOP_REVIEW_ROUND` when the runner set it, otherwise one past the count of `local-review-pass:v3` and `local-review-complete:v3` markers on the PR naming `engine=codex`. The stance follows the tier's schedule: at Deep, rounds 1–2 are adversarial and round 3 and later are convergence rounds; at Lean the cap is 2 and round 2 is the convergence round. The prompt and dispositions change accordingly. The result's `baseSha` and the prompt range must name `REVIEW_BASE` exactly.
 
 ## Phase 1: Build the review prompt
 
@@ -64,7 +66,7 @@ Write a tight, scoped prompt. A vague "review this" wastes the run; name the fil
 - The 3–4 riskiest things about this specific change, phrased as **where to scrutinize hardest** — not as an attack. See the framing rules below.
 - The output contract: **only high-confidence material findings** (correctness, security, data-loss); for each, `file:line`, severity, concrete issue, concrete fix; "no material findings" if clean; be terse.
 
-### Convergence rounds (round 3 and later)
+### Convergence rounds (any round whose resolved stance is convergence)
 
 Codex has already read this change cold twice. Narrow the prompt's scrutiny list
 to what could stop the deploy — correctness, data safety, security and privacy,
@@ -172,7 +174,7 @@ When the status file appears with exit code zero, read the findings file — it 
 - **First, confirm the run actually happened.** A safety refusal exits **zero**, so the status file cannot distinguish it from a clean review. A refused run looks like: an empty or missing findings file, or a findings file containing a decline ("I can't help with that", "I won't assist with…") instead of the contracted format, usually after a run far shorter than normal. **Never report that as "no material findings"** — it is an unreviewed change. Re-frame the prompt per the Phase 1 rules, keep the scope identical, and launch a fresh run; do not argue with the refusal in a follow-up turn on the same run. If a re-framed prompt is refused again, say so plainly and fall back to the Claude-side review chain rather than reporting the change as reviewed.
 - For each finding, verify it against the actual source before acting — Codex can be confidently wrong, just like any reviewer.
 - Deduplicate against the complete PR ledger by fingerprint and semantic defect.
-- For each new confirmed finding, post an inline PR comment using the ledger marker **before editing the code**. Reuse an existing thread instead of opening a duplicate.
+- For each new confirmed finding, post an inline PR comment using the ledger marker **before editing the code**. Reuse an existing thread instead of opening a duplicate. You assign the ledger severity, not Codex: rate it off the four-rung ladder in the ledger reference, on blast radius, whatever wording Codex used.
 - Present the resulting thread list with `file:line`, severity, and your one-line verification.
 - Call out where Codex **disagreed with or added to** earlier ledger findings;
   that cross-engine delta is the reason to run it.
@@ -181,13 +183,17 @@ When the status file appears with exit code zero, read the findings file — it 
   wrapper/standalone ownership rule.
 - Every attestation remains exact to the head reviewed. A later minor fix is an
   explicit transition in the round; it does not rewrite the attestation or
-  claim Codex reviewed the later head. A material transition restarts at Codex.
+  claim Codex reviewed the later head. A material transition moves the head,
+  which invalidates precisely those attestations that named the superseded
+  commit. Classify by what the diff moved, never by the severity of the thread
+  it closed — a fixed `major` whose fix edited only comments or only tests is
+  `minor`.
 
 ## Phase 4: Disposition
 
 Fix only **confirmed** findings (default: fix now, in this PR). Dismiss false positives by replying with evidence and resolving the thread.
 
-In a convergence round the default inverts: fix only a blocking defect — wrong shipped behavior, data loss or corruption, a security or privacy hole, a broken public contract, or broken deploy/rollout — with the smallest edit that clears it. Every other confirmed finding gets an issue, an `outcome=deferred` reply with the link, and a resolved thread. Those deferrals are usually real findings; fixing them here just moves the head and buys another round.
+In a convergence round the default inverts: fix only a `blocking` defect as the ledger's severity ladder defines it — wrong shipped behavior, data loss or corruption, a security or privacy hole, a broken public contract, or broken deploy/rollout — with the smallest edit that clears it. A finding a comment or test edit could clear was never `blocking`. Every other confirmed finding gets an issue, an `outcome=deferred` reply with the link, and a resolved thread. Those deferrals are usually real findings; fixing them here just moves the head and buys another round.
 
 For a finding that needs a human/scope/legal decision (risk acceptance, prod-data assumptions, an architectural rework), do not guess at the decision — but do disposition the thread, because convergence requires every marked thread to carry a reply and a resolution. File the tracking issue, reply with `outcome=deferred` plus the issue link, resolve the thread, and surface the decision to the user in the skill output. Leave the thread unresolved only when you cannot even file the issue; that is a non-converging run, so say so plainly and leave the PR in draft.
 
