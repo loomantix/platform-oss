@@ -13,6 +13,12 @@ import {
   SUPPORTED_OUTCOMES,
   SUPPORTED_SEVERITIES,
   SUPPORTED_SIDES,
+  TELEMETRY_PASS_TYPES,
+  TELEMETRY_REVIEW_TIERS,
+  TELEMETRY_STANCES,
+  TELEMETRY_STATUSES,
+  TELEMETRY_TOKEN_SOURCES,
+  TELEMETRY_TRIGGERS,
 } from './constants.js';
 import { fail } from './errors.js';
 import { assertRegularFile, parseJsonOrFail } from './io.js';
@@ -32,6 +38,13 @@ import {
   writeResult,
 } from './ledger.js';
 import { readResult, validateResult, writeBlockedResult } from './result.js';
+import { classifyFiles, classifyRange, parseDiffPatch } from './changeset.js';
+import {
+  buildTelemetryBody,
+  buildTelemetryRecord,
+  emitTelemetry,
+  prCommentSink,
+} from './telemetry.js';
 import {
   coverage,
   parseReviewers,
@@ -42,7 +55,19 @@ import {
 import { formatFindings } from './format.js';
 import { resetGitHubRunner } from './github.js';
 import type {
+  Changeset,
+  ChangesetReport,
+  EmitTelemetryResult,
   ReviewFinding,
+  TelemetryFindingsInput,
+  TelemetryLaneInput,
+  TelemetryPassType,
+  TelemetryReviewTier,
+  TelemetryStance,
+  TelemetryStatus,
+  TelemetryTokenBucketInput,
+  TelemetryTokenSource,
+  TelemetryTrigger,
   SupportedClassification,
   SupportedEngine,
   SupportedOutcome,
@@ -88,6 +113,35 @@ interface CliArgs {
   author?: SupportedEngine | undefined;
   reviewers?: string | undefined;
   file?: string | undefined;
+  /**
+   * The raw `--engine` value.
+   *
+   * Telemetry accepts an open engine token while every other command accepts
+   * only the closed protocol enum, and the command is not reliably known until
+   * the whole argument vector has been read.
+   */
+  engineRaw?: string | undefined;
+  engineVersion?: string | undefined;
+  passType?: TelemetryPassType | undefined;
+  reviewTier?: TelemetryReviewTier | undefined;
+  trigger?: TelemetryTrigger | undefined;
+  stance?: TelemetryStance | undefined;
+  status?: TelemetryStatus | undefined;
+  tokenSource?: TelemetryTokenSource | undefined;
+  tokensFile?: string | undefined;
+  lanesFile?: string | undefined;
+  findingsFile?: string | undefined;
+  changesetFile?: string | undefined;
+  diffFile?: string | undefined;
+  promptStackSha256?: string | undefined;
+  promptStackVersion?: string | undefined;
+  repoInstructionsSha256?: string | undefined;
+  durationSeconds?: string | undefined;
+  emittedAt?: string | undefined;
+  idempotencyKey?: string | undefined;
+  promptSurfaces?: string[] | undefined;
+  truncated?: boolean | undefined;
+  dryRun?: boolean | undefined;
 }
 
 function writeSortedJson(value: unknown): void {
@@ -97,6 +151,91 @@ function writeSortedJson(value: unknown): void {
     sorted[key] = source[key];
   }
   process.stdout.write(JSON.stringify(sorted) + '\n');
+}
+
+function readJsonFile(pathValue: string, label: string): unknown {
+  assertRegularFile(pathValue, `${label} must be a regular non-symlink file`);
+  return parseJsonOrFail(
+    readFileSync(pathValue, 'utf8'),
+    `${label} must contain valid UTF-8 JSON`,
+  );
+}
+
+function readJsonArray(pathValue: string, label: string): unknown[] {
+  const parsed = readJsonFile(pathValue, label);
+  if (!Array.isArray(parsed)) {
+    fail(`${label} must contain a JSON array`);
+  }
+  return parsed;
+}
+
+/**
+ * Resolve the classified changeset for the pinned review range.
+ *
+ * A caller that already classified the range passes the result back rather than
+ * paying for it twice; otherwise the range is read from the local clone. The
+ * working tree is never the source: a classifier reading uncommitted state
+ * would report a changeset no reviewer saw.
+ */
+function resolveChangesetReport(args: CliArgs): ChangesetReport {
+  const options =
+    args.promptSurfaces === undefined
+      ? undefined
+      : { promptSurfaces: args.promptSurfaces };
+  if (args.diffFile) {
+    assertRegularFile(
+      args.diffFile,
+      'diff file must be a regular non-symlink file',
+    );
+    return classifyFiles(
+      parseDiffPatch(readFileSync(args.diffFile, 'utf8')),
+      options,
+    );
+  }
+  if (!args.base || !args.head) {
+    fail('changeset classification requires --diff-file or --base and --head');
+  }
+  return classifyRange({ base: args.base, head: args.head, options });
+}
+
+function parseDurationSeconds(raw: string | undefined): number | null {
+  if (raw === undefined) {
+    return null;
+  }
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    fail('--duration-seconds must be a non-negative number');
+  }
+  return Number(raw);
+}
+
+/**
+ * Accept either a bare changeset or the classifier's full report.
+ *
+ * `classify-changeset` prints the report, so a caller that stored its output
+ * can hand the same file straight back rather than editing a sub-object out of
+ * it first.
+ */
+function normalizeChangesetInput(value: unknown): Changeset {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    fail('changeset file must contain a JSON object');
+  }
+  const source = value as Record<string, unknown>;
+  const nested = source['changeset'];
+  if (typeof nested === 'object' && nested !== null && !Array.isArray(nested)) {
+    return nested as Changeset;
+  }
+  return source as unknown as Changeset;
+}
+
+/**
+ * Current time as the record's RFC 3339 UTC second.
+ *
+ * Sub-second precision is noise a review pass cannot support, and trimming it
+ * here keeps every emitted timestamp one shape for the join to a dated rate
+ * table downstream.
+ */
+function nowUtcSecond(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 function parsePositiveInteger(value: string, name: string): number {
@@ -152,6 +291,18 @@ function parseCliArgs(argv: string[]): CliArgs {
       continue;
     }
 
+    if (arg === '--truncated') {
+      args.truncated = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--dry-run') {
+      args.dryRun = true;
+      i++;
+      continue;
+    }
+
     const next = argv[i + 1];
     const parseVal = (name: string): string => {
       if (next === undefined || next.startsWith('--')) {
@@ -178,7 +329,68 @@ function parseCliArgs(argv: string[]): CliArgs {
         args.before = parseVal(arg);
         break;
       case '--engine':
-        args.engine = parseEnum(arg, parseVal(arg), SUPPORTED_ENGINES);
+        args.engineRaw = parseVal(arg);
+        break;
+      case '--engine-version':
+        args.engineVersion = parseVal(arg);
+        break;
+      case '--pass-type':
+        args.passType = parseEnum(arg, parseVal(arg), TELEMETRY_PASS_TYPES);
+        break;
+      case '--review-tier':
+        args.reviewTier = parseEnum(arg, parseVal(arg), TELEMETRY_REVIEW_TIERS);
+        break;
+      case '--trigger':
+        args.trigger = parseEnum(arg, parseVal(arg), TELEMETRY_TRIGGERS);
+        break;
+      case '--stance':
+        args.stance = parseEnum(arg, parseVal(arg), TELEMETRY_STANCES);
+        break;
+      case '--status':
+        args.status = parseEnum(arg, parseVal(arg), TELEMETRY_STATUSES);
+        break;
+      case '--token-source':
+        args.tokenSource = parseEnum(
+          arg,
+          parseVal(arg),
+          TELEMETRY_TOKEN_SOURCES,
+        );
+        break;
+      case '--tokens-file':
+        args.tokensFile = parseVal(arg);
+        break;
+      case '--lanes-file':
+        args.lanesFile = parseVal(arg);
+        break;
+      case '--findings-file':
+        args.findingsFile = parseVal(arg);
+        break;
+      case '--changeset-file':
+        args.changesetFile = parseVal(arg);
+        break;
+      case '--diff-file':
+        args.diffFile = parseVal(arg);
+        break;
+      case '--prompt-stack-sha256':
+        args.promptStackSha256 = parseVal(arg);
+        break;
+      case '--prompt-stack-version':
+        args.promptStackVersion = parseVal(arg);
+        break;
+      case '--repo-instructions-sha256':
+        args.repoInstructionsSha256 = parseVal(arg);
+        break;
+      case '--duration-seconds':
+        args.durationSeconds = parseVal(arg);
+        break;
+      case '--emitted-at':
+        args.emittedAt = parseVal(arg);
+        break;
+      case '--idempotency-key':
+        args.idempotencyKey = parseVal(arg);
+        break;
+      case '--prompt-surface':
+        args.promptSurfaces = [...(args.promptSurfaces ?? []), parseVal(arg)];
         break;
       case '--round':
         args.round = parsePositiveInteger(parseVal(arg), arg);
@@ -282,6 +494,13 @@ function validateArgs(args: CliArgs): void {
     fail('subcommand required');
   }
 
+  // Telemetry records an open engine token; every other command is bound to the
+  // protocol enum, where an unknown engine claiming a clean pass would be a
+  // forgery vector rather than a junk row.
+  if (args.engineRaw !== undefined && args.command !== 'emit-telemetry') {
+    args.engine = parseEnum('--engine', args.engineRaw, SUPPORTED_ENGINES);
+  }
+
   for (const name of ['head', 'base', 'before', 'resultHead'] as const) {
     const val = args[name];
     if (val !== undefined) {
@@ -338,8 +557,17 @@ function validateArgs(args: CliArgs): void {
 /**
  * Parse argv, dispatch the requested subcommand, and return an exit code.
  */
-export function runCli(argv: string[] = process.argv.slice(2)): number {
-  resetGitHubRunner();
+function telemetryFailure(error: unknown): EmitTelemetryResult {
+  return {
+    emitted: false,
+    sink: null,
+    reference: null,
+    idempotencyKey: null,
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+function runCliCommand(argv: string[]): number {
   const args = parseCliArgs(argv);
 
   if (args.version) {
@@ -723,6 +951,101 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
       writeSortedJson(out);
       break;
     }
+    case 'classify-changeset': {
+      const report = resolveChangesetReport(args);
+      writeSortedJson({
+        ...report.changeset,
+        skip: report.skip,
+        reviewSignificantFiles: report.reviewSignificantFiles,
+        classifications: report.classifications,
+      });
+      break;
+    }
+    case 'emit-telemetry': {
+      // Emission never fails the pass that produced the record. A telemetry
+      // defect must not block a review that found real defects, so every error
+      // on this path is reported on stdout and the command still exits 0.
+      let outcome: EmitTelemetryResult;
+      try {
+        if (!args.repo || args.pr === undefined || !args.engineRaw) {
+          fail('emit-telemetry requires --repo, --pr, and --engine');
+        }
+        if (
+          !args.passType ||
+          !args.trigger ||
+          !args.stance ||
+          !args.status ||
+          !args.tokenSource ||
+          args.round === undefined ||
+          !args.base ||
+          !args.head
+        ) {
+          fail(
+            'emit-telemetry requires --pass-type, --trigger, --stance, --status, --token-source, --round, --base, and --head',
+          );
+        }
+        const changeset = args.changesetFile
+          ? (readJsonFile(args.changesetFile, 'changeset file') as {
+              changeset?: unknown;
+            })
+          : resolveChangesetReport(args).changeset;
+        const record = buildTelemetryRecord({
+          emittedAt: args.emittedAt ?? nowUtcSecond(),
+          repo: args.repo,
+          pr: args.pr,
+          idempotencyKey: args.idempotencyKey,
+          engine: args.engineRaw,
+          engineVersion: args.engineVersion ?? null,
+          passType: args.passType,
+          reviewTier: args.reviewTier ?? null,
+          trigger: args.trigger,
+          round: args.round,
+          stance: args.stance,
+          status: args.status,
+          baseSha: args.base,
+          headSha: args.head,
+          promptStackSha256: args.promptStackSha256 ?? null,
+          promptStackVersion: args.promptStackVersion ?? null,
+          repoInstructionsSha256: args.repoInstructionsSha256 ?? null,
+          tokenSource: args.tokenSource,
+          tokens: args.tokensFile
+            ? (readJsonArray(
+                args.tokensFile,
+                'tokens file',
+              ) as TelemetryTokenBucketInput[])
+            : [],
+          lanes: args.lanesFile
+            ? (readJsonArray(
+                args.lanesFile,
+                'lanes file',
+              ) as TelemetryLaneInput[])
+            : undefined,
+          truncated: args.truncated === true,
+          durationSeconds: parseDurationSeconds(args.durationSeconds),
+          changeset: normalizeChangesetInput(changeset),
+          findings: args.findingsFile
+            ? (readJsonFile(
+                args.findingsFile,
+                'findings file',
+              ) as TelemetryFindingsInput)
+            : undefined,
+        });
+
+        if (args.dryRun) {
+          process.stdout.write(buildTelemetryBody(record) + '\n');
+          return 0;
+        }
+
+        outcome = emitTelemetry({
+          record,
+          sink: prCommentSink({ repo: args.repo, pr: args.pr }),
+        });
+      } catch (error) {
+        outcome = telemetryFailure(error);
+      }
+      writeSortedJson(outcome);
+      break;
+    }
     case 'read-result': {
       const targetFile = args.file ?? args.resultFile;
       if (!targetFile) {
@@ -763,4 +1086,37 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
   }
 
   return 0;
+}
+
+/** Locate the command token without validating command-specific arguments. */
+function commandFromArgv(argv: readonly string[]): string | undefined {
+  const booleanFlags = new Set([
+    '--protocol-version',
+    '--version',
+    '--file-level',
+    '--truncated',
+    '--dry-run',
+  ]);
+  for (let i = 0; i < argv.length; ) {
+    const arg = argv[i]!;
+    if (!arg.startsWith('-')) {
+      return arg;
+    }
+    i += booleanFlags.has(arg) ? 1 : 2;
+  }
+  return undefined;
+}
+
+/** Parse argv, dispatch the requested subcommand, and return an exit code. */
+export function runCli(argv: string[] = process.argv.slice(2)): number {
+  resetGitHubRunner();
+  if (commandFromArgv(argv) !== 'emit-telemetry') {
+    return runCliCommand(argv);
+  }
+  try {
+    return runCliCommand(argv);
+  } catch (error) {
+    writeSortedJson(telemetryFailure(error));
+    return 0;
+  }
 }

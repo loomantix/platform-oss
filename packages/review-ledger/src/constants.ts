@@ -5,6 +5,12 @@ import type {
   SupportedSeverity,
   SupportedSide,
   SupportedStatus,
+  TelemetryPassType,
+  TelemetryReviewTier,
+  TelemetryStance,
+  TelemetryStatus,
+  TelemetryTokenSource,
+  TelemetryTrigger,
 } from './types.js';
 
 export const PROTOCOL_VERSION = 3;
@@ -157,3 +163,89 @@ export const FINDING_V1_RE =
 
 export const DISPOSITION_V1_RE =
   /^<!-- local-review-disposition:v1 engine=(?<engine>codex|claude|gemini|antigravity) round=(?<round>[1-9][0-9]*) head=(?<head>[0-9a-f]{40}) fingerprint=(?<fingerprint>[A-Za-z0-9._:/-]+) outcome=(?<outcome>fixed|dismissed|deferred) -->$/m;
+
+/** Current version of the review-telemetry record. */
+export const TELEMETRY_VERSION = 1;
+
+/**
+ * Prefix every telemetry marker shares, whatever its version.
+ *
+ * Readers exclude telemetry from reviewer context by this prefix rather than by
+ * an allowlist of known markers, so a record type added later cannot leak into
+ * a reviewer's context by default.
+ */
+export const TELEMETRY_MARKER_PREFIX = '<!-- local-review-telemetry:';
+
+/** The v1 telemetry marker, on its own line above the JSON payload. */
+export const TELEMETRY_V1_MARKER = '<!-- local-review-telemetry:v1 -->';
+
+/**
+ * Engine identity in a telemetry record is an open token, not v3's closed enum.
+ *
+ * v3 closes its enum because engine identity gates attestation evidence, so an
+ * unknown engine claiming a clean pass is a forgery vector. Telemetry carries
+ * no authority: a bogus name yields a junk row in an analysis database, not a
+ * false attestation. Instrumenting a new engine must not require a package
+ * release and a fleet-wide re-vendor.
+ */
+export const OPEN_TOKEN_RE = /^[a-z0-9-]+$/;
+
+/** Provider-specific token bucket keys, kept narrow enough to carry no prose. */
+export const PROVIDER_BUCKET_KEY_RE = /^[a-z0-9_]+$/;
+
+/** RFC 3339 UTC, to the second. A record without a timestamp has no series. */
+export const UTC_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+/** `owner/name`, the only repository spelling the ledger accepts. */
+export const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+export const TELEMETRY_PASS_TYPES: readonly TelemetryPassType[] = [
+  'review',
+  'refactor',
+  'hosted',
+] as const;
+
+export const TELEMETRY_REVIEW_TIERS: readonly TelemetryReviewTier[] = [
+  'lean',
+  'deep',
+] as const;
+
+export const TELEMETRY_TRIGGERS: readonly TelemetryTrigger[] = [
+  'autonomous',
+  'interactive',
+] as const;
+
+export const TELEMETRY_STANCES: readonly TelemetryStance[] = [
+  'adversarial',
+  'convergence',
+] as const;
+
+export const TELEMETRY_STATUSES: readonly TelemetryStatus[] = [
+  'clean',
+  'changed',
+  'blocked',
+  'skipped',
+] as const;
+
+export const TELEMETRY_TOKEN_SOURCES: readonly TelemetryTokenSource[] = [
+  'session-log-delta',
+  'stream-json',
+  'unscoped-session',
+  'unavailable',
+] as const;
+
+/**
+ * The canonical token buckets every provider normalises into.
+ *
+ * Input, output, cache-write and cache-read are priced up to ten times apart,
+ * so a single total is unpriceable after the fact and cannot answer whether
+ * caching is working. Anything a provider reports outside this set travels in
+ * `providerBuckets` instead of being folded into one of these.
+ */
+export const CANONICAL_TOKEN_BUCKETS: readonly string[] = [
+  'input',
+  'output',
+  'cacheRead',
+  'cacheWrite',
+  'reasoning',
+] as const;
