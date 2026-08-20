@@ -16,14 +16,27 @@ You are orchestrating the post-push AI review cycle for an open pull request.
 2. **Mid-loop cost-shift checkpoint** between iter 2 → 3 and iter 3 → 4. If the iteration that just completed produced fixes but findings still aren't converging (any critical, or critical+suggestion+nitpick ≥ 5 post-dedup), pause and ask the user before spending another iteration's worth of paid-reviewer budget. Three exits: continue the chain, bail early to the final `/deepcritique` (skipping the remaining paid iters), or stop and merge as-is (skipping `/deepcritique` too). The trigger only fires when fix-resolutions are still being produced — the no-fix early-exit above already handles the other non-convergence mode.
 3. **Final `/deepcritique` on the PR.** After the loop exits for any reason except merge-as-is, invoke `Skill(skill="deepcritique", args="<pr-number>")`. It reads the complete PR ledger and runs `/critique deep` on the current exact head. It runs `/refactorpass` first only when the pre-push chain did not already spend this engine's cleanup latch on the PR, and it selects an adversarial or convergence stance from its round number — both resolved from the ledger, not from this skill.
 
-`/reviewit` is the explicit hosted-review fallback. The default local path uses
-the draft PR ledger with `/deepcritique <pr>` and `/codex-review <pr>`.
+`/reviewit` is the explicit hosted-reviewer lane, run whenever it is useful
+rather than only when a local engine is missing. The local relay remains the
+default path and uses the draft PR ledger with `/deepcritique <pr>` and
+`/codex-review <pr>`.
 
 This replaces the older `/review-cycle` skill. Auto-trigger of Gemini and Copilot is intentionally disabled — `/reviewit` is the only path that fires AI review.
 
 ## Mode resolution
 
 `$ARGUMENTS` is whitespace-tokenized. The first token is the PR number; if a second token exists and equals `deep` (case-insensitive), set `MODE=deep` and `MAX_ITERS=4`. Otherwise `MODE=lean` and `MAX_ITERS=2`. Surface the resolved mode in the Phase 6 summary.
+
+**The effective recorded tier governs the mode in both directions.** Resolve it
+under the authenticated transition rule in the local review ledger. A `deep`
+argument supplied by an internal tier-aware handoff is only an assertion and
+does not override the marker. A direct human `deep` request is trigger 6: append
+a Deep replacement that preserves recorded triggers and adds 6 before starting,
+then run the four-iteration mode. Without a marker or direct request, classify
+against the triggers in
+[`../../REVIEW_WORKFLOW.md`](../../REVIEW_WORKFLOW.md), post one, and default to
+Lean only when none match. Say whenever resolution changes the argument-derived
+mode.
 
 ## Core principles
 
@@ -43,7 +56,9 @@ This replaces the older `/review-cycle` skill. Auto-trigger of Gemini and Copilo
 
 **Argument**: `$ARGUMENTS` — first token is the PR number; optional second token `deep` enables deep mode (see "Mode resolution" above).
 
-1. **Validate PR number** (numeric, > 0). If missing, ask the user for it. Resolve `MODE` and `MAX_ITERS` per the rule above.
+1. **Validate PR number** (numeric, > 0). If missing, ask the user for it. Load
+   [`../../references/local-review-ledger.md`](../../references/local-review-ledger.md),
+   then resolve `MODE` and `MAX_ITERS` per the rule above.
 
 2. **Fetch PR details**:
 
@@ -57,13 +72,17 @@ This replaces the older `/review-cycle` skill. Auto-trigger of Gemini and Copilo
 
 4. **Confirm the head ref is checked out locally** (`git rev-parse --abbrev-ref HEAD` matches `headRefName`). If not, the skill cannot push fixes — surface and exit.
 
-5. **Triviality detection — prompt to skip the chain on docs/config-only PRs.** Inspect the PR's changed files and classify by extension (same heuristic as `/refactorpass` and `/critique` Phase 0):
+5. **Triviality detection — prompt to skip the chain on docs/config-only PRs.**
+   Classify with the ledger's shared definition, including that every
+   `.claude/**` path is source whatever its extension:
 
    ```bash
    gh pr view <pr-number> --json files --jq '.files[].path'
    ```
 
-   Classify each path. If only docs/config files (`.md`, `.txt`, `.yml`, `.yaml`, `.json`, `.toml`, `.gitignore`, `.gitattributes`, `LICENSE`, `CHANGELOG`, `README`, files under `docs/`, `*.fixture.*`, snapshot files), prompt the user **before** spending any reviewer budget:
+   If the shared classifier returns only docs/config files, prompt the user
+   **before** spending any reviewer budget. Never offer this skip after a tier
+   trigger matched:
 
    ```
    This PR looks docs/config-only — N files, no source code changes.
@@ -118,7 +137,7 @@ gh workflow run "Gemini Code Review" \
   -F tier=flash
 ```
 
-**Pass `-F tier=flash` explicitly.** The workflow defaults `tier` to `pro` when omitted (intentional for UI clickers, unintended for CLI/API callers). Pro is $1–$8 per review; Flash is $0.05–$0.20. Only override to `pro` if the user has explicitly asked for a deep review on a high-stakes PR (security/auth, schema migrations, large refactors) AND confirmed the cost.
+**Pass `-F tier=flash` explicitly.** The workflow defaults `tier` to `pro` when omitted (intentional for UI clickers, unintended for CLI/API callers). Pro is $1–$8 per review; Flash is $0.05–$0.20. Only override to `pro` when the resolved review tier is Deep, the user asked for it explicitly, AND confirmed the cost. Do not re-derive the triggers here — read the tier marker.
 
 ### Fire Copilot
 
@@ -241,6 +260,8 @@ jq '[.[] | select((.user.login | test("copilot"; "i"))
 ```
 
 For each: classify severity (critical / suggestion / nitpick / question), category (architecture / correctness / security / performance / maintainability / testing), record file path, summarize.
+
+Those four levels are the hosted reviewers' own vocabulary, used here only to triage and count this loop's comments. They are not the local-review ledger's `blocking`/`major`/`minor`/`nit` ladder and do not map onto it; if a hosted finding is carried into a local ledger thread, rate it fresh off the ladder in [`../../references/local-review-ledger.md`](../../references/local-review-ledger.md).
 
 ### Parse Gemini findings
 

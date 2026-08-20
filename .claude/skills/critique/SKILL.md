@@ -12,7 +12,9 @@ reviewers found, how it was fixed, and why a thread was resolved.
 
 ## Mode resolution
 
-Parse `$ARGUMENTS` for an optional PR number and the word `deep`.
+Mode follows the resolved review tier, not the caller's habit. Parse
+`$ARGUMENTS` for an optional PR number and the word `deep`; `deep` asserts that
+the tier resolved to Deep, and Phase 0 checks it against the PR's tier marker.
 
 - Lean mode runs `code-reviewer` and, when the diff contains error/async
   signals, `silent-failure-hunter`.
@@ -30,13 +32,22 @@ Resolve this engine's round number per the ledger before selecting lenses: use
 `local-review-complete:v3`
 markers on the PR naming `engine=claude` and add one.
 
-- **Rounds 1–2 run adversarially** — the matrix and dispositions below apply as
-  written.
-- **Round 3 and later run in convergence mode.** Both engines have read the
-  change cold twice; the goal moves from challenging it to landing it. Convergence
-  mode overrides the lens table and the fix bias, as set out under "Convergence
-  rounds" below. It does not change the post-before-editing, reply, or resolve
-  contract, and it does not raise the round cap.
+The stance follows the tier's schedule, not the round ordinal alone:
+
+- **At Deep, rounds 1–2 run adversarially and round 3 and later run in
+  convergence mode.**
+- **At Lean the cap is two rounds: round 1 is adversarial and round 2 is the
+  convergence round.** A Lean PR arriving at round 3 is mis-tiered or not
+  converging; report which and stop rather than opening it.
+- **The first round after an escalation is adversarial whatever its ordinal**,
+  per the workflow doc's escalation rule.
+
+In an adversarial round the matrix and dispositions below apply as written. In a
+convergence round both engines have already read the change cold; the goal moves
+from challenging it to landing it. Convergence mode overrides the lens table and
+the fix bias, as set out under "Convergence rounds" below. It does not change the
+post-before-editing, reply, or resolve contract, and it does not raise the round
+cap.
 
 State the resolved round and stance in the output.
 
@@ -66,6 +77,20 @@ contract; see [`../../MODEL_NOTES.md`](../../MODEL_NOTES.md) §8.
 Do not begin a reviewer until the PR ledger is available. Do not use a
 force-push to establish or update the review branch.
 
+### Tier resolution
+
+Resolve the effective `local-review-tier:v1` marker under the ledger's
+authenticated, forward-only transition rule. If none exists, classify against
+the tier triggers in [`../../REVIEW_WORKFLOW.md`](../../REVIEW_WORKFLOW.md) and
+post the marker before starting a lane; Lean is the tier when no trigger
+matches. Run the lens set for the recorded tier. A `deep` argument from an
+internal `/deepcritique` handoff only asserts that tier; a direct human `deep`
+request is trigger 6 and posts a Deep replacement that preserves recorded
+triggers and adds 6 before lanes start. Escalate mid-pass only on a confirmed
+finding that reaches a trigger, per the workflow doc's evidence rule, and post
+the replacement marker naming it. State the resolved tier and trigger alongside
+the round and stance.
+
 ## Phase 1: Select the review lenses
 
 Always include `pr-review-toolkit:code-reviewer` when source code changed.
@@ -82,15 +107,18 @@ Add only lenses whose signal exists:
 
 Every finder prompt must identify the exact head and diff, ask the agent to
 read the source, request every plausible finding with severity and `file:line`,
-and impose a concise output ceiling. Do not ask finders to suppress findings by
-confidence. Run selected agents in parallel; the orchestrator verifies them.
+and impose a concise output ceiling. Name the four-rung ladder from the ledger
+reference in the prompt — `blocking`, `major`, `minor`, `nit`, rated on blast
+radius — so lenses do not each invent their own scale. Do not ask finders to
+suppress findings by confidence. Run selected agents in parallel; the
+orchestrator verifies them.
 
 Brief each finder per the ledger's diff-delivery rules: resolve the changed-file
 list once, name the paths that lens owns, and prefer `git diff <base-sha>..HEAD
 -- <path>` over handing every agent one whole-diff artifact. Scope a lens by the
 files it reviews, never by the findings it may report.
 
-### Convergence rounds (round 3 and later)
+### Convergence rounds (any round whose stance is convergence)
 
 Run only `code-reviewer`, `silent-failure-hunter`, and `security-review` when its
 signal is present. Drop `type-design-analyzer`, `comment-analyzer`,
@@ -155,10 +183,9 @@ already posted, reply with `outcome=deferred` and the no-issue rationale; keep a
 concern that does not clear the actionable finding bar out of the PR ledger.
 
 In a convergence round, the bar tightens further toward landing the change.
-Change the PR only for a **blocking** defect that also clears the bar above — one
-that is realistically reachable and ships materially wrong behavior, loses or
-corrupts data, exposes a credible security or privacy exploit, breaks a public
-contract, or breaks deploy or rollout:
+Change the PR only for a realistically reachable `blocking` defect, as the
+ledger's severity ladder defines it, that also clears the bar above. A finding a
+comment or test edit could clear was never `blocking`:
 
 - Fix a blocking finding with the smallest edit that clears it. No refactor, no
   rename, no new abstraction, no test or comment hardening alongside it.
@@ -182,7 +209,13 @@ For confirmed fixes:
 4. require local HEAD, remote head, and PR head to match;
 5. use the deterministic helper's resumable `dispose` transaction with the fix
    SHA, validation result, fingerprint, and occurrence;
-6. after the final lane, write the v3 structured result. Under agent-loop the
+6. before the attestation, run the repository's gating suite unfiltered, per the
+   ledger's "Validate before attesting". The focused run in step 2 dispositions
+   the finding and is not evidence for the pass. Name the command, config, and
+   SHA in the attestation. A red gating run is itself a blocking finding, even
+   when it predates this round, and applies to a `clean` pass just as much as a
+   changed one;
+7. after the final lane, write the v3 structured result. Under agent-loop the
    wrapper owns the committed-pass marker.
 
 Never resolve a finding merely because code changed. A marked thread requires
@@ -199,31 +232,40 @@ deployment/sync, or review-integrity change, including a test or workflow
 change needed to prevent a false green. `minor` is low-risk non-behavioral
 cleanup, clarity, or test/docs polish.
 
+Severity is a property of the finding, classification a property of this pass's
+diff, and neither implies the other. A `major` finding whose fix touched only
+comments, only docs, or only tests is a `minor` pass. Never restate a severity
+to reach a classification: the thread's severity is fixed evidence, and the
+classification is read off the diff. See "Severity is not classification" in the
+ledger reference.
+
 Every engine attestation remains exact to the head it reviewed. A later minor
 fix does not rewrite that evidence or claim the other engine reviewed the new
 head. The outer round may still converge through an explicit minor transition;
-a material transition restarts at Codex.
+a material transition moves the head, which invalidates precisely those
+attestations that named the superseded commit.
 
 ## Phase 4: Output
 
-Report the PR and reviewed head, the resolved round and stance, mode and lenses,
-disposition/thread counts, validation, fix SHAs, and whether material fixes
-require another local-engine pass.
+Report the PR and reviewed head, the resolved tier and its trigger, the round
+and stance, mode and lenses, disposition/thread counts, validation, fix SHAs,
+and whether material fixes require another local-engine pass.
 
 A convergence round that found no blocking defect ends the loop: record a clean
 result, recommend the ship step, and list any urgent deferred issues.
 
-If this Claude pass made a material fix, restart the bounded round at
-`/codex-review <pr-number>` in a fresh session. Otherwise it completes the
-Claude half of the current round. Always finalize `clean`, `changed`, or
-`blocked` per the ledger's wrapper/standalone ownership rule before returning.
-Use `write-result` for `clean` or `changed`, and use
+If this Claude pass made a material fix, it moved the head: every declared
+reviewer whose attestation named the superseded commit re-runs against the new
+head in a fresh session, and a reviewer that already attested this head does
+not. Otherwise it completes Claude's part of the current round. Always finalize
+`clean`, `changed`, or `blocked` per the ledger's wrapper/standalone ownership
+rule before returning. Use `write-result` for `clean` or `changed`, and use
 `write-blocked-result` with an owner-only blocker file for `blocked`.
 
 ## Boundaries
 
 - Do not force-push or merge.
-- Do not invoke hosted reviewers on the local convergence path.
+- Do not invoke hosted reviewers; they are a separate lane the caller runs, not a side effect of this skill.
 - Do not print raw model logs in the PR.
 - Do not mark the PR ready while marked threads are unanswered or unresolved.
 
