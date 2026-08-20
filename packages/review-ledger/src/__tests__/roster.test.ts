@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   attestationsAtHead,
@@ -8,6 +9,7 @@ import {
   parseReviewers,
   postRoster,
   readRoster,
+  resolveRoster,
   verifyCoverage,
 } from '../index.js';
 import { resetGitHubRunner, setGitHubRunner } from '../github.js';
@@ -94,16 +96,33 @@ function addComment(body: string): number {
   return id;
 }
 
+/** Post a v1 roster directly; the builder only writes v2. */
+function legacyRosterBody(
+  author: SupportedEngine,
+  reviewers: string,
+  content: string,
+): string {
+  // Digest over the reason prose alone — the v1 grammar this package still reads.
+  const sha = createHash('sha256').update(content, 'utf8').digest('hex');
+  return (
+    `<!-- local-review-roster:v1 author=${author} reviewers=${reviewers} ` +
+    `content-sha256=${sha} -->\n${content}`
+  );
+}
+
 function declareRoster(
   author: SupportedEngine,
   reviewers: readonly SupportedEngine[],
-): void {
+  options?: { head?: string; supersedes?: number | null; content?: string },
+): number {
   const { body } = buildRosterBody({
     author,
     reviewers,
-    content: 'Roster for this relay.',
+    head: options?.head ?? HEAD,
+    supersedes: options?.supersedes ?? null,
+    content: options?.content ?? 'Roster for this relay.',
   });
-  addComment(body);
+  return addComment(body);
 }
 
 beforeEach(() => {
@@ -143,12 +162,27 @@ describe('parseReviewers', () => {
 });
 
 describe('buildRosterBody', () => {
+  it('binds the declaration to a commit and to its predecessor', () => {
+    const { marker } = buildRosterBody({
+      author: 'claude',
+      reviewers: ['codex'],
+      head: HEAD,
+      supersedes: 501,
+      content: 'Codex reviews this one.',
+    });
+    expect(marker).toContain(`author=claude reviewers=codex head=${HEAD}`);
+    expect(marker).toContain('supersedes=501');
+    expect(marker).toMatch(/declaration-sha256=[0-9a-f]{64} -->$/);
+  });
+
   it('refuses content that embeds a protocol marker', () => {
     const embedded = `Solo because reasons.\n${passMarker('codex', 1, HEAD)}`;
     expect(() =>
       buildRosterBody({
         author: 'claude',
         reviewers: ['codex'],
+        head: HEAD,
+        supersedes: null,
         content: embedded,
       }),
     ).toThrow(/must not contain local-review markers/);
@@ -159,6 +193,8 @@ describe('buildRosterBody', () => {
       buildRosterBody({
         author: 'copilot' as never,
         reviewers: [],
+        head: HEAD,
+        supersedes: null,
         content: 'x',
       }),
     ).toThrow(/author must be one of/);
@@ -169,30 +205,63 @@ describe('buildRosterBody', () => {
       buildRosterBody({
         author: 'claude',
         reviewers: ['codex', 'gemini', 'antigravity'],
+        head: HEAD,
+        supersedes: null,
         content: 'Too many reviewers.',
       }),
     ).toThrow(/at most two reviewers/);
+  });
+
+  it('refuses a head that is not a full commit SHA', () => {
+    expect(() =>
+      buildRosterBody({
+        author: 'claude',
+        reviewers: [],
+        head: 'HEAD',
+        supersedes: null,
+        content: 'Solo.',
+      }),
+    ).toThrow(/40-character lowercase commit SHA/);
+  });
+
+  it('refuses a non-positive supersedes id', () => {
+    expect(() =>
+      buildRosterBody({
+        author: 'claude',
+        reviewers: [],
+        head: HEAD,
+        supersedes: 0,
+        content: 'Solo.',
+      }),
+    ).toThrow(/supersedes must be a positive comment id/);
   });
 
   it('emits none rather than an empty value for a solo relay', () => {
     const { marker } = buildRosterBody({
       author: 'claude',
       reviewers: [],
+      head: HEAD,
+      supersedes: null,
       content: 'Solo: prototype spike, no external consumers.',
     });
     expect(marker).toContain('author=claude reviewers=none');
-    expect(marker).toMatch(/content-sha256=[0-9a-f]{64} -->$/);
+    expect(marker).toContain('supersedes=none');
   });
 
   it('round-trips through matchRoster', () => {
     const { body } = buildRosterBody({
       author: 'gemini',
       reviewers: ['claude', 'codex'],
+      head: HEAD,
+      supersedes: 7,
       content: 'Full coverage requested.',
     });
     expect(matchRoster(body)).toMatchObject({
+      version: 2,
       author: 'gemini',
       reviewers: ['claude', 'codex'],
+      head: HEAD,
+      supersedes: 7,
     });
   });
 
@@ -200,29 +269,245 @@ describe('buildRosterBody', () => {
     const { marker } = buildRosterBody({
       author: 'claude',
       reviewers: [],
+      head: HEAD,
+      supersedes: null,
       content: 'Solo: prototype spike.',
     });
     expect(() => matchRoster(`${marker}\nSolo: reviewed by everyone.`)).toThrow(
-      /invalid content hash/,
+      /invalid declaration hash/,
     );
   });
 });
 
-describe('readRoster', () => {
-  it('reports absence rather than inventing a default', () => {
-    expect(readRoster({ repo: 'o/r', pr: 1 })).toMatchObject({
-      present: false,
-      author: null,
-      reviewers: [],
+describe('roster:v1 forgery regressions', () => {
+  // The v1 defect: content-sha256 covered only the prose, so each of these
+  // in-place edits left a valid digest behind. Every one of them must now fail.
+  const real = buildRosterBody({
+    author: 'claude',
+    reviewers: ['codex'],
+    head: HEAD,
+    supersedes: null,
+    content: 'Codex reviews this.',
+  });
+
+  it('refuses a reviewers=none edit of a posted roster', () => {
+    const forged = real.body.replace('reviewers=codex', 'reviewers=none');
+    expect(() => matchRoster(forged)).toThrow(/invalid declaration hash/);
+  });
+
+  it('refuses an author edit of a posted roster', () => {
+    const forged = real.body.replace('author=claude', 'author=gemini');
+    expect(() => matchRoster(forged)).toThrow(/invalid declaration hash/);
+  });
+
+  it('refuses a head edit of a posted roster', () => {
+    const forged = real.body.replace(`head=${HEAD}`, `head=${OLD_HEAD}`);
+    expect(() => matchRoster(forged)).toThrow(/invalid declaration hash/);
+  });
+
+  it('refuses a supersedes edit of a posted roster', () => {
+    const forged = real.body.replace('supersedes=none', 'supersedes=501');
+    expect(() => matchRoster(forged)).toThrow(/invalid declaration hash/);
+  });
+
+  it('does not report a forged solo roster as an acknowledged solo relay', () => {
+    addComment(real.body.replace('reviewers=codex', 'reviewers=none'));
+    expect(() => coverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
+      /invalid declaration hash/,
+    );
+  });
+});
+
+describe('matchRoster', () => {
+  it('reads a v1 roster, binding it to no commit', () => {
+    const body = legacyRosterBody('claude', 'codex', 'Codex reviews this.');
+    expect(matchRoster(body)).toMatchObject({
+      version: 1,
+      author: 'claude',
+      reviewers: ['codex'],
+      head: null,
+      supersedes: null,
     });
   });
 
-  it('rejects two conflicting declarations', () => {
+  it('hard-stops on two roster candidates in one comment', () => {
+    const first = buildRosterBody({
+      author: 'claude',
+      reviewers: [],
+      head: HEAD,
+      supersedes: null,
+      content: 'Solo.',
+    }).body;
+    const second = legacyRosterBody('claude', 'codex', 'Codex reviews.');
+    expect(() => matchRoster(`${first}\n${second}`)).toThrow(
+      /more than one local-review roster marker/,
+    );
+  });
+
+  it('rejects a roster marker from an unsupported version', () => {
+    expect(() =>
+      matchRoster('<!-- local-review-roster:v9 author=claude -->\nreason'),
+    ).toThrow(/unsupported protocol version/);
+  });
+
+  it('returns null for a body carrying no roster marker', () => {
+    expect(matchRoster('looks good to me')).toBeNull();
+  });
+});
+
+describe('resolveRoster', () => {
+  it('reports absence rather than inventing a default', () => {
+    expect(readRoster({ repo: 'o/r', pr: 1 })).toMatchObject({
+      present: false,
+      version: null,
+      author: null,
+      reviewers: [],
+      chain: [],
+    });
+  });
+
+  it('resolves the newest link of a supersession chain', () => {
+    const first = declareRoster('claude', ['codex', 'gemini']);
+    const second = declareRoster('claude', ['codex'], { supersedes: first });
+    const report = readRoster({ repo: 'o/r', pr: 1 });
+    expect(report).toMatchObject({
+      version: 2,
+      reviewers: ['codex'],
+      commentId: second,
+      supersedes: first,
+    });
+    expect(report.chain).toEqual([first, second]);
+  });
+
+  it('lets a v2 roster supersede a pre-existing v1 declaration', () => {
+    const legacy = addComment(
+      legacyRosterBody('claude', 'codex', 'Codex reviews this.'),
+    );
+    const replacement = declareRoster('claude', [], { supersedes: legacy });
+    expect(readRoster({ repo: 'o/r', pr: 1 })).toMatchObject({
+      version: 2,
+      reviewers: [],
+      commentId: replacement,
+      chain: [legacy, replacement],
+    });
+  });
+
+  it('refuses a v2 roster that ignores a v1 roster already on the pull request', () => {
+    addComment(legacyRosterBody('claude', 'codex', 'Codex reviews this.'));
+    declareRoster('claude', []);
+    expect(() => readRoster({ repo: 'o/r', pr: 1 })).toThrow(
+      /does not cover every roster/,
+    );
+  });
+
+  it('supersedes a pre-existing v1 roster automatically when posting', () => {
+    const legacy = addComment(
+      legacyRosterBody('claude', 'codex', 'Codex reviews this.'),
+    );
+    const posted = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: HEAD,
+      author: 'claude',
+      reviewers: ['codex'],
+      content: 'Same roster, recorded as v2 evidence.',
+    });
+    expect(posted.supersedes).toBe(legacy);
+    expect(posted.chain).toEqual([legacy, posted.comment_id]);
+  });
+
+  it('refuses a chain whose superseded roster was deleted', () => {
+    declareRoster('claude', ['codex'], { supersedes: 499 });
+    expect(() => readRoster({ repo: 'o/r', pr: 1 })).toThrow(
+      /supersedes comment 499, which is not a roster on this pull request/,
+    );
+  });
+
+  it('refuses a forked chain', () => {
+    const first = declareRoster('claude', ['codex', 'gemini']);
+    declareRoster('claude', ['codex'], { supersedes: first });
+    declareRoster('claude', ['gemini'], { supersedes: first });
+    expect(() => readRoster({ repo: 'o/r', pr: 1 })).toThrow(
+      /supersession chain forks/,
+    );
+  });
+
+  it('refuses two unlinked roots', () => {
     declareRoster('claude', ['codex']);
     declareRoster('claude', ['gemini']);
     expect(() => readRoster({ repo: 'o/r', pr: 1 })).toThrow(
+      /more than one supersession chain/,
+    );
+  });
+
+  it('refuses a link that supersedes a later declaration', () => {
+    // The replacement's own comment id (800) predates the roster it claims to
+    // replace (900), so the chain does not run in the order it asserts.
+    const push = (id: number, body: string): void => {
+      runner.issueComments.push({ id, user: { login: runner.actor }, body });
+    };
+    push(
+      900,
+      buildRosterBody({
+        author: 'claude',
+        reviewers: ['codex'],
+        head: HEAD,
+        supersedes: null,
+        content: 'Roster for this relay.',
+      }).body,
+    );
+    push(
+      800,
+      buildRosterBody({
+        author: 'claude',
+        reviewers: ['gemini'],
+        head: HEAD,
+        supersedes: 900,
+        content: 'Roster for this relay.',
+      }).body,
+    );
+    expect(() => readRoster({ repo: 'o/r', pr: 1 })).toThrow(
+      /supersedes a later declaration/,
+    );
+  });
+
+  it('rejects two conflicting v1 declarations', () => {
+    addComment(legacyRosterBody('claude', 'codex', 'Codex reviews.'));
+    addComment(legacyRosterBody('claude', 'gemini', 'Gemini reviews.'));
+    expect(() => readRoster({ repo: 'o/r', pr: 1 })).toThrow(
       /declared more than once/,
     );
+  });
+
+  it('ignores roster-shaped comments authored by anyone but the actor', () => {
+    runner.issueComments.push({
+      id: 900,
+      user: { login: 'someone-else' },
+      body: buildRosterBody({
+        author: 'claude',
+        reviewers: [],
+        head: HEAD,
+        supersedes: null,
+        content: 'Solo.',
+      }).body,
+    });
+    expect(readRoster({ repo: 'o/r', pr: 1 }).present).toBe(false);
+  });
+
+  it('refuses a roster row carrying no comment id', () => {
+    expect(() =>
+      resolveRoster([
+        {
+          body: buildRosterBody({
+            author: 'claude',
+            reviewers: [],
+            head: HEAD,
+            supersedes: null,
+            content: 'Solo.',
+          }).body,
+        },
+      ]),
+    ).toThrow(/malformed/);
   });
 });
 
@@ -236,7 +521,13 @@ describe('postRoster', () => {
       reviewers: ['codex'],
       content: 'Codex reviews this one.',
     });
-    expect(first).toMatchObject({ replayed: false, reviewers: ['codex'] });
+    expect(first).toMatchObject({
+      replayed: false,
+      reviewers: ['codex'],
+      head: HEAD,
+      supersedes: null,
+      superseded: false,
+    });
 
     const second = postRoster({
       repo: 'o/r',
@@ -251,25 +542,79 @@ describe('postRoster', () => {
     expect(runner.issueComments).toHaveLength(1);
   });
 
-  it('refuses a second roster that contradicts the first', () => {
-    postRoster({
+  it('records a late narrow to solo as a visible, ordered replacement', () => {
+    const declared = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: HEAD,
+      author: 'claude',
+      reviewers: ['codex', 'gemini'],
+      content: 'Two reviewers: this touches auth.',
+    });
+
+    const narrowed = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: HEAD,
+      author: 'claude',
+      reviewers: [],
+      content: 'Narrowed to solo: the auth change was dropped from this PR.',
+    });
+
+    expect(narrowed).toMatchObject({
+      reviewers: [],
+      supersedes: declared.comment_id,
+      superseded: true,
+      replayed: false,
+    });
+    expect(narrowed.chain).toEqual([declared.comment_id, narrowed.comment_id]);
+    // The superseded declaration stays on the pull request.
+    expect(runner.issueComments).toHaveLength(2);
+    expect(readRoster({ repo: 'o/r', pr: 1 }).reviewers).toEqual([]);
+  });
+
+  it('records a widened roster the same way', () => {
+    const declared = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: HEAD,
+      author: 'claude',
+      reviewers: [],
+      content: 'Solo: docs only.',
+    });
+    const widened = postRoster({
       repo: 'o/r',
       pr: 1,
       head: HEAD,
       author: 'claude',
       reviewers: ['codex'],
-      content: 'Codex reviews this one.',
+      content: 'Source landed; codex reviews it.',
     });
-    expect(() =>
-      postRoster({
-        repo: 'o/r',
-        pr: 1,
-        head: HEAD,
-        author: 'claude',
-        reviewers: ['gemini'],
-        content: 'Gemini reviews this one.',
-      }),
-    ).toThrow(/conflicting content/);
+    expect(widened.supersedes).toBe(declared.comment_id);
+    expect(widened.chain).toHaveLength(2);
+  });
+
+  it('re-declares an unchanged roster at a new head as a new link', () => {
+    const declared = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: HEAD,
+      author: 'claude',
+      reviewers: [],
+      content: 'Solo: internal tooling spike.',
+    });
+    runner.prHead = OLD_HEAD;
+    const restated = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: OLD_HEAD,
+      author: 'claude',
+      reviewers: [],
+      content: 'Solo: internal tooling spike.',
+    });
+    expect(restated.replayed).toBe(false);
+    expect(restated.head).toBe(OLD_HEAD);
+    expect(restated.supersedes).toBe(declared.comment_id);
   });
 
   it('converges concurrent identical posts onto one roster', () => {
@@ -278,7 +623,11 @@ describe('postRoster', () => {
       reviewers: ['codex'] as const,
       content: 'Codex reviews this one.',
     };
-    runner.concurrentRosterBody = buildRosterBody(declaration).body;
+    runner.concurrentRosterBody = buildRosterBody({
+      ...declaration,
+      head: HEAD,
+      supersedes: null,
+    }).body;
 
     const posted = postRoster({
       repo: 'o/r',
@@ -290,6 +639,20 @@ describe('postRoster', () => {
     expect(posted).toMatchObject({ comment_id: 500, replayed: true });
     expect(runner.issueComments).toHaveLength(1);
     expect(readRoster({ repo: 'o/r', pr: 1 }).commentId).toBe(500);
+  });
+
+  it('refuses a head that is not the pull request head', () => {
+    runner.prHead = OLD_HEAD;
+    expect(() =>
+      postRoster({
+        repo: 'o/r',
+        pr: 1,
+        head: HEAD,
+        author: 'claude',
+        reviewers: [],
+        content: 'Solo.',
+      }),
+    ).toThrow(/PR head mismatch/);
   });
 });
 
@@ -390,6 +753,9 @@ describe('coverage', () => {
     expect(report.tier).toBe('cross');
     expect(report.roundComplete).toBe(true);
     expect(report.missingReviewers).toEqual([]);
+    expect(report.rosterVersion).toBe(2);
+    expect(report.rosterHead).toBe(HEAD);
+    expect(report.rosterStale).toBe(false);
   });
 
   it('reaches full with two non-author engines at the same head', () => {
@@ -450,6 +816,7 @@ describe('coverage', () => {
     addComment(passMarker('claude', 1, HEAD));
     const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
     expect(report.tier).toBe('solo');
+    expect(report.soloDeclared).toBe(true);
     expect(report.soloAcknowledged).toBe(true);
     expect(report.roundComplete).toBe(true);
   });
@@ -460,6 +827,37 @@ describe('coverage', () => {
     expect(report.soloAcknowledged).toBe(true);
     expect(report.authorAttested).toBe(false);
     expect(report.roundComplete).toBe(false);
+  });
+
+  it('does not let a solo roster declared at an earlier head govern this one', () => {
+    declareRoster('claude', [], { head: OLD_HEAD });
+    addComment(passMarker('claude', 1, HEAD));
+    const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
+    expect(report.rosterStale).toBe(true);
+    expect(report.rosterHead).toBe(OLD_HEAD);
+    expect(report.soloDeclared).toBe(true);
+    expect(report.soloAcknowledged).toBe(false);
+    expect(report.roundComplete).toBe(false);
+  });
+
+  it('reads a v1 solo roster as declared but not acknowledged', () => {
+    addComment(legacyRosterBody('claude', 'none', 'Solo: prototype spike.'));
+    addComment(passMarker('claude', 1, HEAD));
+    const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
+    expect(report.rosterVersion).toBe(1);
+    expect(report.rosterHead).toBeNull();
+    expect(report.soloDeclared).toBe(true);
+    expect(report.soloAcknowledged).toBe(false);
+    expect(report.roundComplete).toBe(false);
+  });
+
+  it('still holds a v1 roster to its declared reviewers', () => {
+    addComment(legacyRosterBody('claude', 'codex', 'Codex reviews this.'));
+    addComment(passMarker('codex', 1, HEAD));
+    const report = coverage({ repo: 'o/r', pr: 1, head: HEAD });
+    expect(report.rosterVersion).toBe(1);
+    expect(report.tier).toBe('cross');
+    expect(report.roundComplete).toBe(true);
   });
 
   it('asserts the actor before reading actor-owned evidence', () => {
@@ -513,6 +911,49 @@ describe('verifyCoverage', () => {
     expect(() => verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
       /solo relay still requires the author engine to attest/,
     );
+  });
+
+  it('refuses a solo relay declared over earlier code, naming the way out', () => {
+    declareRoster('claude', [], { head: OLD_HEAD });
+    addComment(passMarker('claude', 1, HEAD));
+    expect(() => verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
+      new RegExp(`declared at ${OLD_HEAD}, not at ${HEAD}`),
+    );
+    expect(() => verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
+      /post-roster --head/,
+    );
+  });
+
+  it('refuses a v1 solo roster, whose declaration sits outside its hash', () => {
+    addComment(legacyRosterBody('claude', 'none', 'Solo: prototype spike.'));
+    addComment(passMarker('claude', 1, HEAD));
+    expect(() => verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
+      /roster:v1 grammar/,
+    );
+  });
+
+  it('clears a stale solo roster in one deliberate re-declaration', () => {
+    const stale = declareRoster('claude', [], { head: OLD_HEAD });
+    addComment(passMarker('claude', 1, HEAD));
+    expect(() => verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toThrow(
+      /declared at/,
+    );
+
+    const redeclared = postRoster({
+      repo: 'o/r',
+      pr: 1,
+      head: HEAD,
+      author: 'claude',
+      reviewers: [],
+      content: 'Still solo: the later commits are test fixtures only.',
+    });
+
+    expect(redeclared.supersedes).toBe(stale);
+    expect(verifyCoverage({ repo: 'o/r', pr: 1, head: HEAD })).toMatchObject({
+      soloAcknowledged: true,
+      roundComplete: true,
+      rosterChain: [stale, redeclared.comment_id],
+    });
   });
 
   it('accepts a complete cross-model relay', () => {

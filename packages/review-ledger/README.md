@@ -171,14 +171,34 @@ review-ledger post-roster --repo owner/repo --pr 123 --head <sha> \
 review-ledger post-roster --repo owner/repo --pr 123 --head <sha> \
   --author claude --reviewers none --content-file ./solo-reason.txt
 
+# Changed your mind? Post again. The new roster supersedes the old one and
+# both stay on the pull request, so the narrowing is visible and ordered.
+review-ledger post-roster --repo owner/repo --pr 123 --head <new-sha> \
+  --author claude --reviewers none --content-file ./narrowed-reason.txt
+
 review-ledger read-roster --repo owner/repo --pr 123
 
 # Report coverage at the exact current head
 review-ledger coverage --repo owner/repo --pr 123 --head <sha>
 
-# ...or fail when no roster is declared or a declared reviewer is missing
+# ...or fail when the ledger would assert something untrue about what happened
 review-ledger verify-coverage --repo owner/repo --pr 123 --head <sha>
 ```
+
+The roster marker is `local-review-roster:v2`. Its `declaration-sha256` covers
+`author`, `reviewers`, `head`, and `supersedes` together with the recorded
+reason, so no field can be edited in place after the fact; `head=` binds the
+declaration to the commit it was made over; and `supersedes=` chains each
+replacement to the roster it replaces. Pull requests carrying the older
+`local-review-roster:v1` marker still read, but v1 puts the declaration outside
+its own hash and names no commit, so a v1 roster is advisory: re-post it to
+record the same choice as v2 evidence.
+
+Neither `coverage` nor `verify-coverage` is a merge gate, and neither should be
+wired into one. A developer who has looked at a change and judged its review
+sufficient is always free to ship it. Solo review with a recorded reason is a
+legitimate outcome, not a degraded one — what these commands owe you is an
+accurate record of what happened, not a verdict on it.
 
 `coverage` reports a `tier` over distinct **non-author** engines that attested
 the exact head: `solo` (none), `cross` (one), `full` (two or more). The author

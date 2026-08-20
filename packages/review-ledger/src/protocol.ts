@@ -184,6 +184,31 @@ export function matchProtocol(
   pattern: RegExp,
   marker: string,
 ): RegExpExecArray | null {
+  const matched = matchMarkerLine(body, pattern, marker);
+  if (matched === null) {
+    return null;
+  }
+  if (sha256Text(matched.content) !== matched.match.groups!['content_sha']) {
+    fail(`authenticated ${marker} record has an invalid content hash`);
+  }
+  return matched.match;
+}
+
+/**
+ * Enforce the shared marker layout and return the marker with its content.
+ *
+ * Every authenticated record in this protocol has the same shape: the marker is
+ * the first complete line, and everything after it is non-empty content. Only
+ * the digest differs — a finding hashes its prose, a roster hashes its prose
+ * together with the declaration the prose exists to justify. Splitting the
+ * layout rules out here keeps the two digests from drifting apart on which
+ * bytes they are defined over.
+ */
+export function matchMarkerLine(
+  body: string,
+  pattern: RegExp,
+  marker: string,
+): { match: RegExpExecArray; content: string } | null {
   if (!body.includes(marker)) {
     return null;
   }
@@ -199,10 +224,7 @@ export function matchProtocol(
   if (!content.trim()) {
     fail(`authenticated ${marker} content is empty`);
   }
-  if (sha256Text(content) !== match.groups['content_sha']) {
-    fail(`authenticated ${marker} record has an invalid content hash`);
-  }
-  return match;
+  return { match, content };
 }
 
 /**

@@ -468,23 +468,46 @@ export interface GitHubRunner {
  */
 export type CoverageTier = 'solo' | 'cross' | 'full';
 
-/**
- * A parsed `local-review-roster:v1` marker.
- */
-export interface RosterV1Match {
-  author: SupportedEngine;
-  reviewers: SupportedEngine[];
-  contentSha: string;
-}
+/** Which roster grammar a parsed marker was written in. */
+export type RosterVersion = 1 | 2;
 
 /**
- * The roster declared on a pull request, or its declared absence.
+ * A parsed roster marker, at either protocol version.
+ *
+ * `head` and `supersedes` are `null` for a v1 marker, whose grammar carries
+ * neither. A v1 roster is therefore bound to no commit and supersedes nothing,
+ * which is why it is read as advisory rather than as evidence a reader can gate
+ * on.
+ */
+export interface RosterMatch {
+  version: RosterVersion;
+  author: SupportedEngine;
+  reviewers: SupportedEngine[];
+  head: string | null;
+  supersedes: number | null;
+  /** `declaration-sha256` for v2, `content-sha256` for v1. */
+  digest: string;
+}
+
+/** @deprecated Use {@link RosterMatch}. */
+export type RosterV1Match = RosterMatch;
+
+/**
+ * The effective roster declared on a pull request, or its declared absence.
+ *
+ * `chain` lists the comment ids of the supersession chain, oldest first, so a
+ * narrowed roster is visible as an ordered replacement rather than appearing as
+ * the only declaration ever made.
  */
 export interface RosterReport {
   present: boolean;
+  version: RosterVersion | null;
   author: SupportedEngine | null;
   reviewers: SupportedEngine[];
+  head: string | null;
   commentId: number | null;
+  supersedes: number | null;
+  chain: number[];
 }
 
 /**
@@ -508,6 +531,12 @@ export interface PostRosterResult {
   comment_id: number;
   author: SupportedEngine;
   reviewers: SupportedEngine[];
+  head: string;
+  /** The comment id this declaration replaces, or `null` for the first one. */
+  supersedes: number | null;
+  /** True when this post replaced an earlier roster rather than opening one. */
+  superseded: boolean;
+  chain: number[];
   replayed: boolean;
   verified: true;
 }
@@ -538,6 +567,12 @@ export interface CoverageParams {
 export interface CoverageResult {
   head: string;
   rosterPresent: boolean;
+  rosterVersion: RosterVersion | null;
+  /** The commit the effective roster was declared at; `null` for v1. */
+  rosterHead: string | null;
+  /** True when the roster names a commit other than the one being reported on. */
+  rosterStale: boolean;
+  rosterChain: number[];
   author: SupportedEngine | null;
   reviewers: SupportedEngine[];
   attestedAtHead: SupportedEngine[];
@@ -545,6 +580,16 @@ export interface CoverageResult {
   missingReviewers: SupportedEngine[];
   authorAttested: boolean;
   tier: CoverageTier;
+  /** A roster declaring no reviewers is present, whatever its version or head. */
+  soloDeclared: boolean;
+  /**
+   * The solo declaration is one this reader can stand behind: v2 grammar, so
+   * the declaration is inside its own digest, and named at this exact head.
+   *
+   * A solo relay with a recorded reason is a legitimate outcome, not a degraded
+   * one. This flag is about whether the ledger's record of that choice is
+   * trustworthy, never about whether the choice was a good one.
+   */
   soloAcknowledged: boolean;
   roundComplete: boolean;
   verified: true;

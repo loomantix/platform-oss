@@ -1,8 +1,11 @@
 import {
   COMPLETE_V3_RE,
   PASS_V3_RE,
+  ROSTER_ANY_MARKER,
   ROSTER_V1_MARKER,
   ROSTER_V1_RE,
+  ROSTER_V2_MARKER,
+  ROSTER_V2_RE,
   SUPPORTED_ENGINES,
 } from './constants.js';
 import { fail, LedgerError } from './errors.js';
@@ -16,8 +19,12 @@ import {
   verifyHead,
   verifyIssueComment,
 } from './github.js';
-import { sha256Text } from './hash.js';
-import { matchProtocol, validateContentString } from './protocol.js';
+import { requireSha, sha256Text } from './hash.js';
+import {
+  matchMarkerLine,
+  matchProtocol,
+  validateContentString,
+} from './protocol.js';
 import type {
   AttestationAtHead,
   CoverageParams,
@@ -25,8 +32,8 @@ import type {
   CoverageTier,
   PostRosterParams,
   PostRosterResult,
+  RosterMatch,
   RosterReport,
-  RosterV1Match,
   SupportedEngine,
 } from './types.js';
 
@@ -81,31 +88,130 @@ function validateReviewers(
 }
 
 /**
- * Match the roster marker in a comment body and verify its content hash.
+ * Canonical pre-image for a roster:v2 `declaration-sha256`.
+ *
+ * The declaration is hashed together with the reason prose that justifies it.
+ * v1 hashed only the prose, so rewriting `reviewers=codex` to `reviewers=none`
+ * in a posted marker left the digest valid and the ledger went on to report an
+ * acknowledged solo relay that nobody had declared.
+ *
+ * The version string leads the pre-image so a roster digest can never collide
+ * with the plain content digest every other record in this protocol uses.
  */
-export function matchRoster(body: string): RosterV1Match | null {
-  const match = matchProtocol(body, ROSTER_V1_RE, ROSTER_V1_MARKER);
-  if (!match || !match.groups) {
+export function rosterDigestInput(fields: {
+  author: SupportedEngine;
+  reviewers: string;
+  head: string;
+  supersedes: number | null;
+  content: string;
+}): string {
+  return [
+    'local-review-roster:v2',
+    `author=${fields.author}`,
+    `reviewers=${fields.reviewers}`,
+    `head=${fields.head}`,
+    `supersedes=${fields.supersedes === null ? 'none' : fields.supersedes}`,
+    '',
+    fields.content,
+  ].join('\n');
+}
+
+/** Render a validated reviewer list as the marker's `reviewers=` value. */
+function formatReviewers(reviewers: readonly SupportedEngine[]): string {
+  return reviewers.length === 0 ? 'none' : reviewers.join(',');
+}
+
+/**
+ * Match the roster marker in a comment body and verify its digest.
+ *
+ * Reads both grammars. A v1 marker still parses so a pull request already
+ * carrying one keeps reporting what it declared; it returns a null `head` and
+ * null `supersedes`, which is what makes it advisory downstream.
+ */
+export function matchRoster(body: string): RosterMatch | null {
+  const occurrences = body.split(ROSTER_ANY_MARKER).length - 1;
+  if (occurrences === 0) {
     return null;
+  }
+  if (occurrences > 1) {
+    fail('a comment carries more than one local-review roster marker');
+  }
+  if (body.includes(ROSTER_V2_MARKER)) {
+    return matchRosterV2(body);
+  }
+  if (body.includes(ROSTER_V1_MARKER)) {
+    return matchRosterV1(body);
+  }
+  fail('local-review roster record is of an unsupported protocol version');
+}
+
+function matchRosterV2(body: string): RosterMatch {
+  const matched = matchMarkerLine(body, ROSTER_V2_RE, ROSTER_V2_MARKER);
+  if (matched === null) {
+    fail('local-review roster record is malformed');
+  }
+  const groups = matched.match.groups!;
+  const author = groups['author'] as SupportedEngine;
+  const rawSupersedes = groups['supersedes']!;
+  const supersedes =
+    rawSupersedes === 'none' ? null : parseInt(rawSupersedes, 10);
+  if (supersedes !== null && !Number.isSafeInteger(supersedes)) {
+    fail('local-review roster supersedes must be a comment id');
+  }
+  const expected = sha256Text(
+    rosterDigestInput({
+      author,
+      reviewers: groups['reviewers']!,
+      head: groups['head']!,
+      supersedes,
+      content: matched.content,
+    }),
+  );
+  if (expected !== groups['declaration_sha']) {
+    fail(
+      'authenticated local-review-roster:v2 record has an invalid declaration hash',
+    );
+  }
+  return {
+    version: 2,
+    author,
+    reviewers: parseReviewers(groups['reviewers']!, author),
+    head: groups['head']!,
+    supersedes,
+    digest: groups['declaration_sha']!,
+  };
+}
+
+function matchRosterV1(body: string): RosterMatch {
+  const match = matchProtocol(body, ROSTER_V1_RE, ROSTER_V1_MARKER);
+  if (!match?.groups) {
+    fail('local-review roster record is malformed');
   }
   const author = match.groups['author'] as SupportedEngine;
   return {
+    version: 1,
     author,
     reviewers: parseReviewers(match.groups['reviewers']!, author),
-    contentSha: match.groups['content_sha']!,
+    head: null,
+    supersedes: null,
+    digest: match.groups['content_sha']!,
   };
 }
 
 /**
- * Build the roster marker and its complete comment body.
+ * Build the roster:v2 marker and its complete comment body.
  *
- * The declared reason travels in hashed content for the same reason a finding's
- * prose does: a solo review is a deliberate, attributable choice, and the
- * justification for it must not be silently editable after the fact.
+ * The declared reason travels in the hashed region for the same reason a
+ * finding's prose does: a roster is a deliberate, attributable choice, and the
+ * justification for it must not be silently editable after the fact. In v2 the
+ * declaration travels there too, so the reason cannot be left standing over a
+ * roster it no longer describes.
  */
 export function buildRosterBody(params: {
   author: SupportedEngine;
   reviewers: readonly SupportedEngine[];
+  head: string;
+  supersedes: number | null;
   content: string;
 }): { marker: string; body: string } {
   if (!SUPPORTED_ENGINES.includes(params.author)) {
@@ -113,45 +219,186 @@ export function buildRosterBody(params: {
   }
   validateContentString(params.content);
   validateReviewers(params.reviewers, params.author);
-  const reviewers =
-    params.reviewers.length === 0 ? 'none' : params.reviewers.join(',');
+  requireSha(params.head, 'head');
+  if (
+    params.supersedes !== null &&
+    (!Number.isSafeInteger(params.supersedes) || params.supersedes < 1)
+  ) {
+    fail('supersedes must be a positive comment id');
+  }
+  const reviewers = formatReviewers(params.reviewers);
+  const declarationSha = sha256Text(
+    rosterDigestInput({
+      author: params.author,
+      reviewers,
+      head: params.head,
+      supersedes: params.supersedes,
+      content: params.content,
+    }),
+  );
   const marker =
-    `${ROSTER_V1_MARKER} author=${params.author} reviewers=${reviewers} ` +
-    `content-sha256=${sha256Text(params.content)} -->`;
+    `${ROSTER_V2_MARKER} author=${params.author} reviewers=${reviewers} ` +
+    `head=${params.head} ` +
+    `supersedes=${params.supersedes === null ? 'none' : params.supersedes} ` +
+    `declaration-sha256=${declarationSha} -->`;
   return { marker, body: `${marker}\n${params.content}` };
 }
 
-/** Parse the unique roster from an authenticated actor-owned row set. */
-function readRosterRows(rows: Array<Record<string, unknown>>): RosterReport {
-  const candidates = rows.filter((row) =>
-    String(row['body'] ?? '').includes(ROSTER_V1_MARKER),
-  );
+const ABSENT_ROSTER: RosterReport = {
+  present: false,
+  version: null,
+  author: null,
+  reviewers: [],
+  head: null,
+  commentId: null,
+  supersedes: null,
+  chain: [],
+};
+
+interface RosterCandidate {
+  id: number;
+  match: RosterMatch;
+}
+
+/** Parse every roster-shaped comment in an actor-owned row set. */
+function rosterCandidates(
+  rows: Array<Record<string, unknown>>,
+): RosterCandidate[] {
+  const candidates: RosterCandidate[] = [];
+  for (const row of rows) {
+    const body = String(row['body'] ?? '');
+    if (!body.includes(ROSTER_ANY_MARKER)) {
+      continue;
+    }
+    const match = matchRoster(body);
+    if (match === null || typeof row['id'] !== 'number') {
+      fail('local-review roster record is malformed');
+    }
+    candidates.push({ id: row['id'] as number, match });
+  }
+  return candidates.sort((a, b) => a.id - b.id);
+}
+
+/**
+ * Resolve the effective roster from the append-only supersession chain.
+ *
+ * Modelled on the tier marker: comments are read in chronological order and the
+ * newest accepted link is the effective one, so narrowing a roster is a visible
+ * replacement rather than a silent substitution. Unlike the tier marker this
+ * imposes no ancestry requirement between links. A developer who decides late
+ * that a change no longer needs a second reviewer must be able to record that
+ * in one step, and a rebase must not be able to make that step unreachable.
+ * Hard stops are reserved for genuine ambiguity — a forked or dangling chain,
+ * two candidates in one comment, a forged digest — never for a human changing
+ * their mind.
+ */
+export function resolveRoster(
+  rows: Array<Record<string, unknown>>,
+): RosterReport {
+  const candidates = rosterCandidates(rows);
   if (candidates.length === 0) {
-    return { present: false, author: null, reviewers: [], commentId: null };
+    return ABSENT_ROSTER;
   }
-  if (candidates.length !== 1) {
-    fail('local-review roster is declared more than once');
+  const links = candidates.filter((row) => row.match.version === 2);
+  if (links.length === 0) {
+    return resolveLegacyRoster(candidates);
   }
-  const row = candidates[0]!;
-  const parsed = matchRoster(String(row['body'] ?? ''));
-  if (parsed === null || typeof row['id'] !== 'number') {
-    fail('local-review roster record is malformed');
+
+  const byId = new Map(candidates.map((row) => [row.id, row]));
+  const superseded = new Set<number>();
+  let roots = 0;
+  for (const link of links) {
+    const predecessor = link.match.supersedes;
+    if (predecessor === null) {
+      // The chain opens here. A pull request that already carried a v1 roster
+      // opens its chain by superseding that comment instead, so migrating to
+      // v2 stays one step and leaves the original declaration standing.
+      roots += 1;
+      continue;
+    }
+    const target = byId.get(predecessor);
+    if (target === undefined) {
+      fail(
+        `local-review roster supersedes comment ${predecessor}, which is not a roster on this pull request`,
+      );
+    }
+    if (predecessor >= link.id) {
+      fail('local-review roster supersedes a later declaration');
+    }
+    if (superseded.has(predecessor)) {
+      fail('local-review roster supersession chain forks');
+    }
+    superseded.add(predecessor);
+    if (target.match.version !== 2) {
+      roots += 1;
+    }
   }
+  if (roots !== 1) {
+    fail(
+      roots === 0
+        ? 'local-review roster supersession chain has no first declaration'
+        : 'local-review roster declares more than one supersession chain',
+    );
+  }
+
+  const tips = links.filter((link) => !superseded.has(link.id));
+  if (tips.length !== 1) {
+    fail('local-review roster supersession chain does not resolve to one tip');
+  }
+  const tip = tips[0]!;
+
+  const chain: number[] = [];
+  let cursor: RosterCandidate | undefined = tip;
+  while (cursor !== undefined) {
+    chain.unshift(cursor.id);
+    const predecessor: number | null = cursor.match.supersedes;
+    cursor =
+      predecessor === null
+        ? undefined
+        : candidates.find((row) => row.id === predecessor);
+  }
+  if (chain.length !== candidates.length) {
+    fail('local-review roster supersession chain does not cover every roster');
+  }
+
   return {
     present: true,
-    author: parsed.author,
-    reviewers: parsed.reviewers,
-    commentId: row['id'] as number,
+    version: 2,
+    author: tip.match.author,
+    reviewers: tip.match.reviewers,
+    head: tip.match.head,
+    commentId: tip.id,
+    supersedes: tip.match.supersedes,
+    chain,
   };
 }
 
 /**
- * Read the actor-owned roster declared on a pull request.
+ * Resolve a pull request that carries only pre-v2 rosters.
  *
- * An authenticated actor carries at most one roster. Two conflicting
- * declarations are a contradiction to reject rather than a history to
- * reconcile: every downstream completeness answer depends on which one is
- * authoritative.
+ * v1 has no supersession field, so two of them are a contradiction to reject
+ * rather than a history to order — exactly the rule v1 shipped with. Posting a
+ * v2 roster is what turns that contradiction into an ordered chain.
+ */
+function resolveLegacyRoster(candidates: RosterCandidate[]): RosterReport {
+  if (candidates.length !== 1) {
+    fail('local-review roster is declared more than once');
+  }
+  const only = candidates[0]!;
+  return {
+    present: true,
+    version: 1,
+    author: only.match.author,
+    reviewers: only.match.reviewers,
+    head: null,
+    commentId: only.id,
+    supersedes: null,
+    chain: [only.id],
+  };
+}
+
+/**
+ * Read the effective actor-owned roster declared on a pull request.
  */
 export function readRoster(params: {
   repo: string;
@@ -159,7 +406,7 @@ export function readRoster(params: {
   actor?: string | undefined;
 }): RosterReport {
   assertActor(params.actor);
-  return readRosterRows(getIssueComments(params.repo, params.pr));
+  return resolveRoster(getIssueComments(params.repo, params.pr));
 }
 
 function reconcileConcurrentRoster(
@@ -168,13 +415,13 @@ function reconcileConcurrentRoster(
   body: string,
   postedCommentId: number,
 ): { commentId: number; usedPostedComment: boolean } {
-  const rows = getIssueComments(repo, pr).filter((row) =>
-    String(row['body'] ?? '').includes(ROSTER_V1_MARKER),
+  const rows = getIssueComments(repo, pr).filter(
+    (row) => String(row['body'] ?? '') === body,
   );
-  if (
-    rows.length === 0 ||
-    rows.some((row) => row['body'] !== body || typeof row['id'] !== 'number')
-  ) {
+  if (rows.some((row) => typeof row['id'] !== 'number')) {
+    fail('local-review roster conflicts with concurrent evidence');
+  }
+  if (rows.length === 0) {
     fail('local-review roster conflicts with concurrent evidence');
   }
 
@@ -190,29 +437,70 @@ function reconcileConcurrentRoster(
 }
 
 /**
- * Declare the engines participating in this pull request's review relay.
+ * Declare, or re-declare, the engines participating in this review relay.
  *
  * Participation must be declared rather than inferred. An engine that has not
  * posted an attestation is indistinguishable from an engine that was never
  * going to, so without a declared roster no reader can decide whether a round
  * is complete or merely unfinished.
+ *
+ * Re-declaring is a first-class operation, not a workaround. Posting over an
+ * existing roster appends a link naming the one it replaces, so widening the
+ * roster, narrowing it to a declared solo relay, or simply re-stating it at a
+ * new head are all one deliberate step that leaves the previous declaration
+ * standing on the pull request.
  */
 export function postRoster(params: PostRosterParams): PostRosterResult {
   assertActor(params.actor);
-  const { marker, body } = buildRosterBody({
-    author: params.author,
-    reviewers: params.reviewers,
-    content: params.content,
-  });
+  requireSha(params.head, 'head');
   verifyHead(params.repo, params.pr, params.head);
 
   const rows = getIssueComments(params.repo, params.pr);
-  const existing = findMatchingBody(rows, ROSTER_V1_MARKER, body);
-  let commentId: number;
-  let replayed = existing !== null;
-  let created = existing === null;
+  const existing = resolveRoster(rows);
 
-  if (existing === null) {
+  // Replay is byte-identity with the effective roster, rebuilt against that
+  // roster's own predecessor: re-running an unchanged declaration returns the
+  // comment already posted, while any genuine re-declaration links to the tip
+  // and becomes a new comment. Because `supersedes=` is inside the body, a
+  // re-declaration can never collide with the link it replaces.
+  const replayCandidate =
+    existing.present && existing.version === 2
+      ? buildRosterBody({
+          author: params.author,
+          reviewers: params.reviewers,
+          head: params.head,
+          supersedes: existing.supersedes,
+          content: params.content,
+        })
+      : null;
+  const effectiveBody =
+    existing.commentId === null
+      ? null
+      : (rows.find((row) => row['id'] === existing.commentId)?.['body'] ??
+        null);
+  const isReplay =
+    replayCandidate !== null && effectiveBody === replayCandidate.body;
+
+  const supersedes = isReplay ? existing.supersedes : existing.commentId;
+  const { marker, body } = isReplay
+    ? replayCandidate
+    : buildRosterBody({
+        author: params.author,
+        reviewers: params.reviewers,
+        head: params.head,
+        supersedes,
+        content: params.content,
+      });
+
+  let commentId: number;
+  let replayed = false;
+  let created = false;
+
+  if (isReplay) {
+    commentId = existing.commentId!;
+    replayed = true;
+  } else {
+    created = true;
     try {
       const response = jsonOutput(
         [
@@ -239,10 +527,9 @@ export function postRoster(params: PostRosterParams): PostRosterResult {
         throw error;
       }
     }
-  } else {
-    commentId = existing;
   }
 
+  let chain: number[];
   try {
     if (created) {
       const reconciled = reconcileConcurrentRoster(
@@ -256,10 +543,11 @@ export function postRoster(params: PostRosterParams): PostRosterResult {
       created = reconciled.usedPostedComment;
     }
     verifyIssueComment(params.repo, commentId, body);
-    const roster = readRosterRows(getIssueComments(params.repo, params.pr));
+    const roster = resolveRoster(getIssueComments(params.repo, params.pr));
     if (roster.commentId !== commentId) {
-      fail('could not verify a unique local-review roster after posting');
+      fail('could not verify the effective local-review roster after posting');
     }
+    chain = roster.chain;
     verifyHead(params.repo, params.pr, params.head);
   } catch (error) {
     if (created) {
@@ -282,6 +570,10 @@ export function postRoster(params: PostRosterParams): PostRosterResult {
     comment_id: commentId,
     author: params.author,
     reviewers: [...params.reviewers],
+    head: params.head,
+    supersedes,
+    superseded: supersedes !== null,
+    chain,
     replayed,
     verified: true,
   };
@@ -362,12 +654,17 @@ export function coverageTier(count: number): CoverageTier {
  * The author engine's own pass is reported but never counted. It re-reads a
  * change while still holding the rationale that produced it, which is the
  * opposite of the cold read the relay exists to obtain.
+ *
+ * This reports; it never decides. Nothing here is a merge gate, and nothing
+ * here should become one — a developer who has looked at a change and judged
+ * its review sufficient is always free to ship it. What this owes them is an
+ * accurate record of what actually happened, not a verdict on it.
  */
 export function coverage(params: CoverageParams): CoverageResult {
   assertActor(params.actor);
   verifyHead(params.repo, params.pr, params.head);
   const rows = getIssueComments(params.repo, params.pr);
-  const roster = readRosterRows(rows);
+  const roster = resolveRoster(rows);
   const attested = attestationsAtHead(rows, params.head);
 
   const attestedEngines = [
@@ -384,10 +681,22 @@ export function coverage(params: CoverageParams): CoverageResult {
 
   const authorAttested =
     roster.author !== null && attestedEngines.includes(roster.author);
-  const soloAcknowledged = roster.present && roster.reviewers.length === 0;
+  // A v1 roster names no commit, so it is stale in the only sense that matters:
+  // it says nothing about which code it was declared over.
+  const rosterStale = roster.present && roster.head !== params.head;
+  const soloDeclared = roster.present && roster.reviewers.length === 0;
+  // Solo review with a recorded reason is a legitimate outcome. What has to
+  // hold before a reader repeats that claim is that the record is one the
+  // reader can stand behind: the v2 grammar puts the declaration inside its own
+  // digest, and `head=` binds it to the code it was declared over.
+  const soloAcknowledged = soloDeclared && roster.version === 2 && !rosterStale;
   const report: CoverageResult = {
     head: params.head,
     rosterPresent: roster.present,
+    rosterVersion: roster.version,
+    rosterHead: roster.head,
+    rosterStale,
+    rosterChain: roster.chain,
     author: roster.author,
     reviewers: [...roster.reviewers],
     attestedAtHead: attestedEngines,
@@ -395,11 +704,12 @@ export function coverage(params: CoverageParams): CoverageResult {
     missingReviewers,
     authorAttested,
     tier: coverageTier(nonAuthorAttested.length),
+    soloDeclared,
     soloAcknowledged,
     roundComplete:
       roster.present &&
       missingReviewers.length === 0 &&
-      (!soloAcknowledged || authorAttested),
+      (!soloDeclared || (soloAcknowledged && authorAttested)),
     verified: true,
   };
   verifyHead(params.repo, params.pr, params.head);
@@ -407,11 +717,17 @@ export function coverage(params: CoverageParams): CoverageResult {
 }
 
 /**
- * Compute coverage and refuse an incomplete or unacknowledged relay.
+ * Compute coverage and refuse a ledger that would assert something untrue.
  *
- * Solo review is permitted, but only when it was declared up front with a
- * recorded reason. That keeps the recommendation visible on the pull request
- * instead of resting on whoever remembered it.
+ * Every refusal here is about the record, never about the amount of review. A
+ * declared solo relay passes; what does not pass is a ledger reporting an
+ * acknowledged solo relay on the strength of a declaration that was editable in
+ * place, or one made over different code. Each refusal clears in one deliberate
+ * step — re-post the roster at the current head — and that re-posting is an
+ * ordinary operation, available at any point in a pull request's life.
+ *
+ * This is not a merge gate. It has no authority over whether a change ships,
+ * and must never be wired into branch protection or a required check.
  */
 export function verifyCoverage(params: CoverageParams): CoverageResult {
   const report = coverage(params);
@@ -425,8 +741,21 @@ export function verifyCoverage(params: CoverageParams): CoverageResult {
       `declared reviewers have not attested this head: ${report.missingReviewers.join(', ')}`,
     );
   }
+  if (report.soloDeclared && report.rosterVersion !== 2) {
+    fail(
+      'this solo relay is declared in the roster:v1 grammar, whose declaration sits outside its own hash; ' +
+        're-post it with post-roster to record the same choice as roster:v2 evidence',
+    );
+  }
+  if (report.soloDeclared && report.rosterStale) {
+    fail(
+      `this solo relay was declared at ${report.rosterHead ?? '<no head>'}, not at ${report.head}; ` +
+        're-post it with post-roster --head ' +
+        `${report.head} to declare the same choice over the code that is here now`,
+    );
+  }
   // Solo review is review without a second engine, not the absence of review.
-  // Without this the gate passes on a pull request carrying no attestation at
+  // Without this the report passes on a pull request carrying no attestation at
   // all, because a solo roster has no reviewer that can be missing.
   if (report.soloAcknowledged && !report.authorAttested) {
     fail(
