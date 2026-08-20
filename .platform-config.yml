@@ -149,3 +149,14 @@ allowed_destinations:
   - .github/copilot-instructions.md
   - .github/workflows/dco.yml
   - agent-loop-instructions.md
+
+# Per-file consent for sensitive destinations. `allowed_destinations` bounds
+# where the sync may write; this bounds what may be done to the sensitive
+# files inside that surface, and the two are checked independently.
+#
+# This repo requires DCO sign-off, so it syncs the shared `dco.yml` workflow
+# rather than opting out of it. A workflow runs with this repository's
+# secrets and permissions, so the engine requires the destination be named
+# explicitly before it will overwrite one.
+allow_sensitive_writes:
+  - .github/workflows/dco.yml
