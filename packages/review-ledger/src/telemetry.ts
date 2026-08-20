@@ -33,11 +33,15 @@ import type {
   EmitTelemetryResult,
   SupportedSeverity,
   TelemetryFindings,
+  TelemetryFindingsInput,
   TelemetryLane,
+  TelemetryLaneInput,
   TelemetryOutcomeCounts,
   TelemetryRecord,
   TelemetrySink,
   TelemetryTokenBucket,
+  TelemetryTokenBucketInput,
+  TelemetryPassType,
 } from './types.js';
 
 /**
@@ -232,6 +236,10 @@ function validateChangeset(value: unknown): Changeset {
       source['classifierVersion'],
       'changeset.classifierVersion',
     ),
+    reviewSignificantFiles: requireCount(
+      source['reviewSignificantFiles'],
+      'changeset.reviewSignificantFiles',
+    ),
     files: {
       app: requireCount(files['app'], 'changeset.files.app'),
       test: requireCount(files['test'], 'changeset.files.test'),
@@ -321,7 +329,7 @@ export function telemetryIdempotencyKey(fields: {
   repo: string;
   pr: number;
   engine: string;
-  passType: string;
+  passType: TelemetryPassType;
   round: number;
   headSha: string;
 }): string {
@@ -416,7 +424,9 @@ export function validateTelemetryRecord(value: unknown): TelemetryRecord {
     fail('telemetry tokens must be an array');
   }
   const tokens = rawTokens.map(validateTokenBucket);
-  const models = tokens.map((bucket) => `${bucket.model}:${bucket.effort}`);
+  const models = tokens.map((bucket) =>
+    JSON.stringify([bucket.model, bucket.effort]),
+  );
   if (new Set(models).size !== models.length) {
     fail('telemetry tokens must carry one bucket per model and effort');
   }
@@ -446,11 +456,8 @@ export function validateTelemetryRecord(value: unknown): TelemetryRecord {
   // A skip still burns tokens reading and classifying the pull request, so it
   // is recorded; what it cannot have is reviewable work, since that is what
   // made it a skip.
-  if (
-    status === 'skipped' &&
-    (changeset.files.app > 0 || changeset.files.test > 0)
-  ) {
-    fail('a skipped pass cannot carry application or test files');
+  if (status === 'skipped' && changeset.reviewSignificantFiles > 0) {
+    fail('a skipped pass cannot carry review-significant files');
   }
 
   const idempotencyKey = source['idempotencyKey'];
@@ -512,7 +519,7 @@ export function validateTelemetryRecord(value: unknown): TelemetryRecord {
 }
 
 function tokenBucketFrom(
-  bucket: Partial<TelemetryTokenBucket>,
+  bucket: TelemetryTokenBucketInput,
 ): TelemetryTokenBucket {
   return validateTokenBucket({
     model: bucket.model,
@@ -526,7 +533,7 @@ function tokenBucketFrom(
   });
 }
 
-function laneFrom(lane: Partial<TelemetryLane>): TelemetryLane {
+function laneFrom(lane: TelemetryLaneInput): TelemetryLane {
   return validateLane({
     lens: lane.lens,
     model: lane.model ?? null,
@@ -539,7 +546,7 @@ function laneFrom(lane: Partial<TelemetryLane>): TelemetryLane {
 }
 
 function findingsFrom(
-  findings: Partial<TelemetryFindings> | undefined,
+  findings: TelemetryFindingsInput | undefined,
 ): TelemetryFindings {
   const ladder: Record<string, TelemetryOutcomeCounts> = {};
   for (const severity of SUPPORTED_SEVERITIES) {
@@ -614,6 +621,38 @@ export function buildTelemetryRecord(
   });
 }
 
+/** Project a validated reader record onto the public-safe v1 writer schema. */
+function knownTelemetryRecord(value: unknown): TelemetryRecord {
+  const record = validateTelemetryRecord(value);
+  return {
+    version: record.version,
+    emittedAt: record.emittedAt,
+    repo: record.repo,
+    pr: record.pr,
+    idempotencyKey: record.idempotencyKey,
+    engine: record.engine,
+    engineVersion: record.engineVersion,
+    passType: record.passType,
+    reviewTier: record.reviewTier,
+    trigger: record.trigger,
+    round: record.round,
+    stance: record.stance,
+    status: record.status,
+    baseSha: record.baseSha,
+    headSha: record.headSha,
+    promptStackSha256: record.promptStackSha256,
+    promptStackVersion: record.promptStackVersion,
+    repoInstructionsSha256: record.repoInstructionsSha256,
+    tokenSource: record.tokenSource,
+    tokens: record.tokens,
+    ...(!record.lanes ? {} : { lanes: record.lanes }),
+    truncated: record.truncated,
+    durationSeconds: record.durationSeconds,
+    changeset: record.changeset,
+    findings: record.findings,
+  };
+}
+
 /**
  * Render a record as the comment body that carries it.
  *
@@ -623,11 +662,12 @@ export function buildTelemetryRecord(
  * reader ignores what it does not know.
  */
 export function buildTelemetryBody(record: TelemetryRecord): string {
+  const safeRecord = knownTelemetryRecord(record);
   return [
     TELEMETRY_V1_MARKER,
     '',
     '```json',
-    JSON.stringify(record, null, 2),
+    JSON.stringify(safeRecord, null, 2),
     '```',
   ].join('\n');
 }
@@ -643,12 +683,13 @@ export function matchTelemetry(body: string): TelemetryRecord | null {
   if (!isTelemetryComment(body)) {
     return null;
   }
+  const prefixIndex = body.indexOf(TELEMETRY_MARKER_PREFIX);
+  if (prefixIndex !== body.lastIndexOf(TELEMETRY_MARKER_PREFIX)) {
+    fail('a comment carries more than one local-review telemetry marker');
+  }
   const markerIndex = body.indexOf(TELEMETRY_V1_MARKER);
   if (markerIndex === -1) {
     fail('local-review telemetry record is of an unsupported version');
-  }
-  if (body.indexOf(TELEMETRY_MARKER_PREFIX, markerIndex + 1) !== -1) {
-    fail('a comment carries more than one local-review telemetry marker');
   }
   const payload = body
     .slice(markerIndex + TELEMETRY_V1_MARKER.length)
@@ -689,11 +730,24 @@ export function prCommentSink(target: {
       const rows = getIssueComments(target.repo, target.pr);
       for (const row of rows) {
         const existing = String(row['body'] ?? '');
-        if (!isTelemetryComment(existing)) {
+        if (!existing.includes(TELEMETRY_V1_MARKER)) {
           continue;
         }
-        const parsed = matchTelemetry(existing);
+        let parsed: TelemetryRecord | null;
+        try {
+          parsed = matchTelemetry(existing);
+        } catch {
+          continue;
+        }
         if (parsed?.idempotencyKey === record.idempotencyKey) {
+          const replayRecord = knownTelemetryRecord(parsed);
+          const candidateRecord = knownTelemetryRecord(record);
+          if (
+            JSON.stringify({ ...replayRecord, emittedAt: null }) !==
+            JSON.stringify({ ...candidateRecord, emittedAt: null })
+          ) {
+            fail('telemetry idempotency key conflicts with an existing record');
+          }
           return { sink: 'pr-comment', reference: String(row['id'] ?? '') };
         }
       }

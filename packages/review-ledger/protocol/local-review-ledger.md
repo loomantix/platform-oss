@@ -211,8 +211,8 @@ the shared definition for the pinned `<base-sha>..<head-sha>` review range:
   when their extension is `.yml`, `.yaml`, `.json`, or `.toml`.
 - **Anything else** — treat as source.
 
-Zero source files means skip; one or more means run the full pass. A mixed
-changeset is not a partial skip.
+Zero review-significant files means skip; one or more means run the full pass.
+A mixed changeset is not a partial skip.
 
 The rules above are executable: `review-ledger classify-changeset --base <sha>
 --head <sha>` returns `skip` alongside per-file classifications, and every lane
@@ -791,17 +791,17 @@ extension of the attestation. The attestation body is byte-verified and hashed;
 a telemetry defect must never fail a review that found real defects. For the
 same reason emission failure is logged and skipped, never raised.
 
-The record carries enumerated fields and integers only — no finding titles, no
-file paths, no summaries — so it is publishable on a public repository as
-evidence the review chain ran. It never carries money: rates move, and on a
+The record writer emits known enumerated fields and integers only — no finding
+titles, file paths, or summaries — so its output is publishable on a public
+repository as evidence the review chain ran. It never carries money: rates move, and on a
 subscription plan the marginal cost of a pass is zero, so tokens are stored and
 priced downstream against a dated table.
 
 Two rules bind readers:
 
-- **A pass must not read prior telemetry.** Markers are excluded from the
-  ledger read a reviewer performs, and no reviewer prompt, packet, or context
-  assembly may include them. Visible history and a readable trend are what turn
+- **A pass must not read prior telemetry.** The caller must exclude markers
+  from the ledger read a reviewer performs, and no reviewer prompt, packet, or
+  context assembly may include them. Visible history and a readable trend are what turn
   a cost measurement into a target to optimise toward. Filter on the marker
   prefix, not on an allowlist of known markers, so a record type added later is
   excluded by default.

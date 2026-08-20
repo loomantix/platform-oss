@@ -98,4 +98,26 @@ describe('CLI command parser and execution', () => {
       ]),
     ).toThrowError(/--expected-result-sha256/);
   });
+
+  it.each([
+    ['emit-telemetry', '--unknown'],
+    ['emit-telemetry', '--round', '0'],
+    ['emit-telemetry', '--head', 'not-a-sha'],
+    ['emit-telemetry', '--repo'],
+  ])(
+    'reports telemetry parse and validation failures without throwing',
+    (...argv) => {
+      const stdoutSpy = vi
+        .spyOn(process.stdout, 'write')
+        .mockImplementation(() => true);
+      try {
+        expect(runCli(argv)).toBe(0);
+        expect(stdoutSpy).toHaveBeenCalledWith(
+          expect.stringMatching(/"emitted":false/),
+        );
+      } finally {
+        stdoutSpy.mockRestore();
+      }
+    },
+  );
 });

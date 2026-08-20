@@ -271,6 +271,17 @@ describe('validateTelemetryRecord', () => {
       cacheHitRatio: 0.94,
     }) as TelemetryRecord & { cacheHitRatio?: number };
     expect(forward.cacheHitRatio).toBe(0.94);
+    expect(buildTelemetryBody(forward)).not.toContain('cacheHitRatio');
+  });
+
+  it('refuses to render a record with the wrong protocol discriminator', () => {
+    const record = buildTelemetryRecord(params());
+    expect(() =>
+      buildTelemetryBody({
+        ...record,
+        version: 2,
+      } as unknown as TelemetryRecord),
+    ).toThrow(/version must be 1/);
   });
 
   it('rejects a timestamp that is not an RFC 3339 UTC second', () => {
@@ -331,8 +342,15 @@ describe('validateTelemetryRecord', () => {
     expect(skipped.tokens[0]?.input).toBe(8_000);
 
     expect(() => buildTelemetryRecord(params({ status: 'skipped' }))).toThrow(
-      /skipped pass cannot carry application or test files/,
+      /skipped pass cannot carry review-significant files/,
     );
+
+    const lockfile = classifyFiles([
+      { path: 'pnpm-lock.yaml', added: 10, deleted: 2 },
+    ]).changeset;
+    expect(() =>
+      buildTelemetryRecord(params({ status: 'skipped', changeset: lockfile })),
+    ).toThrow(/skipped pass cannot carry review-significant files/);
   });
 
   it('rejects two buckets for the same model and effort', () => {
@@ -346,6 +364,20 @@ describe('validateTelemetryRecord', () => {
         }),
       ),
     ).toThrow(/one bucket per model and effort/);
+  });
+
+  it('does not collide distinct model and effort token pairs', () => {
+    const record = buildTelemetryRecord(
+      params({
+        tokens: [
+          { model: 'a:b', effort: 'c', input: 1 },
+          { model: 'a', effort: 'b:c', input: 1 },
+          { model: 'a', effort: 'null', input: 1 },
+          { model: 'a', effort: null, input: 1 },
+        ],
+      }),
+    );
+    expect(record.tokens).toHaveLength(4);
   });
 });
 
@@ -377,6 +409,12 @@ describe('marker body', () => {
   it('fails on two telemetry markers in one comment', () => {
     const record = buildTelemetryRecord(params());
     const body = `${buildTelemetryBody(record)}\n${buildTelemetryBody(record)}`;
+    expect(() => matchTelemetry(body)).toThrow(/more than one/);
+  });
+
+  it('fails when an unsupported marker precedes a v1 marker', () => {
+    const record = buildTelemetryRecord(params());
+    const body = `<!-- local-review-telemetry:v2 -->\n${buildTelemetryBody(record)}`;
     expect(() => matchTelemetry(body)).toThrow(/more than one/);
   });
 });
@@ -488,5 +526,42 @@ describe('prCommentSink', () => {
     const nextRound = buildTelemetryRecord(params({ round: 4 }));
     emitTelemetry({ record: nextRound, sink });
     expect(runner.posts).toBe(2);
+  });
+
+  it('reports a same-key record whose measurements conflict', () => {
+    const runner = new MockRunner();
+    setGitHubRunner(runner);
+    const sink = prCommentSink({ repo: 'owner/repo', pr: 123 });
+    expect(emitTelemetry({ record, sink }).emitted).toBe(true);
+
+    const conflict = buildTelemetryRecord(params({ durationSeconds: 999 }));
+    expect(emitTelemetry({ record: conflict, sink })).toMatchObject({
+      emitted: false,
+      error: expect.stringMatching(/idempotency key conflicts/),
+    });
+    expect(runner.posts).toBe(1);
+  });
+
+  it('ignores malformed and future records while looking for a replay', () => {
+    const runner = new MockRunner();
+    runner.issueComments.push(
+      {
+        id: 700,
+        user: { login: runner.actor },
+        body: '<!-- local-review-telemetry:v1 -->\nnot-json',
+      },
+      {
+        id: 701,
+        user: { login: runner.actor },
+        body: '<!-- local-review-telemetry:v2 -->\n{}',
+      },
+    );
+    setGitHubRunner(runner);
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+    expect(result.emitted).toBe(true);
+    expect(runner.posts).toBe(1);
   });
 });

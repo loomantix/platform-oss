@@ -13,6 +13,12 @@ import {
   SUPPORTED_OUTCOMES,
   SUPPORTED_SEVERITIES,
   SUPPORTED_SIDES,
+  TELEMETRY_PASS_TYPES,
+  TELEMETRY_REVIEW_TIERS,
+  TELEMETRY_STANCES,
+  TELEMETRY_STATUSES,
+  TELEMETRY_TOKEN_SOURCES,
+  TELEMETRY_TRIGGERS,
 } from './constants.js';
 import { fail } from './errors.js';
 import { assertRegularFile, parseJsonOrFail } from './io.js';
@@ -53,13 +59,13 @@ import type {
   ChangesetReport,
   EmitTelemetryResult,
   ReviewFinding,
-  TelemetryFindings,
-  TelemetryLane,
+  TelemetryFindingsInput,
+  TelemetryLaneInput,
   TelemetryPassType,
   TelemetryReviewTier,
   TelemetryStance,
   TelemetryStatus,
-  TelemetryTokenBucket,
+  TelemetryTokenBucketInput,
   TelemetryTokenSource,
   TelemetryTrigger,
   SupportedClassification,
@@ -116,12 +122,12 @@ interface CliArgs {
    */
   engineRaw?: string | undefined;
   engineVersion?: string | undefined;
-  passType?: string | undefined;
-  reviewTier?: string | undefined;
-  trigger?: string | undefined;
-  stance?: string | undefined;
-  status?: string | undefined;
-  tokenSource?: string | undefined;
+  passType?: TelemetryPassType | undefined;
+  reviewTier?: TelemetryReviewTier | undefined;
+  trigger?: TelemetryTrigger | undefined;
+  stance?: TelemetryStance | undefined;
+  status?: TelemetryStatus | undefined;
+  tokenSource?: TelemetryTokenSource | undefined;
   tokensFile?: string | undefined;
   lanesFile?: string | undefined;
   findingsFile?: string | undefined;
@@ -329,22 +335,26 @@ function parseCliArgs(argv: string[]): CliArgs {
         args.engineVersion = parseVal(arg);
         break;
       case '--pass-type':
-        args.passType = parseVal(arg);
+        args.passType = parseEnum(arg, parseVal(arg), TELEMETRY_PASS_TYPES);
         break;
       case '--review-tier':
-        args.reviewTier = parseVal(arg);
+        args.reviewTier = parseEnum(arg, parseVal(arg), TELEMETRY_REVIEW_TIERS);
         break;
       case '--trigger':
-        args.trigger = parseVal(arg);
+        args.trigger = parseEnum(arg, parseVal(arg), TELEMETRY_TRIGGERS);
         break;
       case '--stance':
-        args.stance = parseVal(arg);
+        args.stance = parseEnum(arg, parseVal(arg), TELEMETRY_STANCES);
         break;
       case '--status':
-        args.status = parseVal(arg);
+        args.status = parseEnum(arg, parseVal(arg), TELEMETRY_STATUSES);
         break;
       case '--token-source':
-        args.tokenSource = parseVal(arg);
+        args.tokenSource = parseEnum(
+          arg,
+          parseVal(arg),
+          TELEMETRY_TOKEN_SOURCES,
+        );
         break;
       case '--tokens-file':
         args.tokensFile = parseVal(arg);
@@ -547,8 +557,17 @@ function validateArgs(args: CliArgs): void {
 /**
  * Parse argv, dispatch the requested subcommand, and return an exit code.
  */
-export function runCli(argv: string[] = process.argv.slice(2)): number {
-  resetGitHubRunner();
+function telemetryFailure(error: unknown): EmitTelemetryResult {
+  return {
+    emitted: false,
+    sink: null,
+    reference: null,
+    idempotencyKey: null,
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+function runCliCommand(argv: string[]): number {
   const args = parseCliArgs(argv);
 
   if (args.version) {
@@ -977,27 +996,29 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
           idempotencyKey: args.idempotencyKey,
           engine: args.engineRaw,
           engineVersion: args.engineVersion ?? null,
-          passType: args.passType as TelemetryPassType,
-          reviewTier: (args.reviewTier ?? null) as TelemetryReviewTier | null,
-          trigger: args.trigger as TelemetryTrigger,
+          passType: args.passType,
+          reviewTier: args.reviewTier ?? null,
+          trigger: args.trigger,
           round: args.round,
-          stance: args.stance as TelemetryStance,
-          status: args.status as TelemetryStatus,
+          stance: args.stance,
+          status: args.status,
           baseSha: args.base,
           headSha: args.head,
           promptStackSha256: args.promptStackSha256 ?? null,
           promptStackVersion: args.promptStackVersion ?? null,
           repoInstructionsSha256: args.repoInstructionsSha256 ?? null,
-          tokenSource: args.tokenSource as TelemetryTokenSource,
+          tokenSource: args.tokenSource,
           tokens: args.tokensFile
-            ? (readJsonArray(args.tokensFile, 'tokens file') as Array<
-                Partial<TelemetryTokenBucket>
-              >)
+            ? (readJsonArray(
+                args.tokensFile,
+                'tokens file',
+              ) as TelemetryTokenBucketInput[])
             : [],
           lanes: args.lanesFile
-            ? (readJsonArray(args.lanesFile, 'lanes file') as Array<
-                Partial<TelemetryLane>
-              >)
+            ? (readJsonArray(
+                args.lanesFile,
+                'lanes file',
+              ) as TelemetryLaneInput[])
             : undefined,
           truncated: args.truncated === true,
           durationSeconds: parseDurationSeconds(args.durationSeconds),
@@ -1006,7 +1027,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
             ? (readJsonFile(
                 args.findingsFile,
                 'findings file',
-              ) as Partial<TelemetryFindings>)
+              ) as TelemetryFindingsInput)
             : undefined,
         });
 
@@ -1020,13 +1041,7 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
           sink: prCommentSink({ repo: args.repo, pr: args.pr }),
         });
       } catch (error) {
-        outcome = {
-          emitted: false,
-          sink: null,
-          reference: null,
-          idempotencyKey: null,
-          error: error instanceof Error ? error.message : String(error),
-        };
+        outcome = telemetryFailure(error);
       }
       writeSortedJson(outcome);
       break;
@@ -1071,4 +1086,20 @@ export function runCli(argv: string[] = process.argv.slice(2)): number {
   }
 
   return 0;
+}
+
+/**
+ * Parse argv, dispatch the requested subcommand, and return an exit code.
+ */
+export function runCli(argv: string[] = process.argv.slice(2)): number {
+  resetGitHubRunner();
+  if (argv[0] !== 'emit-telemetry') {
+    return runCliCommand(argv);
+  }
+  try {
+    return runCliCommand(argv);
+  } catch (error) {
+    writeSortedJson(telemetryFailure(error));
+    return 0;
+  }
 }

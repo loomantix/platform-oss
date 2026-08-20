@@ -25,6 +25,8 @@ describe('classifyPath', () => {
     ['handbook/onboarding.md', 'docsConfig', false],
     ['.gitignore', 'docsConfig', false],
     ['src/payloads/claim.fixture.ts', 'docsConfig', false],
+    ['fixtures/sample.json', 'docsConfig', false],
+    ['src/fixtures/sample.json', 'docsConfig', false],
     ['pnpm-lock.yaml', 'generated', true],
     ['packages/x/dist/index.js', 'generated', false],
     ['vendor/review-ledger.bundle.js', 'generated', false],
@@ -141,6 +143,17 @@ describe('classifyFiles', () => {
       classifyFiles([{ path: 'src/a.ts', added: 1, deleted: 0, blank: 2 }]),
     ).toThrow(/invalid blank count/);
   });
+
+  it.each([
+    { added: -1, deleted: 2 },
+    { added: 2, deleted: -1 },
+    { added: 0.5, deleted: 1 },
+    { added: 1, deleted: Number.MAX_SAFE_INTEGER + 1 },
+  ])('rejects invalid component churn counts: %o', ({ added, deleted }) => {
+    expect(() => classifyFiles([{ path: 'src/a.ts', added, deleted }])).toThrow(
+      /invalid churn count/,
+    );
+  });
 });
 
 describe('parseDiffPatch', () => {
@@ -222,6 +235,20 @@ describe('parseDiffPatch', () => {
     ].join('\n');
     expect(parseDiffPatch(patch)).toEqual([
       { path: 'a.txt', added: 1, deleted: 1, blank: 0 },
+    ]);
+  });
+
+  it('does not parse header-like hunk content as file metadata', () => {
+    const patch = [
+      'diff --git a/src/query.sql b/src/query.sql',
+      '--- a/src/query.sql',
+      '+++ b/src/query.sql',
+      '@@ -1 +1 @@',
+      '--- README.md',
+      '+++ not-a-header',
+    ].join('\n');
+    expect(parseDiffPatch(patch)).toEqual([
+      { path: 'src/query.sql', added: 1, deleted: 1, blank: 0 },
     ]);
   });
 });

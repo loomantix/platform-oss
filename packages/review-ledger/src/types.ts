@@ -615,7 +615,7 @@ export interface ChangedFile {
   path: string;
   added: number;
   deleted: number;
-  /** Blank-line churn, or null when the caller could not measure it. */
+  /** Blank-line churn; absent or null is conservatively counted as zero. */
   blank?: number | null | undefined;
 }
 
@@ -642,6 +642,8 @@ export interface ChangesetLines {
 /** The changeset a telemetry record carries. */
 export interface Changeset {
   classifierVersion: number;
+  /** Files whose classification requires a review lane to run. */
+  reviewSignificantFiles: number;
   files: Record<ChangesetClass, number>;
   linesChanged: ChangesetLines;
   linesByLanguage: Record<string, number>;
@@ -739,6 +741,38 @@ export interface TelemetryFindings {
   chainInducedRegressions: number;
 }
 
+/** Caller input for one token bucket; only measured fields may be omitted. */
+export interface TelemetryTokenBucketInput {
+  model: string;
+  effort?: string | null | undefined;
+  input?: number | null | undefined;
+  output?: number | null | undefined;
+  cacheRead?: number | null | undefined;
+  cacheWrite?: number | null | undefined;
+  reasoning?: number | null | undefined;
+  providerBuckets?: Record<string, number> | undefined;
+}
+
+/** Caller input for one lane; the lane identity is always required. */
+export interface TelemetryLaneInput {
+  lens: string;
+  model?: string | null | undefined;
+  input?: number | null | undefined;
+  output?: number | null | undefined;
+  cacheRead?: number | null | undefined;
+  cacheWrite?: number | null | undefined;
+  reasoning?: number | null | undefined;
+}
+
+/** Caller input for finding totals, whose omitted counts default to zero. */
+export interface TelemetryFindingsInput {
+  posted?: number | undefined;
+  bySeverityAndOutcome?:
+    | Partial<Record<SupportedSeverity, Partial<TelemetryOutcomeCounts>>>
+    | undefined;
+  chainInducedRegressions?: number | undefined;
+}
+
 /**
  * One review pass, measured.
  *
@@ -747,7 +781,7 @@ export interface TelemetryFindings {
  * which it can only be if nothing in it can carry prose.
  */
 export interface TelemetryRecord {
-  version: number;
+  version: 1;
   emittedAt: string;
   repo: string;
   pr: number;
@@ -801,12 +835,12 @@ export interface BuildTelemetryParams {
   promptStackVersion?: string | null | undefined;
   repoInstructionsSha256?: string | null | undefined;
   tokenSource: TelemetryTokenSource;
-  tokens?: readonly Partial<TelemetryTokenBucket>[] | undefined;
-  lanes?: readonly Partial<TelemetryLane>[] | undefined;
+  tokens?: readonly TelemetryTokenBucketInput[] | undefined;
+  lanes?: readonly TelemetryLaneInput[] | undefined;
   truncated: boolean;
   durationSeconds?: number | null | undefined;
   changeset: Changeset;
-  findings?: Partial<TelemetryFindings> | undefined;
+  findings?: TelemetryFindingsInput | undefined;
 }
 
 /**

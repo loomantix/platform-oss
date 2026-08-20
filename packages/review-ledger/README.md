@@ -262,9 +262,9 @@ properties are load-bearing:
   and the command still exits 0.
 
 Records are written, never read back into a review: a pass must not see prior
-telemetry. Readers exclude them by marker prefix — `isTelemetryComment` and
-`excludeTelemetryComments` — so a record type added later is excluded by
-default rather than leaking into reviewer context until someone notices.
+telemetry. Callers must exclude them by marker prefix with
+`isTelemetryComment` or `excludeTelemetryComments`, so a record type added
+later is excluded without teaching the caller each versioned marker.
 
 ### Reconcile & Verify Ledger
 

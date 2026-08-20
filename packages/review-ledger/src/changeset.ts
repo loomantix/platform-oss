@@ -283,7 +283,11 @@ function isTest(path: string, name: string): boolean {
 }
 
 function isFixture(path: string, name: string): boolean {
-  return /\.fixture\.[^.]+$/.test(name) || path.includes('/fixtures/');
+  return (
+    /\.fixture\.[^.]+$/.test(name) ||
+    path.startsWith('fixtures/') ||
+    path.includes('/fixtures/')
+  );
 }
 
 function isConfig(path: string, name: string, extension: string): boolean {
@@ -371,6 +375,7 @@ export function classifyPath(
 function emptyChangeset(): Changeset {
   return {
     classifierVersion: CHANGESET_CLASSIFIER_VERSION,
+    reviewSignificantFiles: 0,
     files: { app: 0, test: 0, docsConfig: 0, generated: 0 },
     linesChanged: {
       app: 0,
@@ -403,20 +408,23 @@ export function classifyFiles(
 ): ChangesetReport {
   const changeset = emptyChangeset();
   const classifications: FileClassification[] = [];
-  let reviewSignificantFiles = 0;
-
   for (const file of files) {
     const classification = classifyPath(file.path, options);
     classifications.push(classification);
     if (classification.reviewSignificant) {
-      reviewSignificantFiles += 1;
+      changeset.reviewSignificantFiles += 1;
     }
     changeset.files[classification.class] += 1;
 
-    const churn = file.added + file.deleted;
-    if (!Number.isSafeInteger(churn) || churn < 0) {
+    if (
+      !Number.isSafeInteger(file.added) ||
+      file.added < 0 ||
+      !Number.isSafeInteger(file.deleted) ||
+      file.deleted < 0
+    ) {
       fail(`changed file ${file.path} reports an invalid churn count`);
     }
+    const churn = file.added + file.deleted;
     const blank = file.blank ?? 0;
     if (!Number.isSafeInteger(blank) || blank < 0 || blank > churn) {
       fail(`changed file ${file.path} reports an invalid blank count`);
@@ -440,8 +448,8 @@ export function classifyFiles(
   return {
     changeset,
     classifications,
-    reviewSignificantFiles,
-    skip: reviewSignificantFiles === 0,
+    reviewSignificantFiles: changeset.reviewSignificantFiles,
+    skip: changeset.reviewSignificantFiles === 0,
   };
 }
 
@@ -555,14 +563,14 @@ export function parseDiffPatch(patch: string): ChangedFile[] {
     if (current === null) {
       continue;
     }
-    if (rawLine.startsWith('--- ')) {
+    if (!inHunk && rawLine.startsWith('--- ')) {
       const left = stripSide(rawLine.slice(4).trim());
       if (left !== null) {
         current.path = left;
       }
       continue;
     }
-    if (rawLine.startsWith('+++ ')) {
+    if (!inHunk && rawLine.startsWith('+++ ')) {
       const right = stripSide(rawLine.slice(4).trim());
       if (right !== null) {
         current.path = right;
