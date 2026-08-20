@@ -366,6 +366,17 @@ describe('resolveRoster', () => {
     });
   });
 
+  it('does not share mutable arrays between absent reports', () => {
+    const first = readRoster({ repo: 'o/r', pr: 1 });
+    first.reviewers.push('codex');
+    first.chain.push(500);
+
+    expect(readRoster({ repo: 'o/r', pr: 1 })).toMatchObject({
+      reviewers: [],
+      chain: [],
+    });
+  });
+
   it('resolves the newest link of a supersession chain', () => {
     const first = declareRoster('claude', ['codex', 'gemini']);
     const second = declareRoster('claude', ['codex'], { supersedes: first });

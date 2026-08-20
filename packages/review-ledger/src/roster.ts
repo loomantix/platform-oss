@@ -244,16 +244,18 @@ export function buildRosterBody(params: {
   return { marker, body: `${marker}\n${params.content}` };
 }
 
-const ABSENT_ROSTER: RosterReport = {
-  present: false,
-  version: null,
-  author: null,
-  reviewers: [],
-  head: null,
-  commentId: null,
-  supersedes: null,
-  chain: [],
-};
+function absentRoster(): RosterReport {
+  return {
+    present: false,
+    version: null,
+    author: null,
+    reviewers: [],
+    head: null,
+    commentId: null,
+    supersedes: null,
+    chain: [],
+  };
+}
 
 interface RosterCandidate {
   id: number;
@@ -297,7 +299,7 @@ export function resolveRoster(
 ): RosterReport {
   const candidates = rosterCandidates(rows);
   if (candidates.length === 0) {
-    return ABSENT_ROSTER;
+    return absentRoster();
   }
   const links = candidates.filter((row) => row.match.version === 2);
   if (links.length === 0) {
@@ -352,10 +354,7 @@ export function resolveRoster(
   while (cursor !== undefined) {
     chain.unshift(cursor.id);
     const predecessor: number | null = cursor.match.supersedes;
-    cursor =
-      predecessor === null
-        ? undefined
-        : candidates.find((row) => row.id === predecessor);
+    cursor = predecessor === null ? undefined : byId.get(predecessor);
   }
   if (chain.length !== candidates.length) {
     fail('local-review roster supersession chain does not cover every roster');

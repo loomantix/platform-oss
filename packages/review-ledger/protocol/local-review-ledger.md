@@ -145,8 +145,10 @@ assert something untrue about what happened. Both report a tier over distinct
 - a solo relay was declared at a commit other than this one;
 - a declared solo relay carries no attestation from the author engine.
 
-Each of those clears in one deliberate step — post the roster at the current
-head — and that step is available at any point in a pull request's life.
+Missing or stale roster evidence clears in one `post-roster` step at the current
+head, available at any point in a pull request's life. Missing review evidence
+clears when the named engine posts its attestation, or when the developer
+deliberately re-declares the roster to reflect the review they judge sufficient.
 
 **Neither command is a merge gate.** The ledger records evidence; it holds no
 authority over whether a change ships. Do not wire `verify-coverage` into branch
