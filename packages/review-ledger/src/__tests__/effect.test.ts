@@ -98,6 +98,63 @@ describe('classifyRangeEffect', () => {
     expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
   });
 
+  it('treats every engine prompt directory as source, not just its own', () => {
+    // This helper is vendored into each engine repo, so a rule naming only the
+    // reading engine would make the same SKILL edit inert in the other two.
+    for (const path of [
+      '.claude/skills/critique/SKILL.md',
+      '.codex/skills/critique/SKILL.md',
+      '.agents/skills/critique/SKILL.md',
+      '.codex/references/local-review-ledger.md',
+    ]) {
+      withDiff(`M\t${path}`);
+      expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+    }
+  });
+
+  it('treats executing config as source whatever extension it wears', () => {
+    // A workflow is `.yml` and a manifest is `.json`. Reading them as inert
+    // config would let a rewritten pipeline or a bumped dependency attest
+    // `minor`, so the other engine never re-reads the new head.
+    for (const path of [
+      '.github/workflows/ci.yml',
+      '.github/actions/setup/action.yml',
+      '.github/CODEOWNERS',
+      'package.json',
+      'pnpm-lock.yaml',
+      'package-lock.json',
+    ]) {
+      withDiff(`M\t${path}`);
+      expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+    }
+
+    // Deleting one is not inert either.
+    withDiff('D\t.github/workflows/publish.yml');
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+  });
+
+  it('still reads a script under docs/ with the comment prover', () => {
+    // A `docs/` segment is not a blanket answer for something that executes.
+    withDiff('M\tdocs/scripts/bootstrap.sh', {
+      'docs/scripts/bootstrap.sh': [
+        '@@ -4 +4 @@',
+        '-rm -rf "$target"',
+        '+rm -rf "$target" "$cache"',
+      ].join('\n'),
+    });
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+
+    // ...and a comment-only edit to that same script is still inert.
+    withDiff('M\tdocs/scripts/bootstrap.sh', {
+      'docs/scripts/bootstrap.sh': [
+        '@@ -4 +4 @@',
+        '-# clears the build cache',
+        '+# clears the build cache and the target dir',
+      ].join('\n'),
+    });
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe('non-behavioral');
+  });
+
   it('treats a marker hidden in a string as code', () => {
     withDiff('M\tscripts/deploy.sh', {
       'scripts/deploy.sh': [

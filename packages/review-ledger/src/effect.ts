@@ -14,10 +14,14 @@ export type RangeEffect = 'behavioral' | 'non-behavioral';
  * Extensions the review chain treats as documentation, configuration, or
  * fixture data rather than as source.
  *
- * This mirrors the changeset classification in the review workflow, with one
- * consequence worth stating: paths under `.claude/` are source whatever their
- * extension, because the model reads them as instructions. A prompt edit is a
- * behavioral change and must not reach `non-behavioral` through this set.
+ * This mirrors the changeset classification in the review workflow, with two
+ * consequences worth stating. Paths under an engine's prompt directory are
+ * source whatever their extension, because the model reads them as
+ * instructions. And a path whose content executes — a workflow, a manifest, a
+ * lockfile, a review-gating owners file — is not configuration in the inert
+ * sense this set means, whatever its extension. Both are excluded below, and
+ * both then fail closed: `.md`, `.yml`, and `.json` have no comment syntax
+ * registered, so the per-path prover cannot clear them either.
  */
 const DOCS_CONFIG_EXTENSIONS: ReadonlySet<string> = new Set([
   '.md',
@@ -37,13 +41,38 @@ const DOCS_CONFIG_BASENAMES: ReadonlySet<string> = new Set([
   'NOTICE',
   'CHANGELOG',
   'README',
-  'CODEOWNERS',
   '.gitignore',
   '.gitattributes',
   '.env.example',
 ]);
 
-const PROMPT_SURFACE_RE = /(^|\/)\.claude\//;
+/**
+ * Prompt directories, one per engine in the relay.
+ *
+ * This helper is vendored into every engine repo, so naming only the engine
+ * that happens to be reading is what lets the same Markdown edit be source in
+ * one repo and inert in the next. The list is the set of prompt roots, not the
+ * current engine's.
+ */
+const PROMPT_SURFACE_RE = /(^|\/)\.(claude|codex|agents)\//;
+
+/**
+ * Paths whose content executes, decides what executes, or decides who must
+ * review it — regardless of the extension they wear.
+ *
+ * A workflow is `.yml` and a manifest is `.json`, so the docs/config extension
+ * set would otherwise swallow both and call a rewritten pipeline or a bumped
+ * dependency inert. These are the same paths the sync engine refuses to write
+ * without per-file consent, for the same reason: content here controls what
+ * runs in the repo, what the build installs, or who has to approve it.
+ */
+const EXECUTING_PATH_RES: readonly RegExp[] = [
+  /(^|\/)\.github\/workflows\//,
+  /(^|\/)\.github\/actions\//,
+  /(^|\/)CODEOWNERS$/,
+  /(^|\/)package\.json$/,
+  /(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$/,
+];
 
 const DOCS_DIR_RE = /(^|\/)docs\//;
 
@@ -115,11 +144,19 @@ function isPromptSurface(path: string): boolean {
   return PROMPT_SURFACE_RE.test(`/${path}`);
 }
 
+function isExecutingPath(path: string): boolean {
+  return EXECUTING_PATH_RES.some((pattern) => pattern.test(`/${path}`));
+}
+
 function isDocsOrConfig(path: string): boolean {
-  if (isPromptSurface(path)) {
+  if (isPromptSurface(path) || isExecutingPath(path)) {
     return false;
   }
-  if (DOCS_DIR_RE.test(`/${path}`)) {
+  // A `docs/` segment is only a blanket answer for paths the comment prover
+  // cannot read anyway. A script that lives under `docs/` still executes, so
+  // let rule 2 decide it: a comment-only edit there is still inert, an edit to
+  // one of its statements is not.
+  if (DOCS_DIR_RE.test(`/${path}`) && !COMMENT_SYNTAX.has(extensionOf(path))) {
     return true;
   }
   const base = basenameOf(path);
@@ -130,7 +167,8 @@ function isDocsOrConfig(path: string): boolean {
 }
 
 function isTestPath(path: string): boolean {
-  if (isPromptSurface(path)) {
+  // An executing path does not become inert by sitting under a test directory.
+  if (isPromptSurface(path) || isExecutingPath(path)) {
     return false;
   }
   return TEST_PATH_RES.some((pattern) => pattern.test(`/${path}`));
