@@ -192,13 +192,6 @@ function resolveChangesetReport(args: CliArgs): ChangesetReport {
   return classifyRange({ base: args.base, head: args.head, options });
 }
 
-/**
- * Current time as the record's RFC 3339 UTC second.
- *
- * Sub-second precision is noise a review pass cannot support, and trimming it
- * here keeps every emitted timestamp one shape for the join to a dated rate
- * table downstream.
- */
 function parseDurationSeconds(raw: string | undefined): number | null {
   if (raw === undefined) {
     return null;
@@ -228,6 +221,13 @@ function normalizeChangesetInput(value: unknown): Changeset {
   return source as unknown as Changeset;
 }
 
+/**
+ * Current time as the record's RFC 3339 UTC second.
+ *
+ * Sub-second precision is noise a review pass cannot support, and trimming it
+ * here keeps every emitted timestamp one shape for the join to a dated rate
+ * table downstream.
+ */
 function nowUtcSecond(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 }

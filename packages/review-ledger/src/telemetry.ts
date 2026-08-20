@@ -18,7 +18,7 @@ import {
   TOKEN_RE,
   UTC_TIMESTAMP_RE,
 } from './constants.js';
-import { fail, LedgerError } from './errors.js';
+import { fail } from './errors.js';
 import {
   getIssueComments,
   getPostedCommentId,
@@ -505,9 +505,6 @@ export function validateTelemetryRecord(value: unknown): TelemetryRecord {
     changeset,
     findings: validateFindings(source['findings']),
   };
-  if (lanes === undefined) {
-    delete validated['lanes'];
-  }
   // The cast is over the unknown-keyed carrier, not over the contract: every
   // field the interface declares has just been checked above, and the extras
   // that survive are the forward-compatible ones a newer writer added.
@@ -741,10 +738,7 @@ export function emitTelemetry(params: {
       error: null,
     };
   } catch (error) {
-    const message =
-      error instanceof LedgerError || error instanceof Error
-        ? error.message
-        : String(error);
+    const message = error instanceof Error ? error.message : String(error);
     return {
       emitted: false,
       sink: sink.name,

@@ -10,14 +10,12 @@ import {
   prCommentSink,
   telemetryIdempotencyKey,
   validateTelemetryRecord,
+  type BuildTelemetryParams,
+  type GitHubRunner,
+  type TelemetryRecord,
+  type TelemetrySink,
 } from '../index.js';
 import { resetGitHubRunner, setGitHubRunner } from '../github.js';
-import type {
-  BuildTelemetryParams,
-  GitHubRunner,
-  TelemetryRecord,
-  TelemetrySink,
-} from '../types.js';
 
 const BASE = '2'.repeat(40);
 const HEAD = '1'.repeat(40);
