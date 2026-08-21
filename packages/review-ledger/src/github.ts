@@ -82,6 +82,14 @@ export class DefaultGitHubRunner implements GitHubRunner {
     return this.cachedActor;
   }
 
+  /**
+   * Resolve the actor bypassing the cache.
+   *
+   * An explicit pin outranks the session, so an `actorOverride` is returned
+   * without a lookup. That is deliberate, and it means a runner constructed
+   * with an actor performs no live check at all — seeding an actor disables
+   * rotation detection.
+   */
   liveActor(): string {
     if (this.actorOverride !== null) {
       return this.actorOverride;
@@ -266,11 +274,17 @@ function assertActorPins(login: string, expected?: string): string {
   if (!login) {
     fail('GitHub returned an empty authenticated user');
   }
-  const environmentActor = process.env[EXPECTED_ACTOR_ENV];
-  if (environmentActor && login !== environmentActor) {
-    fail(
-      `authenticated GitHub actor changed: expected ${environmentActor}, found ${login}`,
-    );
+  // A present-but-empty pin is a failed resolution in the caller's wrapper, not
+  // a request to run unpinned. Validate it like the caller pin so it cannot
+  // fail open.
+  const rawEnvironmentActor = process.env[EXPECTED_ACTOR_ENV];
+  if (rawEnvironmentActor !== undefined) {
+    const environmentActor = requireToken(rawEnvironmentActor, 'actor');
+    if (login !== environmentActor) {
+      fail(
+        `authenticated GitHub actor changed: expected ${environmentActor}, found ${login}`,
+      );
+    }
   }
   if (expected !== undefined && requireToken(expected, 'actor') !== login) {
     fail(
@@ -293,13 +307,23 @@ export function assertActor(expected?: string | undefined): string {
 
 /**
  * Re-resolve the authenticated actor without consulting the runner cache.
+ *
+ * A runner that caches identity must supply `liveActor` to be usable here. It
+ * is refused rather than silently downgraded to `currentActor`: falling back to
+ * the cache would make every re-pin compare one memoized value against itself,
+ * so the rotation check would pass vacuously with no diagnostic.
+ *
+ * An explicit actor pin short-circuits the live lookup by design — see
+ * `DefaultGitHubRunner.liveActor`. Seeding an actor therefore disables rotation
+ * detection for that runner.
  */
 export function assertLiveActor(expected?: string | undefined): string {
+  if (!activeRunner.liveActor && activeRunner.currentActor) {
+    fail('GitHub runner cannot re-resolve the live authenticated actor');
+  }
   const actor = activeRunner.liveActor
     ? activeRunner.liveActor()
-    : activeRunner.currentActor
-      ? activeRunner.currentActor()
-      : resolveLoginOrFail(runGh(['api', 'user']));
+    : resolveLoginOrFail(runGh(['api', 'user']));
   return assertActorPins(actor, expected);
 }
 
@@ -317,9 +341,9 @@ export function setCurrentActor(actor: string | null): void {
 /**
  * Keep only the rows authored by the authenticated actor.
  *
- * `options.actor` filters against an actor the caller has already resolved and
- * asserted. This function performs no identity lookup of its own in that mode,
- * so the caller owns the pin ordering around whatever fetch produced `rows`.
+ * `options.actor` is an assertion, never an override: it is re-resolved live
+ * and must equal the authenticated login, so a caller can narrow which identity
+ * counts as actor-owned but can never choose one.
  */
 export function authenticatedRows<T extends Record<string, unknown>>(
   rows: T[],
@@ -328,7 +352,7 @@ export function authenticatedRows<T extends Record<string, unknown>>(
   const actor =
     options?.actor === undefined
       ? currentActor()
-      : requireToken(options.actor, 'actor');
+      : assertLiveActor(options.actor);
   return rows.filter((row) => {
     const user = row['user'] as { login?: string } | undefined;
     const author = row['author'] as { login?: string } | undefined;
@@ -525,10 +549,8 @@ export function getIssueComments(
   // adopt comments fetched under one identity as history owned by another.
   const actor = assertLiveActor(expectedActor);
   const rows = getAllIssueComments(repo, pr);
-  // Re-pin after the fetch subprocess so the whole read happened under one
-  // identity. Keeping this here rather than inside `authenticatedRows` leaves
-  // the pin/fetch/re-pin bracket visible in the function that owns it.
-  assertLiveActor(actor);
+  // `authenticatedRows` re-pins the same actor after the fetch subprocess, so
+  // the whole read is bracketed by live identity checks.
   return authenticatedRows(rows, { actor });
 }
 

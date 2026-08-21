@@ -544,6 +544,16 @@ describe('prCommentSink', () => {
     }
   }
 
+  /** Classify one recorded `gh` invocation so a test can pin the exact order. */
+  function callKind(call: string): string {
+    if (call.startsWith('api user')) return 'user';
+    if (call.includes('/comments?per_page=100')) return 'list';
+    if (call.includes('-X POST')) return 'post';
+    if (call.includes('-X DELETE')) return 'delete';
+    if (call.includes('/issues/comments/')) return 'get';
+    return call;
+  }
+
   beforeEach(() => {
     resetGitHubRunner();
   });
@@ -556,14 +566,20 @@ describe('prCommentSink', () => {
     const first = emitTelemetry({ record, sink });
     expect(first).toMatchObject({ emitted: true, sink: 'pr-comment' });
     expect(runner.posts).toBe(1);
-    const listCall = runner.calls.indexOf(
-      'api --paginate --slurp repos/owner/repo/issues/123/comments?per_page=100',
-    );
-    const postCall = runner.calls.findIndex((call) => call.includes('-X POST'));
-    expect(listCall).toBeGreaterThan(0);
-    expect(runner.calls[listCall - 1]).toBe('api user');
-    expect(runner.calls[listCall + 1]).toBe('api user');
-    expect(runner.calls[postCall - 1]).toBe('api user');
+    // Assert the whole sequence, not offsets around it. Relative assertions are
+    // satisfied by any neighbouring identity read, so adding or removing a pin
+    // silently retargets every drift test below instead of failing here.
+    expect(runner.calls.map(callKind)).toEqual([
+      'user', // seed the pin
+      'user', // pre-fetch live pin
+      'list',
+      'user', // post-fetch live re-pin
+      'user', // pre-POST live pin
+      'post',
+      'user', // pre-readback live pin
+      'get',
+      'user', // post-readback live pin
+    ]);
 
     const replay = emitTelemetry({ record, sink });
     expect(replay.reference).toBe(first.reference);
@@ -740,7 +756,55 @@ describe('prCommentSink', () => {
       reference: null,
       error: expect.stringMatching(/rollback could not be verified/),
     });
+    // The residue must be locatable from the message alone: `emitTelemetry`
+    // reports `error.message` and never walks the cause chain.
+    expect(result.error).toContain('comment 901 on owner/repo#123');
+    expect(result.error).toMatch(
+      /verification failed with: .*could not verify/,
+    );
     expect(runner.issueComments).toHaveLength(1);
+    expect(runner.issueComments[0]).toMatchObject({
+      id: 901,
+      user: { login: 'different-actor' },
+    });
+  });
+
+  it('fails closed when the caller pins an actor the session is not', () => {
+    const runner = new MockRunner();
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({
+        repo: 'owner/repo',
+        pr: 123,
+        actor: 'somebody-else',
+      }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
+    });
+    expect(runner.posts).toBe(0);
+  });
+
+  it('emits under a caller pin that matches the session', () => {
+    const runner = new MockRunner();
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({
+        repo: 'owner/repo',
+        pr: 123,
+        actor: runner.authenticatedActor,
+      }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '901' });
+    expect(runner.posts).toBe(1);
   });
 
   it('reports a same-key record whose measurements conflict', () => {

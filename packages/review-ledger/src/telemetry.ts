@@ -765,6 +765,16 @@ function replayFingerprint(record: TelemetryRecord): string {
 }
 
 /**
+ * Describe a thrown value without assuming it is shaped like an `Error`.
+ *
+ * A cast to `{ message?: string }` throws a `TypeError` on a thrown `null`,
+ * which would destroy the error being reported from inside its own catch.
+ */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * The reference sink: one new comment per pass on the pull request.
  *
  * The pull request is the emission point because it is the only store this
@@ -780,11 +790,12 @@ function replayFingerprint(record: TelemetryRecord): string {
 export function prCommentSink(target: {
   repo: string;
   pr: number;
+  actor?: string;
 }): TelemetrySink {
   return {
     name: 'pr-comment',
     emit({ record, body }) {
-      const actor = assertActor();
+      const actor = assertActor(target.actor);
       const rows = getIssueComments(target.repo, target.pr, actor);
       for (const row of rows) {
         const existing = String(row['body'] ?? '');
@@ -822,11 +833,15 @@ export function prCommentSink(target: {
         try {
           deleteIssueComment(target.repo, target.pr, commentId);
         } catch (rollbackError) {
+          // This is the one branch that leaves GitHub durably mutated, so the
+          // message must name the residue and why verification failed. The
+          // cause chain alone is not enough: `emitTelemetry` reports
+          // `error.message` and never walks it.
           throw new LedgerError(
-            `telemetry verification failed and rollback could not be verified: ${
-              (rollbackError as { message?: string }).message ??
-              String(rollbackError)
-            }`,
+            `telemetry verification failed and rollback could not be verified: ` +
+              `${errorMessage(rollbackError)}; ` +
+              `comment ${commentId} on ${target.repo}#${target.pr} may remain ` +
+              `on the pull request; verification failed with: ${errorMessage(error)}`,
             { cause: error },
           );
         }
