@@ -493,11 +493,14 @@ describe('prCommentSink', () => {
 
   class MockRunner implements GitHubRunner {
     public actor = 'test-actor';
+    public postActor: string | null = null;
     public issueComments: Array<Record<string, unknown>> = [];
     public posts = 0;
+    public calls: string[] = [];
 
     runGh(args: string[], payload?: unknown): string {
       const cmd = args.join(' ');
+      this.calls.push(cmd);
       if (cmd.startsWith('api user')) {
         return JSON.stringify({ login: this.actor });
       }
@@ -508,7 +511,7 @@ describe('prCommentSink', () => {
         this.posts += 1;
         const row = {
           id: 900 + this.posts,
-          user: { login: this.actor },
+          user: { login: this.postActor ?? this.actor },
           body: (payload as { body: string }).body,
         };
         this.issueComments.push(row);
@@ -536,6 +539,10 @@ describe('prCommentSink', () => {
     const first = emitTelemetry({ record, sink });
     expect(first).toMatchObject({ emitted: true, sink: 'pr-comment' });
     expect(runner.posts).toBe(1);
+    expect(runner.calls.slice(0, 2)).toEqual([
+      'api user',
+      'api --paginate --slurp repos/owner/repo/issues/123/comments?per_page=100',
+    ]);
 
     const replay = emitTelemetry({ record, sink });
     expect(replay.reference).toBe(first.reference);
@@ -544,6 +551,79 @@ describe('prCommentSink', () => {
     const nextRound = buildTelemetryRecord(params({ round: 4 }));
     emitTelemetry({ record: nextRound, sink });
     expect(runner.posts).toBe(2);
+  });
+
+  it('ignores an identical replay marker authored by another actor', () => {
+    const runner = new MockRunner();
+    runner.issueComments.push({
+      id: 700,
+      user: { login: 'untrusted-commenter' },
+      body: buildTelemetryBody(record),
+    });
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '901' });
+    expect(runner.posts).toBe(1);
+  });
+
+  it('ignores a conflicting replay marker authored by another actor', () => {
+    const runner = new MockRunner();
+    const conflict = buildTelemetryRecord(params({ durationSeconds: 999 }));
+    runner.issueComments.push({
+      id: 700,
+      user: { login: 'untrusted-commenter' },
+      body: buildTelemetryBody(conflict),
+    });
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '901' });
+    expect(runner.posts).toBe(1);
+  });
+
+  it('accepts a replay only when the authenticated actor owns it', () => {
+    const runner = new MockRunner();
+    runner.issueComments.push({
+      id: 700,
+      user: { login: runner.actor },
+      body: buildTelemetryBody(record),
+    });
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '700' });
+    expect(runner.posts).toBe(0);
+  });
+
+  it('rejects a newly posted comment not owned by the pinned actor', () => {
+    const runner = new MockRunner();
+    runner.postActor = 'different-actor';
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/could not verify PR comment/),
+    });
+    expect(runner.posts).toBe(1);
   });
 
   it('reports a same-key record whose measurements conflict', () => {

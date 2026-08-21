@@ -489,7 +489,12 @@ export function getReviewComments(
 export function getIssueComments(
   repo: string,
   pr: number,
+  expectedActor?: string,
 ): Array<Record<string, unknown>> {
+  // Pin the authenticated identity before fetching replay candidates. If the
+  // credential backing `gh` changes between subprocesses, a caller must never
+  // adopt comments fetched under one identity as history owned by another.
+  const actor = assertActor(expectedActor);
   const pages = jsonOutput<unknown[]>([
     'api',
     '--paginate',
@@ -497,7 +502,16 @@ export function getIssueComments(
     `repos/${repo}/issues/${pr}/comments?per_page=100`,
   ]);
   const rows = flattenPages<Record<string, unknown>>(pages, 'PR-comments');
-  return authenticatedRows(rows);
+  return rows.filter((row) => {
+    const identity = (row['user'] ?? row['author']) as
+      | { login?: string }
+      | undefined;
+    return (
+      typeof identity === 'object' &&
+      identity !== null &&
+      identity.login === actor
+    );
+  });
 }
 
 /**
@@ -523,12 +537,14 @@ export function verifyIssueComment(
   repo: string,
   commentId: number,
   expectedBody: string,
+  expectedActor?: string,
 ): void {
   verifyOwnedComment(
     `repos/${repo}/issues/comments/${commentId}`,
     commentId,
     expectedBody,
     'PR comment',
+    expectedActor,
   );
 }
 
@@ -537,7 +553,9 @@ function verifyOwnedComment(
   commentId: number,
   expectedBody: string,
   label: string,
+  expectedActor?: string,
 ): void {
+  const actor = assertActor(expectedActor);
   const response = jsonOutput<Record<string, unknown>>(['api', endpoint]);
   const user = (response['user'] ?? response['author']) as
     | { login?: string }
@@ -548,7 +566,7 @@ function verifyOwnedComment(
     response['body'] !== expectedBody ||
     typeof user !== 'object' ||
     user === null ||
-    user.login !== currentActor()
+    user.login !== actor
   ) {
     fail(`could not verify ${label} ${commentId} after posting`);
   }

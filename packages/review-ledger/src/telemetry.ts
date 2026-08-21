@@ -20,6 +20,7 @@ import {
 } from './constants.js';
 import { fail } from './errors.js';
 import {
+  assertActor,
   getIssueComments,
   getPostedCommentId,
   jsonOutput,
@@ -781,7 +782,8 @@ export function prCommentSink(target: {
   return {
     name: 'pr-comment',
     emit({ record, body }) {
-      const rows = getIssueComments(target.repo, target.pr);
+      const actor = assertActor();
+      const rows = getIssueComments(target.repo, target.pr, actor);
       for (const row of rows) {
         const existing = String(row['body'] ?? '');
         if (!existing.includes(TELEMETRY_V1_MARKER)) {
@@ -811,7 +813,7 @@ export function prCommentSink(target: {
         { body },
       );
       const commentId = getPostedCommentId(response);
-      verifyIssueComment(target.repo, commentId, body);
+      verifyIssueComment(target.repo, commentId, body, actor);
       return { sink: 'pr-comment', reference: String(commentId) };
     },
   };
