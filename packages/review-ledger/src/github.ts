@@ -44,19 +44,16 @@ export function execFailureDetail(error: unknown): string {
  * Default runner: shells out to `gh` and `git`.
  */
 export class DefaultGitHubRunner implements GitHubRunner {
-  private actor: string | null = null;
   private actorOverride: string | null = null;
+  private cachedActor: string | null = null;
 
   constructor(customActor?: string) {
-    if (customActor) {
-      this.actorOverride = requireToken(customActor, 'actor');
-      this.actor = this.actorOverride;
-    }
+    this.setActor(customActor ?? null);
   }
 
   setActor(actor: string | null): void {
     this.actorOverride = actor ? requireToken(actor, 'actor') : null;
-    this.actor = this.actorOverride;
+    this.cachedActor = null;
   }
 
   runGh(args: string[], payload?: unknown): string {
@@ -81,11 +78,8 @@ export class DefaultGitHubRunner implements GitHubRunner {
   }
 
   currentActor(): string {
-    if (this.actor !== null) {
-      return this.actor;
-    }
-    this.actor = this.liveActor();
-    return this.actor;
+    this.cachedActor ??= this.liveActor();
+    return this.cachedActor;
   }
 
   liveActor(): string {
@@ -322,6 +316,10 @@ export function setCurrentActor(actor: string | null): void {
 
 /**
  * Keep only the rows authored by the authenticated actor.
+ *
+ * `options.actor` filters against an actor the caller has already resolved and
+ * asserted. This function performs no identity lookup of its own in that mode,
+ * so the caller owns the pin ordering around whatever fetch produced `rows`.
  */
 export function authenticatedRows<T extends Record<string, unknown>>(
   rows: T[],
@@ -330,7 +328,7 @@ export function authenticatedRows<T extends Record<string, unknown>>(
   const actor =
     options?.actor === undefined
       ? currentActor()
-      : assertLiveActor(options.actor);
+      : requireToken(options.actor, 'actor');
   return rows.filter((row) => {
     const user = row['user'] as { login?: string } | undefined;
     const author = row['author'] as { login?: string } | undefined;
@@ -527,6 +525,10 @@ export function getIssueComments(
   // adopt comments fetched under one identity as history owned by another.
   const actor = assertLiveActor(expectedActor);
   const rows = getAllIssueComments(repo, pr);
+  // Re-pin after the fetch subprocess so the whole read happened under one
+  // identity. Keeping this here rather than inside `authenticatedRows` leaves
+  // the pin/fetch/re-pin bracket visible in the function that owns it.
+  assertLiveActor(actor);
   return authenticatedRows(rows, { actor });
 }
 
