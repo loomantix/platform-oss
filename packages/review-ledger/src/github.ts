@@ -45,15 +45,18 @@ export function execFailureDetail(error: unknown): string {
  */
 export class DefaultGitHubRunner implements GitHubRunner {
   private actor: string | null = null;
+  private actorOverride: string | null = null;
 
   constructor(customActor?: string) {
     if (customActor) {
-      this.actor = requireToken(customActor, 'actor');
+      this.actorOverride = requireToken(customActor, 'actor');
+      this.actor = this.actorOverride;
     }
   }
 
   setActor(actor: string | null): void {
-    this.actor = actor ? requireToken(actor, 'actor') : null;
+    this.actorOverride = actor ? requireToken(actor, 'actor') : null;
+    this.actor = this.actorOverride;
   }
 
   runGh(args: string[], payload?: unknown): string {
@@ -81,8 +84,15 @@ export class DefaultGitHubRunner implements GitHubRunner {
     if (this.actor !== null) {
       return this.actor;
     }
-    this.actor = resolveLoginOrFail(this.runGh(['api', 'user']));
+    this.actor = this.liveActor();
     return this.actor;
+  }
+
+  liveActor(): string {
+    if (this.actorOverride !== null) {
+      return this.actorOverride;
+    }
+    return resolveLoginOrFail(this.runGh(['api', 'user']));
   }
 
   gitCompare(repo: string, before: string, after: string): unknown {
@@ -255,11 +265,20 @@ export function currentActor(): string {
     }
     login = defaultActor;
   }
+  return assertActorPins(login);
+}
+
+function assertActorPins(login: string, expected?: string): string {
   if (!login) {
     fail('GitHub returned an empty authenticated user');
   }
-  const expected = process.env[EXPECTED_ACTOR_ENV];
-  if (expected && login !== expected) {
+  const environmentActor = process.env[EXPECTED_ACTOR_ENV];
+  if (environmentActor && login !== environmentActor) {
+    fail(
+      `authenticated GitHub actor changed: expected ${environmentActor}, found ${login}`,
+    );
+  }
+  if (expected !== undefined && requireToken(expected, 'actor') !== login) {
     fail(
       `authenticated GitHub actor changed: expected ${expected}, found ${login}`,
     );
@@ -275,13 +294,12 @@ export function currentActor(): string {
  * GitHub session and a caller-supplied value can only narrow it, never set it.
  */
 export function assertActor(expected?: string | undefined): string {
-  const actor = currentActor();
-  if (expected !== undefined && requireToken(expected, 'actor') !== actor) {
-    fail(
-      `authenticated GitHub actor changed: expected ${expected}, found ${actor}`,
-    );
-  }
-  return actor;
+  const actor = activeRunner.liveActor
+    ? activeRunner.liveActor()
+    : activeRunner.currentActor
+      ? activeRunner.currentActor()
+      : resolveLoginOrFail(runGh(['api', 'user']));
+  return assertActorPins(actor, expected);
 }
 
 /**
@@ -495,14 +513,21 @@ export function getIssueComments(
   // credential backing `gh` changes between subprocesses, a caller must never
   // adopt comments fetched under one identity as history owned by another.
   const actor = assertActor(expectedActor);
+  const rows = getAllIssueComments(repo, pr);
+  return authenticatedRows(rows, { actor });
+}
+
+function getAllIssueComments(
+  repo: string,
+  pr: number,
+): Array<Record<string, unknown>> {
   const pages = jsonOutput<unknown[]>([
     'api',
     '--paginate',
     '--slurp',
     `repos/${repo}/issues/${pr}/comments?per_page=100`,
   ]);
-  const rows = flattenPages<Record<string, unknown>>(pages, 'PR-comments');
-  return authenticatedRows(rows, { actor });
+  return flattenPages<Record<string, unknown>>(pages, 'PR-comments');
 }
 
 /**
@@ -548,6 +573,7 @@ function verifyOwnedComment(
 ): void {
   const actor = assertActor(expectedActor);
   const response = jsonOutput<Record<string, unknown>>(['api', endpoint]);
+  assertActor(actor);
   const user = (response['user'] ?? response['author']) as
     | { login?: string }
     | undefined;
@@ -604,7 +630,7 @@ export function issueCommentExists(
   pr: number,
   commentId: number,
 ): boolean {
-  return getIssueComments(repo, pr).some((row) => row['id'] === commentId);
+  return getAllIssueComments(repo, pr).some((row) => row['id'] === commentId);
 }
 
 /**

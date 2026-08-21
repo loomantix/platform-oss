@@ -18,9 +18,10 @@ import {
   TOKEN_RE,
   UTC_TIMESTAMP_RE,
 } from './constants.js';
-import { fail } from './errors.js';
+import { fail, LedgerError } from './errors.js';
 import {
   assertActor,
+  deleteIssueComment,
   getIssueComments,
   getPostedCommentId,
   jsonOutput,
@@ -803,6 +804,7 @@ export function prCommentSink(target: {
         }
       }
 
+      assertActor(actor);
       const response = jsonOutput(
         [
           'api',
@@ -813,7 +815,22 @@ export function prCommentSink(target: {
         { body },
       );
       const commentId = getPostedCommentId(response);
-      verifyIssueComment(target.repo, commentId, body, actor);
+      try {
+        verifyIssueComment(target.repo, commentId, body, actor);
+      } catch (error) {
+        try {
+          deleteIssueComment(target.repo, target.pr, commentId);
+        } catch (rollbackError) {
+          throw new LedgerError(
+            `telemetry verification failed and rollback could not be verified: ${
+              (rollbackError as { message?: string }).message ??
+              String(rollbackError)
+            }`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
       return { sink: 'pr-comment', reference: String(commentId) };
     },
   };

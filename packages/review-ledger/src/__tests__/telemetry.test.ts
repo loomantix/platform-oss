@@ -495,14 +495,18 @@ describe('prCommentSink', () => {
     public actor = 'test-actor';
     public postActor: string | null = null;
     public issueComments: Array<Record<string, unknown>> = [];
+    public actorSequence: string[] = [];
     public posts = 0;
     public calls: string[] = [];
+    public deleteFails = false;
 
     runGh(args: string[], payload?: unknown): string {
       const cmd = args.join(' ');
       this.calls.push(cmd);
       if (cmd.startsWith('api user')) {
-        return JSON.stringify({ login: this.actor });
+        return JSON.stringify({
+          login: this.actorSequence.shift() ?? this.actor,
+        });
       }
       if (cmd.includes('/issues/') && cmd.includes('/comments?per_page=100')) {
         return JSON.stringify([this.issueComments]);
@@ -516,6 +520,16 @@ describe('prCommentSink', () => {
         };
         this.issueComments.push(row);
         return JSON.stringify(row);
+      }
+      if (cmd.includes('-X DELETE') && cmd.includes('/issues/comments/')) {
+        if (this.deleteFails) {
+          throw new Error('delete failed');
+        }
+        const id = parseInt(args.at(-1)!.split('/').pop()!, 10);
+        this.issueComments = this.issueComments.filter(
+          (row) => row['id'] !== id,
+        );
+        return '';
       }
       if (cmd.includes('/issues/comments/')) {
         const id = parseInt(args[1]!.split('/').pop()!, 10);
@@ -539,10 +553,14 @@ describe('prCommentSink', () => {
     const first = emitTelemetry({ record, sink });
     expect(first).toMatchObject({ emitted: true, sink: 'pr-comment' });
     expect(runner.posts).toBe(1);
-    expect(runner.calls.slice(0, 2)).toEqual([
-      'api user',
+    const listCall = runner.calls.indexOf(
       'api --paginate --slurp repos/owner/repo/issues/123/comments?per_page=100',
-    ]);
+    );
+    const postCall = runner.calls.findIndex((call) => call.includes('-X POST'));
+    expect(listCall).toBeGreaterThan(0);
+    expect(runner.calls[listCall - 1]).toBe('api user');
+    expect(runner.calls[listCall + 1]).toBe('api user');
+    expect(runner.calls[postCall - 1]).toBe('api user');
 
     const replay = emitTelemetry({ record, sink });
     expect(replay.reference).toBe(first.reference);
@@ -608,6 +626,52 @@ describe('prCommentSink', () => {
     expect(runner.posts).toBe(0);
   });
 
+  it('rejects replay when credentials change during comment listing', () => {
+    const runner = new MockRunner();
+    runner.issueComments.push({
+      id: 700,
+      user: { login: runner.actor },
+      body: buildTelemetryBody(record),
+    });
+    runner.actorSequence = [runner.actor, runner.actor, 'different-actor'];
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
+    });
+    expect(runner.posts).toBe(0);
+  });
+
+  it('rejects credential drift before posting', () => {
+    const runner = new MockRunner();
+    runner.actorSequence = [
+      runner.actor,
+      runner.actor,
+      runner.actor,
+      'different-actor',
+    ];
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
+    });
+    expect(runner.posts).toBe(0);
+  });
+
   it('rejects a newly posted comment not owned by the pinned actor', () => {
     const runner = new MockRunner();
     runner.postActor = 'different-actor';
@@ -624,6 +688,26 @@ describe('prCommentSink', () => {
       error: expect.stringMatching(/could not verify PR comment/),
     });
     expect(runner.posts).toBe(1);
+    expect(runner.issueComments).toEqual([]);
+  });
+
+  it('reports an unverifiable rollback without hiding a foreign row', () => {
+    const runner = new MockRunner();
+    runner.postActor = 'different-actor';
+    runner.deleteFails = true;
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/rollback could not be verified/),
+    });
+    expect(runner.issueComments).toHaveLength(1);
   });
 
   it('reports a same-key record whose measurements conflict', () => {
