@@ -300,9 +300,9 @@ export function setCurrentActor(actor: string | null): void {
  */
 export function authenticatedRows<T extends Record<string, unknown>>(
   rows: T[],
-  options?: { graphql?: boolean },
+  options?: { graphql?: boolean; actor?: string },
 ): T[] {
-  const actor = currentActor();
+  const actor = assertActor(options?.actor);
   return rows.filter((row) => {
     const user = row['user'] as { login?: string } | undefined;
     const author = row['author'] as { login?: string } | undefined;
@@ -502,16 +502,7 @@ export function getIssueComments(
     `repos/${repo}/issues/${pr}/comments?per_page=100`,
   ]);
   const rows = flattenPages<Record<string, unknown>>(pages, 'PR-comments');
-  return rows.filter((row) => {
-    const identity = (row['user'] ?? row['author']) as
-      | { login?: string }
-      | undefined;
-    return (
-      typeof identity === 'object' &&
-      identity !== null &&
-      identity.login === actor
-    );
-  });
+  return authenticatedRows(rows, { actor });
 }
 
 /**
