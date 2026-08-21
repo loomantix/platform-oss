@@ -16,7 +16,11 @@ import {
   verifyLedger,
   verifyThreadDispositions,
 } from '../index.js';
-import { resetGitHubRunner, setGitHubRunner } from '../github.js';
+import {
+  assertLiveActor,
+  resetGitHubRunner,
+  setGitHubRunner,
+} from '../github.js';
 import type {
   DispositionV3Match,
   FindingV3Match,
@@ -288,11 +292,53 @@ describe('actor identity is asserted, never supplied', () => {
     expect(assertActor(ACTOR)).toBe(ACTOR);
   });
 
+  it('keeps the command actor pin separate from live boundary checks', () => {
+    setGitHubRunner({
+      runGh: () => JSON.stringify({ login: 'rotated-actor' }),
+      currentActor: () => ACTOR,
+      liveActor: () => 'rotated-actor',
+    });
+
+    expect(assertActor(ACTOR)).toBe(ACTOR);
+    expect(() => assertLiveActor(ACTOR)).toThrowError(
+      /authenticated GitHub actor changed/,
+    );
+  });
+
+  it('refuses a runner that cannot re-resolve the live actor', () => {
+    setGitHubRunner({
+      runGh: () => JSON.stringify({ login: 'rotated-actor' }),
+      currentActor: () => ACTOR,
+    });
+
+    expect(assertActor(ACTOR)).toBe(ACTOR);
+    expect(() => assertLiveActor(ACTOR)).toThrowError(
+      /cannot re-resolve the live authenticated actor/,
+    );
+  });
+
   it('honours the environment pin', () => {
     process.env['AGENT_LOOP_REVIEW_ACTOR'] = 'somebody-else';
     expect(() => assertActor()).toThrowError(
       /authenticated GitHub actor changed/,
     );
+  });
+
+  it('honours the environment pin on the live path too', () => {
+    setGitHubRunner({
+      runGh: () => JSON.stringify({ login: ACTOR }),
+      currentActor: () => ACTOR,
+      liveActor: () => ACTOR,
+    });
+    process.env['AGENT_LOOP_REVIEW_ACTOR'] = 'somebody-else';
+    expect(() => assertLiveActor()).toThrowError(
+      /authenticated GitHub actor changed/,
+    );
+  });
+
+  it('refuses a present-but-empty environment pin instead of running unpinned', () => {
+    process.env['AGENT_LOOP_REVIEW_ACTOR'] = '';
+    expect(() => assertActor()).toThrowError(/actor/);
   });
 });
 

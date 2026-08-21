@@ -1038,7 +1038,11 @@ function runCliCommand(argv: string[]): number {
 
         outcome = emitTelemetry({
           record,
-          sink: prCommentSink({ repo: args.repo, pr: args.pr }),
+          sink: prCommentSink({
+            repo: args.repo,
+            pr: args.pr,
+            actor: args.actor,
+          }),
         });
       } catch (error) {
         outcome = telemetryFailure(error);

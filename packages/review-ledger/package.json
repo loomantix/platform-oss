@@ -1,6 +1,6 @@
 {
   "name": "@loomantix/review-ledger",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
   "description": "Deterministic local-review ledger protocol, verification, and CLI for multi-engine code review relays.",
   "repository": {

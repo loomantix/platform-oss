@@ -454,6 +454,7 @@ export interface GitHubReviewThreadNode {
 export interface GitHubRunner {
   runGh(args: string[], payload?: unknown): string;
   currentActor?(): string;
+  liveActor?(): string;
   gitCompare?(repo: string, before: string, after: string): unknown;
   gitRevList?(before: string, head: string): string[];
   runGit?(args: string[]): string;

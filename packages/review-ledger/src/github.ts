@@ -44,16 +44,16 @@ export function execFailureDetail(error: unknown): string {
  * Default runner: shells out to `gh` and `git`.
  */
 export class DefaultGitHubRunner implements GitHubRunner {
-  private actor: string | null = null;
+  private actorOverride: string | null = null;
+  private cachedActor: string | null = null;
 
   constructor(customActor?: string) {
-    if (customActor) {
-      this.actor = requireToken(customActor, 'actor');
-    }
+    this.setActor(customActor ?? null);
   }
 
   setActor(actor: string | null): void {
-    this.actor = actor ? requireToken(actor, 'actor') : null;
+    this.actorOverride = actor ? requireToken(actor, 'actor') : null;
+    this.cachedActor = null;
   }
 
   runGh(args: string[], payload?: unknown): string {
@@ -78,11 +78,23 @@ export class DefaultGitHubRunner implements GitHubRunner {
   }
 
   currentActor(): string {
-    if (this.actor !== null) {
-      return this.actor;
+    this.cachedActor ??= this.liveActor();
+    return this.cachedActor;
+  }
+
+  /**
+   * Resolve the actor bypassing the cache.
+   *
+   * An explicit pin outranks the session, so an `actorOverride` is returned
+   * without a lookup. That is deliberate, and it means a runner constructed
+   * with an actor performs no live check at all — seeding an actor disables
+   * rotation detection.
+   */
+  liveActor(): string {
+    if (this.actorOverride !== null) {
+      return this.actorOverride;
     }
-    this.actor = resolveLoginOrFail(this.runGh(['api', 'user']));
-    return this.actor;
+    return resolveLoginOrFail(this.runGh(['api', 'user']));
   }
 
   gitCompare(repo: string, before: string, after: string): unknown {
@@ -255,11 +267,26 @@ export function currentActor(): string {
     }
     login = defaultActor;
   }
+  return assertActorPins(login);
+}
+
+function assertActorPins(login: string, expected?: string): string {
   if (!login) {
     fail('GitHub returned an empty authenticated user');
   }
-  const expected = process.env[EXPECTED_ACTOR_ENV];
-  if (expected && login !== expected) {
+  // A present-but-empty pin is a failed resolution in the caller's wrapper, not
+  // a request to run unpinned. Validate it like the caller pin so it cannot
+  // fail open.
+  const rawEnvironmentActor = process.env[EXPECTED_ACTOR_ENV];
+  if (rawEnvironmentActor !== undefined) {
+    const environmentActor = requireToken(rawEnvironmentActor, 'actor');
+    if (login !== environmentActor) {
+      fail(
+        `authenticated GitHub actor changed: expected ${environmentActor}, found ${login}`,
+      );
+    }
+  }
+  if (expected !== undefined && requireToken(expected, 'actor') !== login) {
     fail(
       `authenticated GitHub actor changed: expected ${expected}, found ${login}`,
     );
@@ -275,13 +302,29 @@ export function currentActor(): string {
  * GitHub session and a caller-supplied value can only narrow it, never set it.
  */
 export function assertActor(expected?: string | undefined): string {
-  const actor = currentActor();
-  if (expected !== undefined && requireToken(expected, 'actor') !== actor) {
-    fail(
-      `authenticated GitHub actor changed: expected ${expected}, found ${actor}`,
-    );
+  return assertActorPins(currentActor(), expected);
+}
+
+/**
+ * Re-resolve the authenticated actor without consulting the runner cache.
+ *
+ * A runner that caches identity must supply `liveActor` to be usable here. It
+ * is refused rather than silently downgraded to `currentActor`: falling back to
+ * the cache would make every re-pin compare one memoized value against itself,
+ * so the rotation check would pass vacuously with no diagnostic.
+ *
+ * An explicit actor pin short-circuits the live lookup by design — see
+ * `DefaultGitHubRunner.liveActor`. Seeding an actor therefore disables rotation
+ * detection for that runner.
+ */
+export function assertLiveActor(expected?: string | undefined): string {
+  if (!activeRunner.liveActor && activeRunner.currentActor) {
+    fail('GitHub runner cannot re-resolve the live authenticated actor');
   }
-  return actor;
+  const actor = activeRunner.liveActor
+    ? activeRunner.liveActor()
+    : resolveLoginOrFail(runGh(['api', 'user']));
+  return assertActorPins(actor, expected);
 }
 
 /**
@@ -297,12 +340,19 @@ export function setCurrentActor(actor: string | null): void {
 
 /**
  * Keep only the rows authored by the authenticated actor.
+ *
+ * `options.actor` is an assertion, never an override: it is re-resolved live
+ * and must equal the authenticated login, so a caller can narrow which identity
+ * counts as actor-owned but can never choose one.
  */
 export function authenticatedRows<T extends Record<string, unknown>>(
   rows: T[],
-  options?: { graphql?: boolean },
+  options?: { graphql?: boolean; actor?: string },
 ): T[] {
-  const actor = currentActor();
+  const actor =
+    options?.actor === undefined
+      ? currentActor()
+      : assertLiveActor(options.actor);
   return rows.filter((row) => {
     const user = row['user'] as { login?: string } | undefined;
     const author = row['author'] as { login?: string } | undefined;
@@ -489,6 +539,24 @@ export function getReviewComments(
 export function getIssueComments(
   repo: string,
   pr: number,
+  expectedActor?: string,
+): Array<Record<string, unknown>> {
+  if (expectedActor === undefined) {
+    return authenticatedRows(getAllIssueComments(repo, pr));
+  }
+  // Pin the authenticated identity before fetching replay candidates. If the
+  // credential backing `gh` changes between subprocesses, a caller must never
+  // adopt comments fetched under one identity as history owned by another.
+  const actor = assertLiveActor(expectedActor);
+  const rows = getAllIssueComments(repo, pr);
+  // `authenticatedRows` re-pins the same actor after the fetch subprocess, so
+  // the whole read is bracketed by live identity checks.
+  return authenticatedRows(rows, { actor });
+}
+
+function getAllIssueComments(
+  repo: string,
+  pr: number,
 ): Array<Record<string, unknown>> {
   const pages = jsonOutput<unknown[]>([
     'api',
@@ -496,8 +564,7 @@ export function getIssueComments(
     '--slurp',
     `repos/${repo}/issues/${pr}/comments?per_page=100`,
   ]);
-  const rows = flattenPages<Record<string, unknown>>(pages, 'PR-comments');
-  return authenticatedRows(rows);
+  return flattenPages<Record<string, unknown>>(pages, 'PR-comments');
 }
 
 /**
@@ -523,12 +590,14 @@ export function verifyIssueComment(
   repo: string,
   commentId: number,
   expectedBody: string,
+  expectedActor?: string,
 ): void {
   verifyOwnedComment(
     `repos/${repo}/issues/comments/${commentId}`,
     commentId,
     expectedBody,
     'PR comment',
+    expectedActor,
   );
 }
 
@@ -537,8 +606,16 @@ function verifyOwnedComment(
   commentId: number,
   expectedBody: string,
   label: string,
+  expectedActor?: string,
 ): void {
+  const actor =
+    expectedActor === undefined
+      ? assertActor()
+      : assertLiveActor(expectedActor);
   const response = jsonOutput<Record<string, unknown>>(['api', endpoint]);
+  if (expectedActor !== undefined) {
+    assertLiveActor(actor);
+  }
   const user = (response['user'] ?? response['author']) as
     | { login?: string }
     | undefined;
@@ -548,7 +625,7 @@ function verifyOwnedComment(
     response['body'] !== expectedBody ||
     typeof user !== 'object' ||
     user === null ||
-    user.login !== currentActor()
+    user.login !== actor
   ) {
     fail(`could not verify ${label} ${commentId} after posting`);
   }
@@ -595,7 +672,7 @@ export function issueCommentExists(
   pr: number,
   commentId: number,
 ): boolean {
-  return getIssueComments(repo, pr).some((row) => row['id'] === commentId);
+  return getAllIssueComments(repo, pr).some((row) => row['id'] === commentId);
 }
 
 /**

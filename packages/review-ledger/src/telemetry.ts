@@ -18,8 +18,11 @@ import {
   TOKEN_RE,
   UTC_TIMESTAMP_RE,
 } from './constants.js';
-import { fail } from './errors.js';
+import { fail, LedgerError } from './errors.js';
 import {
+  assertActor,
+  assertLiveActor,
+  deleteIssueComment,
   getIssueComments,
   getPostedCommentId,
   jsonOutput,
@@ -762,6 +765,16 @@ function replayFingerprint(record: TelemetryRecord): string {
 }
 
 /**
+ * Describe a thrown value without assuming it is shaped like an `Error`.
+ *
+ * A cast to `{ message?: string }` throws a `TypeError` on a thrown `null`,
+ * which would destroy the error being reported from inside its own catch.
+ */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * The reference sink: one new comment per pass on the pull request.
  *
  * The pull request is the emission point because it is the only store this
@@ -777,11 +790,13 @@ function replayFingerprint(record: TelemetryRecord): string {
 export function prCommentSink(target: {
   repo: string;
   pr: number;
+  actor?: string;
 }): TelemetrySink {
   return {
     name: 'pr-comment',
     emit({ record, body }) {
-      const rows = getIssueComments(target.repo, target.pr);
+      const actor = assertActor(target.actor);
+      const rows = getIssueComments(target.repo, target.pr, actor);
       for (const row of rows) {
         const existing = String(row['body'] ?? '');
         if (!existing.includes(TELEMETRY_V1_MARKER)) {
@@ -801,6 +816,7 @@ export function prCommentSink(target: {
         }
       }
 
+      assertLiveActor(actor);
       const response = jsonOutput(
         [
           'api',
@@ -811,7 +827,26 @@ export function prCommentSink(target: {
         { body },
       );
       const commentId = getPostedCommentId(response);
-      verifyIssueComment(target.repo, commentId, body);
+      try {
+        verifyIssueComment(target.repo, commentId, body, actor);
+      } catch (error) {
+        try {
+          deleteIssueComment(target.repo, target.pr, commentId);
+        } catch (rollbackError) {
+          // This is the one branch that leaves GitHub durably mutated, so the
+          // message must name the residue and why verification failed. The
+          // cause chain alone is not enough: `emitTelemetry` reports
+          // `error.message` and never walks it.
+          throw new LedgerError(
+            `telemetry verification failed and rollback could not be verified: ` +
+              `${errorMessage(rollbackError)}; ` +
+              `comment ${commentId} on ${target.repo}#${target.pr} may remain ` +
+              `on the pull request; verification failed with: ${errorMessage(error)}`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
       return { sink: 'pr-comment', reference: String(commentId) };
     },
   };

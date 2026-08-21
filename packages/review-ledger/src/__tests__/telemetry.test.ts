@@ -11,11 +11,14 @@ import {
   telemetryIdempotencyKey,
   validateTelemetryRecord,
   type BuildTelemetryParams,
-  type GitHubRunner,
   type TelemetryRecord,
   type TelemetrySink,
 } from '../index.js';
-import { resetGitHubRunner, setGitHubRunner } from '../github.js';
+import {
+  DefaultGitHubRunner,
+  resetGitHubRunner,
+  setGitHubRunner,
+} from '../github.js';
 
 const BASE = '2'.repeat(40);
 const HEAD = '1'.repeat(40);
@@ -491,15 +494,22 @@ describe('emitTelemetry', () => {
 describe('prCommentSink', () => {
   const record = buildTelemetryRecord(params());
 
-  class MockRunner implements GitHubRunner {
-    public actor = 'test-actor';
+  class MockRunner extends DefaultGitHubRunner {
+    public authenticatedActor = 'test-actor';
+    public postActor: string | null = null;
     public issueComments: Array<Record<string, unknown>> = [];
+    public actorSequence: string[] = [];
     public posts = 0;
+    public calls: string[] = [];
+    public deleteFails = false;
 
     runGh(args: string[], payload?: unknown): string {
       const cmd = args.join(' ');
+      this.calls.push(cmd);
       if (cmd.startsWith('api user')) {
-        return JSON.stringify({ login: this.actor });
+        return JSON.stringify({
+          login: this.actorSequence.shift() ?? this.authenticatedActor,
+        });
       }
       if (cmd.includes('/issues/') && cmd.includes('/comments?per_page=100')) {
         return JSON.stringify([this.issueComments]);
@@ -508,11 +518,21 @@ describe('prCommentSink', () => {
         this.posts += 1;
         const row = {
           id: 900 + this.posts,
-          user: { login: this.actor },
+          user: { login: this.postActor ?? this.authenticatedActor },
           body: (payload as { body: string }).body,
         };
         this.issueComments.push(row);
         return JSON.stringify(row);
+      }
+      if (cmd.includes('-X DELETE') && cmd.includes('/issues/comments/')) {
+        if (this.deleteFails) {
+          throw new Error('delete failed');
+        }
+        const id = parseInt(args.at(-1)!.split('/').pop()!, 10);
+        this.issueComments = this.issueComments.filter(
+          (row) => row['id'] !== id,
+        );
+        return '';
       }
       if (cmd.includes('/issues/comments/')) {
         const id = parseInt(args[1]!.split('/').pop()!, 10);
@@ -522,6 +542,16 @@ describe('prCommentSink', () => {
       }
       throw new Error(`unexpected gh call: ${cmd}`);
     }
+  }
+
+  /** Classify one recorded `gh` invocation so a test can pin the exact order. */
+  function callKind(call: string): string {
+    if (call.startsWith('api user')) return 'user';
+    if (call.includes('/comments?per_page=100')) return 'list';
+    if (call.includes('-X POST')) return 'post';
+    if (call.includes('-X DELETE')) return 'delete';
+    if (call.includes('/issues/comments/')) return 'get';
+    return call;
   }
 
   beforeEach(() => {
@@ -536,6 +566,20 @@ describe('prCommentSink', () => {
     const first = emitTelemetry({ record, sink });
     expect(first).toMatchObject({ emitted: true, sink: 'pr-comment' });
     expect(runner.posts).toBe(1);
+    // Assert the whole sequence, not offsets around it. Relative assertions are
+    // satisfied by any neighbouring identity read, so adding or removing a pin
+    // silently retargets every drift test below instead of failing here.
+    expect(runner.calls.map(callKind)).toEqual([
+      'user', // seed the pin
+      'user', // pre-fetch live pin
+      'list',
+      'user', // post-fetch live re-pin
+      'user', // pre-POST live pin
+      'post',
+      'user', // pre-readback live pin
+      'get',
+      'user', // post-readback live pin
+    ]);
 
     const replay = emitTelemetry({ record, sink });
     expect(replay.reference).toBe(first.reference);
@@ -544,6 +588,223 @@ describe('prCommentSink', () => {
     const nextRound = buildTelemetryRecord(params({ round: 4 }));
     emitTelemetry({ record: nextRound, sink });
     expect(runner.posts).toBe(2);
+  });
+
+  it('ignores an identical replay marker authored by another actor', () => {
+    const runner = new MockRunner();
+    runner.issueComments.push({
+      id: 700,
+      user: { login: 'untrusted-commenter' },
+      body: buildTelemetryBody(record),
+    });
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '901' });
+    expect(runner.posts).toBe(1);
+  });
+
+  it('ignores a conflicting replay marker authored by another actor', () => {
+    const runner = new MockRunner();
+    const conflict = buildTelemetryRecord(params({ durationSeconds: 999 }));
+    runner.issueComments.push({
+      id: 700,
+      user: { login: 'untrusted-commenter' },
+      body: buildTelemetryBody(conflict),
+    });
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '901' });
+    expect(runner.posts).toBe(1);
+  });
+
+  it('accepts a replay only when the authenticated actor owns it', () => {
+    const runner = new MockRunner();
+    runner.issueComments.push({
+      id: 700,
+      user: { login: runner.authenticatedActor },
+      body: buildTelemetryBody(record),
+    });
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '700' });
+    expect(runner.posts).toBe(0);
+  });
+
+  it('rejects replay when credentials change during comment listing', () => {
+    const runner = new MockRunner();
+    runner.issueComments.push({
+      id: 700,
+      user: { login: runner.authenticatedActor },
+      body: buildTelemetryBody(record),
+    });
+    runner.actorSequence = [
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      'different-actor',
+    ];
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
+    });
+    expect(runner.posts).toBe(0);
+  });
+
+  it('rejects credential drift before posting', () => {
+    const runner = new MockRunner();
+    runner.actorSequence = [
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      'different-actor',
+    ];
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
+    });
+    expect(runner.posts).toBe(0);
+  });
+
+  it('rejects a newly posted comment not owned by the pinned actor', () => {
+    const runner = new MockRunner();
+    runner.postActor = 'different-actor';
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/could not verify PR comment/),
+    });
+    expect(runner.posts).toBe(1);
+    expect(runner.issueComments).toEqual([]);
+  });
+
+  it('rejects credential drift after comment readback', () => {
+    const runner = new MockRunner();
+    runner.actorSequence = [
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      'different-actor',
+    ];
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
+    });
+    expect(runner.posts).toBe(1);
+    expect(runner.issueComments).toEqual([]);
+  });
+
+  it('reports an unverifiable rollback without hiding a foreign row', () => {
+    const runner = new MockRunner();
+    runner.postActor = 'different-actor';
+    runner.deleteFails = true;
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/rollback could not be verified/),
+    });
+    // The residue must be locatable from the message alone: `emitTelemetry`
+    // reports `error.message` and never walks the cause chain.
+    expect(result.error).toContain('comment 901 on owner/repo#123');
+    expect(result.error).toMatch(
+      /verification failed with: .*could not verify/,
+    );
+    expect(runner.issueComments).toHaveLength(1);
+    expect(runner.issueComments[0]).toMatchObject({
+      id: 901,
+      user: { login: 'different-actor' },
+    });
+  });
+
+  it('fails closed when the caller pins an actor the session is not', () => {
+    const runner = new MockRunner();
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({
+        repo: 'owner/repo',
+        pr: 123,
+        actor: 'somebody-else',
+      }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
+    });
+    expect(runner.posts).toBe(0);
+  });
+
+  it('emits under a caller pin that matches the session', () => {
+    const runner = new MockRunner();
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({
+        repo: 'owner/repo',
+        pr: 123,
+        actor: runner.authenticatedActor,
+      }),
+    });
+
+    expect(result).toMatchObject({ emitted: true, reference: '901' });
+    expect(runner.posts).toBe(1);
   });
 
   it('reports a same-key record whose measurements conflict', () => {
@@ -609,12 +870,12 @@ describe('prCommentSink', () => {
     runner.issueComments.push(
       {
         id: 700,
-        user: { login: runner.actor },
+        user: { login: runner.authenticatedActor },
         body: '<!-- local-review-telemetry:v1 -->\nnot-json',
       },
       {
         id: 701,
-        user: { login: runner.actor },
+        user: { login: runner.authenticatedActor },
         body: '<!-- local-review-telemetry:v2 -->\n{}',
       },
     );
