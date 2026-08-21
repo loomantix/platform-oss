@@ -16,7 +16,11 @@ import {
   verifyLedger,
   verifyThreadDispositions,
 } from '../index.js';
-import { resetGitHubRunner, setGitHubRunner } from '../github.js';
+import {
+  assertLiveActor,
+  resetGitHubRunner,
+  setGitHubRunner,
+} from '../github.js';
 import type {
   DispositionV3Match,
   FindingV3Match,
@@ -286,6 +290,19 @@ describe('actor identity is asserted, never supplied', () => {
 
   it('passes when the expected actor matches', () => {
     expect(assertActor(ACTOR)).toBe(ACTOR);
+  });
+
+  it('keeps the command actor pin separate from live boundary checks', () => {
+    setGitHubRunner({
+      runGh: () => JSON.stringify({ login: 'rotated-actor' }),
+      currentActor: () => ACTOR,
+      liveActor: () => 'rotated-actor',
+    });
+
+    expect(assertActor(ACTOR)).toBe(ACTOR);
+    expect(() => assertLiveActor(ACTOR)).toThrowError(
+      /authenticated GitHub actor changed/,
+    );
   });
 
   it('honours the environment pin', () => {

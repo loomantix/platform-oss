@@ -21,6 +21,7 @@ import {
 import { fail, LedgerError } from './errors.js';
 import {
   assertActor,
+  assertLiveActor,
   deleteIssueComment,
   getIssueComments,
   getPostedCommentId,
@@ -804,7 +805,7 @@ export function prCommentSink(target: {
         }
       }
 
-      assertActor(actor);
+      assertLiveActor(actor);
       const response = jsonOutput(
         [
           'api',

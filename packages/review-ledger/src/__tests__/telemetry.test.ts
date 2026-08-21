@@ -11,11 +11,14 @@ import {
   telemetryIdempotencyKey,
   validateTelemetryRecord,
   type BuildTelemetryParams,
-  type GitHubRunner,
   type TelemetryRecord,
   type TelemetrySink,
 } from '../index.js';
-import { resetGitHubRunner, setGitHubRunner } from '../github.js';
+import {
+  DefaultGitHubRunner,
+  resetGitHubRunner,
+  setGitHubRunner,
+} from '../github.js';
 
 const BASE = '2'.repeat(40);
 const HEAD = '1'.repeat(40);
@@ -491,8 +494,8 @@ describe('emitTelemetry', () => {
 describe('prCommentSink', () => {
   const record = buildTelemetryRecord(params());
 
-  class MockRunner implements GitHubRunner {
-    public actor = 'test-actor';
+  class MockRunner extends DefaultGitHubRunner {
+    public authenticatedActor = 'test-actor';
     public postActor: string | null = null;
     public issueComments: Array<Record<string, unknown>> = [];
     public actorSequence: string[] = [];
@@ -505,7 +508,7 @@ describe('prCommentSink', () => {
       this.calls.push(cmd);
       if (cmd.startsWith('api user')) {
         return JSON.stringify({
-          login: this.actorSequence.shift() ?? this.actor,
+          login: this.actorSequence.shift() ?? this.authenticatedActor,
         });
       }
       if (cmd.includes('/issues/') && cmd.includes('/comments?per_page=100')) {
@@ -515,7 +518,7 @@ describe('prCommentSink', () => {
         this.posts += 1;
         const row = {
           id: 900 + this.posts,
-          user: { login: this.postActor ?? this.actor },
+          user: { login: this.postActor ?? this.authenticatedActor },
           body: (payload as { body: string }).body,
         };
         this.issueComments.push(row);
@@ -612,7 +615,7 @@ describe('prCommentSink', () => {
     const runner = new MockRunner();
     runner.issueComments.push({
       id: 700,
-      user: { login: runner.actor },
+      user: { login: runner.authenticatedActor },
       body: buildTelemetryBody(record),
     });
     setGitHubRunner(runner);
@@ -630,10 +633,14 @@ describe('prCommentSink', () => {
     const runner = new MockRunner();
     runner.issueComments.push({
       id: 700,
-      user: { login: runner.actor },
+      user: { login: runner.authenticatedActor },
       body: buildTelemetryBody(record),
     });
-    runner.actorSequence = [runner.actor, runner.actor, 'different-actor'];
+    runner.actorSequence = [
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      'different-actor',
+    ];
     setGitHubRunner(runner);
 
     const result = emitTelemetry({
@@ -652,9 +659,9 @@ describe('prCommentSink', () => {
   it('rejects credential drift before posting', () => {
     const runner = new MockRunner();
     runner.actorSequence = [
-      runner.actor,
-      runner.actor,
-      runner.actor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
       'different-actor',
     ];
     setGitHubRunner(runner);
@@ -686,6 +693,32 @@ describe('prCommentSink', () => {
       emitted: false,
       reference: null,
       error: expect.stringMatching(/could not verify PR comment/),
+    });
+    expect(runner.posts).toBe(1);
+    expect(runner.issueComments).toEqual([]);
+  });
+
+  it('rejects credential drift after comment readback', () => {
+    const runner = new MockRunner();
+    runner.actorSequence = [
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      runner.authenticatedActor,
+      'different-actor',
+    ];
+    setGitHubRunner(runner);
+
+    const result = emitTelemetry({
+      record,
+      sink: prCommentSink({ repo: 'owner/repo', pr: 123 }),
+    });
+
+    expect(result).toMatchObject({
+      emitted: false,
+      reference: null,
+      error: expect.stringMatching(/authenticated GitHub actor changed/),
     });
     expect(runner.posts).toBe(1);
     expect(runner.issueComments).toEqual([]);
@@ -773,12 +806,12 @@ describe('prCommentSink', () => {
     runner.issueComments.push(
       {
         id: 700,
-        user: { login: runner.actor },
+        user: { login: runner.authenticatedActor },
         body: '<!-- local-review-telemetry:v1 -->\nnot-json',
       },
       {
         id: 701,
-        user: { login: runner.actor },
+        user: { login: runner.authenticatedActor },
         body: '<!-- local-review-telemetry:v2 -->\n{}',
       },
     );

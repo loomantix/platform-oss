@@ -294,6 +294,13 @@ function assertActorPins(login: string, expected?: string): string {
  * GitHub session and a caller-supplied value can only narrow it, never set it.
  */
 export function assertActor(expected?: string | undefined): string {
+  return assertActorPins(currentActor(), expected);
+}
+
+/**
+ * Re-resolve the authenticated actor without consulting the runner cache.
+ */
+export function assertLiveActor(expected?: string | undefined): string {
   const actor = activeRunner.liveActor
     ? activeRunner.liveActor()
     : activeRunner.currentActor
@@ -320,7 +327,10 @@ export function authenticatedRows<T extends Record<string, unknown>>(
   rows: T[],
   options?: { graphql?: boolean; actor?: string },
 ): T[] {
-  const actor = assertActor(options?.actor);
+  const actor =
+    options?.actor === undefined
+      ? currentActor()
+      : assertLiveActor(options.actor);
   return rows.filter((row) => {
     const user = row['user'] as { login?: string } | undefined;
     const author = row['author'] as { login?: string } | undefined;
@@ -509,10 +519,13 @@ export function getIssueComments(
   pr: number,
   expectedActor?: string,
 ): Array<Record<string, unknown>> {
+  if (expectedActor === undefined) {
+    return authenticatedRows(getAllIssueComments(repo, pr));
+  }
   // Pin the authenticated identity before fetching replay candidates. If the
   // credential backing `gh` changes between subprocesses, a caller must never
   // adopt comments fetched under one identity as history owned by another.
-  const actor = assertActor(expectedActor);
+  const actor = assertLiveActor(expectedActor);
   const rows = getAllIssueComments(repo, pr);
   return authenticatedRows(rows, { actor });
 }
@@ -571,9 +584,14 @@ function verifyOwnedComment(
   label: string,
   expectedActor?: string,
 ): void {
-  const actor = assertActor(expectedActor);
+  const actor =
+    expectedActor === undefined
+      ? assertActor()
+      : assertLiveActor(expectedActor);
   const response = jsonOutput<Record<string, unknown>>(['api', endpoint]);
-  assertActor(actor);
+  if (expectedActor !== undefined) {
+    assertLiveActor(actor);
+  }
   const user = (response['user'] ?? response['author']) as
     | { login?: string }
     | undefined;
