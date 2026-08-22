@@ -37,11 +37,36 @@ Proceed in the current session only after an explicit override.
    and open a draft PR before invoking a review lane.
 4. Require local HEAD, remote head, and PR head to match.
 5. Record the PR number and exact base SHA. Read every prior review thread,
-   including resolved and outdated threads.
+   including resolved and outdated threads. Telemetry markers are not review
+   context: exclude them by marker prefix and never carry them into a lane's
+   prompt or packet. Where any remaining thread carries a v3 finding or
+   disposition record, write its comment ID to an owner-only file before
+   running a lane: that snapshot is the ledger's
+   `--historical-comment-ids-file`, and it is the one attestation input that
+   cannot be reconstructed once this pass has posted its own findings.
+
+This chain emits no telemetry record of its own. Each sub-skill it actually
+invokes snapshots and emits for itself, so the wrapper never adds a third record
+that double-counts their work. A skipped refactor phase is not an invoked pass
+and emits no refactor record. See
+[`../../REVIEW_WORKFLOW.md`](../../REVIEW_WORKFLOW.md) "Pass Telemetry".
+
+That is deliberately not complete attribution, and the gap runs one way. This
+wrapper's own pre-flight — reading the ledger reference and every prior thread,
+classifying the changeset, building the packet, resolving the round, and any
+tier marker it posts — happens before the first sub-skill takes its snapshot, so
+no record covers it. The two handoff branches below are the extreme case: the
+whole wrapper pass precedes the single record the receiving lane emits. Deep
+records therefore understate the chain, and a `session-log-delta` emitted under
+this wrapper is scoped to its lane rather than to the chain. Do not read the
+Deep-versus-Lean comparison as if the two were measured on the same boundary.
+
 6. Apply the docs/config-only skip, per the ledger's changeset classification.
-   On a skip, finalize a clean v3 result using the ledger's wrapper/standalone
-   ownership rule, report `docs-config skip`, and exit without spending the
-   refactor latch.
+   On a skip, finalize a clean v3 result through immediate handoff to
+   `/critique <pr-number>`: that telemetry-owning lane takes its snapshot,
+   independently confirms the classification, finalizes the result, and emits
+   `status=skipped` under the ledger's wrapper/standalone ownership rule. Return
+   after it completes without spending the refactor latch.
 7. Resolve the changed-file list once for the initial packet. If refactorpass
    commits, that packet ends with its reviewed head: reload the PR head and
    build a new immutable packet before deep critique. If refactorpass is a no-op,
@@ -113,7 +138,37 @@ least one fixed finding fails closed. Do not emit `clean` for a cleanup-moved en
 For a blocked pass, put the safe blocker in an owner-only
 regular file and call `write-blocked-result`.
 
-## Phase 3: Handoff
+## Phase 3: Auto-mode relay
+
+Skip this phase in session mode, where the user starts the next reviewer in a
+fresh terminal.
+
+In auto mode, read the effective roster and exact-head coverage from the ledger,
+then start each declared reviewer that holds no attestation at the current head.
+Honour the roster as declared; treat `gemini` as a default only when declaring a
+new relay, and supersede an existing declaration explicitly rather than swapping
+a reviewer already in flight.
+
+Start the `gemini` reviewer only through its launcher, which owns the model,
+effort, permission, output, and timeout contract:
+
+```bash
+.claude/skills/critique/scripts/run-agy-review.sh \
+  --repo <owner/repo> --pr <pr-number> --base <review-base-sha> \
+  --head <reviewed-head-sha> --round <round>
+```
+
+An engine with no checked-in launcher runs in session mode.
+
+The launcher exiting zero is necessary and not sufficient. After it returns,
+confirm that engine's authenticated attestation at the exact reviewed head with
+the ledger helper's `verify-coverage`. A nonzero exit with attestation present
+means the reviewer's CLI reported a turn-level error over work that landed —
+report it, re-run the round, and change nothing in the launcher. A zero exit
+with no attestation at that head means the round is not covered. State the
+launcher exit, the structured status, and the coverage result.
+
+## Phase 4: Handoff
 
 Print:
 
@@ -122,13 +177,15 @@ Print:
 - Reviewed head: <sha>
 - Tier: deep (trigger: <trigger>)
 - Round: <n> (<adversarial | convergence>)
+- Relay: <auto: engines launched and their coverage | session>
 - Refactor pass: <ran | already spent at <sha> | docs-config skip>
 - Findings: <posted/replied/resolved counts>
 - Review depth: <agents run>
 - Classification: <clean | minor | material>
 
 Next local step:
-  Run each declared reviewer that has not attested this head.
+  Run each declared reviewer that has not attested this head — through its
+  launcher in auto mode, or in a fresh terminal in session mode.
   A fix invalidates only the attestations naming the superseded head; a
   reviewer that already attested this head does not re-run.
   The outer runner decides convergence from the exact-head v3 results.

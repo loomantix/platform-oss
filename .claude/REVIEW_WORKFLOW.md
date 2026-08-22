@@ -177,12 +177,19 @@ review is permitted but must be declared with a reason; see step 2.
    session's memory.
 3. Pin the exact base SHA for the round, resolve the tier, and give both to
    every reviewer. Do not start a reviewer with the tier unresolved.
-4. Run each declared reviewer in a fresh session against the current head, under
-   the ledger's comment/fix/reply/resolve contract. Claude's lane is
-   `critique <pr-number>` at Lean and `deepcritique <pr-number>` at Deep; other
-   engines use their own equivalents. Reviewer order within a round is a
-   scheduling choice, not a protocol rule — what matters is which commit each
-   one read.
+4. Run each declared reviewer against the current head, under the ledger's
+   comment/fix/reply/resolve contract. Claude's lane is `critique <pr-number>`
+   at Lean and `deepcritique <pr-number>` at Deep; other engines use their own
+   equivalents. Reviewer order within a round is a scheduling choice, not a
+   protocol rule — what matters is which commit each one read.
+
+   How a non-author reviewer starts is a session choice, not a protocol rule.
+   **Session mode** — the user starts each reviewer in a fresh terminal — is
+   always available and is the only mode for an engine with no tested launcher.
+   **Auto mode** lets the current session start a declared reviewer itself,
+   through that engine's checked-in launcher and nothing else. Both modes carry
+   the same contract and neither changes which commit an attestation names.
+
 5. Classify fixes by effect, not path or finding severity. `material` includes
    substantive correctness, security/privacy, data-safety, compatibility,
    deployment/sync, or review-integrity changes, including tests or workflows
@@ -243,6 +250,44 @@ review is permitted but must be declared with a reason; see step 2.
    the stopping rule above. Leave the PR draft and report non-convergence
    instead of continuing an unbounded cycle.
 
+### Auto mode
+
+Auto mode is available for the `gemini` reviewer, launched through
+[`skills/critique/scripts/run-agy-review.sh`](skills/critique/scripts/run-agy-review.sh).
+The launcher pins `gemini-3.7-flash-high`, literal `--effort high`, accept-edits
+mode, unattended permissions, structured JSON output, and a 60-minute print
+bound; a caller supplies only the repository, PR, base, head, and round. It
+refuses to start unless the current repository, the PR's ownership and head
+repository, local HEAD, PR head, and remote head all match the requested exact
+head over a clean worktree, and unless the reviewer CLI resolves exactly one
+live `deepcritique` skill backed by a clean `loomantix/gemini-platform`
+checkout at the launcher's pinned commit that vendors this engine's
+`review-ledger` version. Hand-composing the CLI command instead is outside the
+tested contract.
+
+Honour the effective roster exactly: run the declared reviewers that lack an
+attestation at the current head, and treat `gemini` as a default only when
+declaring a new relay. Replacing a reviewer already in flight takes an explicit
+superseding declaration.
+
+**A returning launcher is not a completed review.** Accept the round only when
+the launcher exits zero — it requires structured `status == SUCCESS` and a
+non-blank response — _and_ `verify-coverage` shows that engine's authenticated
+attestation at the exact reviewed head. The two disagree in both directions: the
+Antigravity CLI reports a turn-level `ERROR` when any single tool call in the
+turn failed, so a review that finished and posted its ledger evidence can still
+exit nonzero; and a reviewer can narrate completion, or post a comment, without
+publishing a result at the head that will merge. Read the ledger rather than the
+narration, and re-run the round rather than relaxing the launcher.
+
+The launcher starts a fresh one-shot by omitting every continuation flag. The
+Antigravity CLI has no equivalent of Claude's `--no-session-persistence`, so it
+still records a local conversation; use session mode where local conversation
+persistence is prohibited.
+
+The `agent-loop` wrapper drives its own fixed engine slots and is not part of
+this lane.
+
 The author engine's own adversarial pass never counts toward coverage. It
 re-reads the change while still holding the rationale that produced it, which is
 the opposite of the cold read the relay exists to obtain. `coverage` reports it
@@ -299,6 +344,191 @@ Invocation:
 
 `reviewit`'s iteration cap is the tier's round cap: two at Lean, four at Deep.
 
+## Pass Telemetry
+
+Every pass records what it cost, as a `local-review-telemetry:v1` marker in its
+own PR comment. The record carries token buckets per exact model, classified
+line churn, finding dispositions, and the pass identity needed to ask whether
+Deep earns its cost. It carries no prose, no file paths, no finding titles, and
+no money: rates move and a subscription's marginal cost is zero, so a stored
+dollar figure is wrong when written and unverifiable later. Counts keep the
+whole series re-priceable.
+
+Emission is opt-in while extraction is being proven on one repository. The
+snapshot helper reads `LOOM_REVIEW_TELEMETRY` and does nothing unless it is
+`on`, ignoring surrounding whitespace and case. Any other non-empty value is
+neither on nor off: the helper stays disabled and reports an error, so a typo
+reads as a misconfiguration rather than as a deliberate opt-out. It is
+environment configuration set once, never an interactive prompt during a pass —
+a prompt would block an autonomous run.
+
+### Never read a telemetry marker
+
+A pass must not read prior telemetry: not into a finder prompt, not into a
+review packet, not into context assembly, not into a summary of the PR. An
+agent that can see its own measured cost and a readable trend has been handed a
+target, and the thing it can most easily optimise is the review rather than the
+spend. Reporting **this** pass's own numbers at the end, after findings are
+posted, is fine — a single figure with no baseline is not a trend.
+
+Filter by the `local-review-telemetry:` prefix rather than by a list of known
+markers, so a record type added later is excluded by default instead of leaking
+into reviewer context until someone teaches the filter about it.
+
+### Snapshot before, delta after
+
+`<usage-helper>` is `.claude/skills/critique/scripts/usage-snapshot.js`, beside
+the vendored ledger helper and invoked the same way. It reads this engine's own
+session log; the ledger helper never does, and never may.
+
+Write telemetry working files to `$AGENT_LOOP_LOG_DIR/telemetry/` when that
+variable is set, or to another owner-only directory outside the Git worktree.
+
+After the pre-flight has resolved the mandatory repository, PR, base, head,
+round, and stance identity, but before it reads review threads, classifies the
+changeset, or invokes the first reviewer or cleanup agent:
+
+```bash
+node <usage-helper> snapshot --out "<telemetry-dir>/usage-start.json"
+```
+
+The skill and identity-resolution pre-flight necessarily precede this boundary
+and are not included in the record. A failure before the boundary reports
+`telemetry not emitted: boundary unresolved`; it cannot truthfully construct the
+PR-bound record that `emit-telemetry` requires. A failure after the snapshot has
+all mandatory identity fields and emits `status=blocked`. Compare pass records
+only on this shared boundary.
+
+After the pass has finalized its v3 result, and after any fix commits:
+
+```bash
+node <usage-helper> delta \
+  --start "<telemetry-dir>/usage-start.json" --out-dir "<telemetry-dir>"
+```
+
+`delta` prints `enabled`, `tokenSource`, `reason`, `engineVersion`,
+`durationSeconds`, and the paths it wrote. When `enabled` is false, do not
+invoke `emit-telemetry`. Otherwise pass non-null values through verbatim, except
+`reason`: it is diagnostic only, names why a measurement was downgraded or
+abandoned, is not an `emit-telemetry` argument, and never upgrades provenance.
+Report it in the pass output so a telemetry outage can be told apart from
+telemetry being switched off. A failed `snapshot` reports `scoped: false` and no
+`snapshotFile`; treat the start file it did not write as stale and do not pass
+it to `delta`. `tokenSource` is the provenance of the numbers and must never be
+upgraded by hand:
+
+- `session-log-delta` — measured, scoped to this pass.
+- `unscoped-session` — an unattributed session total. It may include or omit
+  work relative to this pass and must not be used in pass-cost comparisons. A
+  standalone pass with no usable start snapshot lands here.
+- `unavailable` — no usable data, and the record carries **no** token buckets.
+
+**A pass with no usable usage data must never emit zero tokens.** A zero makes
+the engine look free and skews every average in its favour, and it is the kind
+of defect that survives a year because the dashboard still looks plausible.
+Aggregation excludes a missing measurement; nothing zero-fills it. The rule is
+about absence versus measured zero, so it holds for every count the helper
+reports, not only the token buckets, and an `unavailable` record reports no
+engine version, duration, or turn count at all — a record that has declared its
+own inputs unusable may not go on to quote values drawn from them.
+
+### Count the findings
+
+Write this pass's own dispositions to a regular file with the active
+file-editing tool — never a heredoc or command substitution:
+
+```json
+{
+  "posted": 0,
+  "bySeverityAndOutcome": {
+    "blocking": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "major": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "minor": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "nit": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 }
+  },
+  "chainInducedRegressions": 0
+}
+```
+
+For this schema, `posted` is the number of unique finding threads this pass
+handled: the union of roots it newly posted and inherited occurrences it
+dispositioned. Count each thread once even when both happened in this pass; this
+keeps `posted` greater than or equal to the summed outcomes the helper validates.
+`chainInducedRegressions`
+counts new fingerprints whose diff anchor traces via `git blame` to a commit
+recorded as a fix SHA in an earlier disposition **on this PR** — rework the
+chain caused itself, which is far more expensive than either a finding or a
+clean pass. A `reopen-occurrence` is not one of these: that is the same defect
+still present, not a new one the chain introduced.
+
+### Emit the record
+
+```bash
+node <ledger-helper> emit-telemetry \
+  --repo <owner/repo> --pr <number> --engine claude \
+  --base <full-base-sha> --head <full-head-sha> \
+  --pass-type <review|refactor> --review-tier <lean|deep> \
+  --trigger <autonomous|interactive> --round <n> \
+  --stance <adversarial|convergence> --status <clean|changed|blocked|skipped> \
+  --token-source <from delta> --engine-version <from delta> \
+  --duration-seconds <from delta> \
+  --tokens-file <from delta> --lanes-file <from delta> \
+  --findings-file <path>
+```
+
+Omit `--review-tier`, `--engine-version`, `--duration-seconds`, `--tokens-file`,
+and `--lanes-file` whenever the corresponding value is null. A docs/config-only
+skip can legitimately have no resolved review tier, and unavailable usage can
+legitimately have no engine version or duration; the omitted options serialize
+as null without inventing a value or failing the emission.
+
+`--stance` is the one value on this list's other side: it is mandatory and
+cannot be omitted, yet it follows the tier's schedule, and the two schedules
+diverge from round 2. A branch that emits before a tier is resolved — a
+docs/config skip, or a cleanup lane that resolves no tier at all — must
+therefore derive it rather than reaching for the tier it does not have. Read the
+effective tier marker already on the PR, without classifying or posting one, and
+fall back to `adversarial` when none exists: a PR carrying no tier marker has
+had no prior round, and both schedules make round 1 adversarial. Resolve this
+before the first branch that can emit, not at the point of emission.
+Omit `--changeset-file` and the classifier runs over `<base>..<head>` itself.
+Add `--truncated` when a lane silently truncated the diff it was given: a lane
+that reviewed less than it was asked to produces cheap, bad findings, which is
+the exact pattern that otherwise reads as efficiency.
+
+`trigger` is `autonomous` when a runner set the `AGENT_LOOP_*` variables and
+`interactive` otherwise.
+
+### What each pass emits
+
+| Pass                                  | `--pass-type` | `--status` |
+| ------------------------------------- | ------------- | ---------- |
+| Adversarial pass, nothing to fix      | `review`      | `clean`    |
+| Adversarial pass that committed a fix | `review`      | `changed`  |
+| Pass that could not complete          | `review`      | `blocked`  |
+| Docs/config-only skip                 | `review`      | `skipped`  |
+| Cleanup pass that committed           | `refactor`    | `changed`  |
+| Cleanup pass that found nothing       | `refactor`    | `clean`    |
+| Cleanup skipped on a spent latch      | `refactor`    | `clean`    |
+| Cleanup on a docs/config-only skip    | `refactor`    | `skipped`  |
+| Cleanup that could not complete       | `refactor`    | `blocked`  |
+
+A skip still burns tokens reading and classifying the PR, and "we spent eight
+thousand tokens deciding not to review" is exactly the machinery overhead worth
+seeing. `skipped` is reserved for the changeset that had nothing reviewable in
+it — the record rejects a `skipped` pass carrying review-significant files, so a
+cleanup pass that stopped on a spent latch reports `clean` instead. Its
+changeset was reviewable; this engine had simply already spent its one pass.
+
+### Emission failure is never fatal
+
+`emit-telemetry` exits zero either way and prints `emitted` with the reason on
+failure. Report that outcome and move on. Never retry it into the review, never
+let it change the v3 result, and never let it delay marking the PR ready. This
+is why the record is a separate marker in a separate comment rather than an
+extension of the attestation, whose body is byte-verified and hash-checked: a
+telemetry defect must not fail a review that found real defects.
+
 ## Review Principles
 
 - Treat generated findings as hypotheses; verify against source before posting.
@@ -338,6 +568,11 @@ Invocation:
 - [`references/local-review-ledger.md`](references/local-review-ledger.md) — the
   PR-thread ledger contract, including the shared docs/config-only changeset
   classification every skill skips on.
+- `skills/critique/scripts/usage-snapshot.js` — this engine's pass-scoped usage
+  extractor. It reads the session log, which the vendored ledger helper never
+  does; see "Pass Telemetry" above.
+- [`skills/critique/scripts/run-agy-review.sh`](skills/critique/scripts/run-agy-review.sh)
+  — the auto-mode launcher for the `gemini` reviewer.
 - [`skills/refactorpass/SKILL.md`](skills/refactorpass/SKILL.md) ·
   [`skills/critique/SKILL.md`](skills/critique/SKILL.md) ·
   [`skills/deepcritique/SKILL.md`](skills/deepcritique/SKILL.md) ·
