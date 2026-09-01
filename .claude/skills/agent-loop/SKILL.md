@@ -54,25 +54,26 @@ The config is parsed as literal `key = value` lines and is never sourced.
 Unknown or duplicate keys fail closed. Hook values are shell commands executed
 with the issue worktree as the current directory.
 
-| Key                                              | Purpose                                                                                                                                              |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `base_branch`                                    | Integration branch; env `AGENT_LOOP_BASE_BRANCH` overrides it.                                                                                       |
-| `setup_hook`                                     | Isolated bootstrap, such as `pnpm install --frozen-lockfile`. Never symlink mutable dependency directories.                                          |
-| `validation_hook`                                | Bounded validation after the worker, after each review, and after fresh-base integration.                                                            |
-| `review_contract_version`                        | New and migrated consumers use `3`; version `2` remains temporarily accepted for staged sync compatibility.                                          |
-| `config_doctor`                                  | Run the non-mutating compatibility preflight before issue selection or claim.                                                                        |
-| `claude_effort_policy`                           | Optional literal Claude effort policy enforced by the doctor.                                                                                        |
-| `review_max_rounds`                              | Maximum complete Codex→Claude rounds. Default `4`; cap exhaustion preserves the draft PR.                                                            |
-| `claude_review_hook`                             | Required local Claude PR review. Reads the ledger, comments before fixes, publishes through `$AGENT_LOOP_REVIEW_PUSH_HELPER`, replies, and resolves. |
-| `codex_review_hook`                              | Required local Codex PR review with the same ledger contract.                                                                                        |
-| `worker_hook`                                    | Optional worker command override. Default is the Claude CLI in headless, auto-approving mode.                                                        |
-| `worker_model`, `worker_fallback_model`          | Primary and capacity-fallback models for the default worker.                                                                                         |
-| `worker_retries`                                 | Retries after clean capacity/timeout failures. Default `1`.                                                                                          |
-| `worker_timeout_seconds`, `hook_timeout_seconds` | Bounded execution time.                                                                                                                              |
-| `retry_on_timeout`, `retry_delay_seconds`        | Timeout retry policy.                                                                                                                                |
-| `dependency_gate`                                | `ready` (legacy) or `merged-to-base`.                                                                                                                |
-| `branch_prefix`, `worktree_root`, `log_root`     | Isolated path/ref controls.                                                                                                                          |
-| `log_max_kb`, `output_max_lines`                 | Bound captured logs and displayed failure tails.                                                                                                     |
+| Key                                              | Purpose                                                                                                                                                                                                      |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `base_branch`                                    | Integration branch; env `AGENT_LOOP_BASE_BRANCH` overrides it.                                                                                                                                               |
+| `setup_hook`                                     | Isolated bootstrap, such as `pnpm install --frozen-lockfile`. Never symlink mutable dependency directories.                                                                                                  |
+| `validation_hook`                                | Bounded validation after the worker, after each review, and after fresh-base integration.                                                                                                                    |
+| `review_contract_version`                        | New and migrated consumers use `3`; version `2` remains temporarily accepted for staged sync compatibility.                                                                                                  |
+| `config_doctor`                                  | Run the non-mutating compatibility preflight before issue selection or claim.                                                                                                                                |
+| `claude_effort_policy`                           | Optional literal Claude effort policy enforced by the doctor.                                                                                                                                                |
+| `review_max_rounds`                              | Codex→Claude round cap from `1` through the hard ceiling `4`. Default `4`; exhaustion preserves the draft PR.                                                                                                |
+| `review_timeout_seconds`                         | Positive wall-clock budget for one issue's review, persisted across resume. Default `7200`; each review pass and its validation is capped at the smaller of the remaining budget and `hook_timeout_seconds`. |
+| `claude_review_hook`                             | Required local Claude PR review. Reads the ledger, comments before fixes, publishes through `$AGENT_LOOP_REVIEW_PUSH_HELPER`, replies, and resolves.                                                         |
+| `codex_review_hook`                              | Required local Codex PR review with the same ledger contract.                                                                                                                                                |
+| `worker_hook`                                    | Optional worker command override. Default is the Claude CLI in headless, auto-approving mode.                                                                                                                |
+| `worker_model`, `worker_fallback_model`          | Primary and capacity-fallback models for the default worker.                                                                                                                                                 |
+| `worker_retries`                                 | Retries after clean capacity/timeout failures. Default `1`.                                                                                                                                                  |
+| `worker_timeout_seconds`, `hook_timeout_seconds` | Bounded execution time.                                                                                                                                                                                      |
+| `retry_on_timeout`, `retry_delay_seconds`        | Timeout retry policy.                                                                                                                                                                                        |
+| `dependency_gate`                                | `ready` (legacy) or `merged-to-base`.                                                                                                                                                                        |
+| `branch_prefix`, `worktree_root`, `log_root`     | Isolated path/ref controls.                                                                                                                                                                                  |
+| `log_max_kb`, `output_max_lines`                 | Bound captured logs and displayed failure tails.                                                                                                                                                             |
 
 Hooks receive `AGENT_LOOP_ISSUE_ID`, `AGENT_LOOP_BASE_BRANCH`,
 `AGENT_LOOP_BRANCH`, `AGENT_LOOP_WORKTREE`, `AGENT_LOOP_LOG_DIR`, and
@@ -119,6 +120,74 @@ byte-level review of the region in the same PR — the diff is the audit trail.
 A consumer that sets `worker_hook` supplies its own runner and the Claude CLI
 is not required on `PATH`.
 
+## Model Selection
+
+The loop runs three model-backed aspects, and they are configured in two
+different places. This is the most common onboarding question, so it is spelled
+out here.
+
+| Aspect         | Where the model is chosen                | Effort control                                                        |
+| -------------- | ---------------------------------------- | --------------------------------------------------------------------- |
+| Default worker | `worker_model` / `worker_fallback_model` | none — the default worker invocation takes a model only               |
+| Codex review   | inside `codex_review_hook`               | inside the same command                                               |
+| Claude review  | inside `claude_review_hook`              | inside the same command, and validated against `claude_effort_policy` |
+
+A review hook is a literal shell command, so reviewer model and effort are
+ordinary flags on that command rather than dedicated config keys. These
+fragments show flag placement only; a working hook must also carry
+`AGENT_LOOP_REVIEW_PUSH_HELPER`, `AGENT_LOOP_REVIEW_RESULT_FILE`, and
+`write-result`, or contract-v3 preflight rejects it:
+
+```
+claude_review_hook = claude --print --effort low --model <model-id> /deepcritique ...
+codex_review_hook  = codex exec -c model_reasoning_effort=medium ... /deepcritique ...
+```
+
+`claude_effort_policy` constrains only `claude_review_hook`, and only when
+`config_doctor = true` — the doctor is what enforces it, so the key is inert
+without it. It does not apply to the worker, which has no effort control.
+
+`worker_model` and `worker_fallback_model` configure the **default** worker
+only. When `worker_hook` is set the wrapper runs that hook verbatim and both
+keys are ignored, so a hook pins its own model, in the hook. For the default
+worker, `worker_fallback_model` is used only after a clean capacity failure that
+left the worktree unchanged; a timeout retries on the primary model.
+
+### Choosing per aspect
+
+Measured across real issues, wall clock splits roughly as:
+
+- review passes: **75-84%** (of which the two engines split about 2:1)
+- worker: **10-17%**
+- validation: **9-12%**
+
+So reviewer choice dominates _cost_, while worker choice dominates _how many
+rounds are needed_ — round one consistently produces the most findings, and a
+cleaner first draft is what removes a round. A round costs far more than a
+worker pass, so the cheapest slot is usually the one worth upgrading.
+
+Leaving `worker_model` empty is not a neutral default: the default worker then
+runs on whatever the CLI currently defaults to, which moves with CLI releases.
+Pin it.
+
+### Current limitation: the engine roster is fixed
+
+Both `claude_review_hook` and `codex_review_hook` are **required**, and the
+roster and order are hardcoded as Codex then Claude. There is no key for a third
+engine and no supported way to omit one.
+
+What preflight enforces is that both hook strings are non-empty and carry the
+contract tokens; it never checks that a reviewer CLI is installed. So a run
+missing one CLI starts, claims the issue, completes the worker pass and
+validation, pushes, opens the draft PR, and only then fails at that engine's
+leg — leaving a claimed issue and an abandoned draft behind.
+
+This is a wrapper limitation rather than a contract one: `review-ledger.js`
+already treats `gemini` and `antigravity` as first-class engine identities, and
+`run-agy-review.sh` already accepts a wrapper-supplied per-pass bound. A hook
+that substitutes one engine's CLI for another's would record the pass under the
+wrong engine identity and corrupt the ledger's roster, so it is not a workaround.
+
 ## Deterministic Phase Order
 
 1. Select and dependency-gate an eligible issue.
@@ -132,13 +201,16 @@ is not required on `PATH`.
    safe-push helper, posts structured fix and final-lane
    completion evidence, then resolves.
 8. If either engine made material fixes, restart from Codex. Stop after
-   `review_max_rounds` and preserve the draft.
+   `review_max_rounds` or the persisted whole-run deadline and preserve the draft.
 9. Re-attest the exact issue contract and dependencies, excluding only the
    wrapper-captured PR from the addressed-by-open-PR check. Require a complete
    clean round plus replies and resolutions on every marked thread, then mark
    the PR ready.
 
-Do not invoke Gemini, Copilot, `reviewit`, or any GitHub-hosted AI reviewer.
+Do not invoke `reviewit`, Copilot, or any GitHub-hosted AI reviewer, including
+hosted Gemini. This bans _hosted_ review, not the local `gemini` engine identity
+that the ledger and `run-agy-review.sh` already support; the wrapper simply has
+no roster slot to run it from today.
 
 ## Dependency Gate
 
