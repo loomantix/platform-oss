@@ -63,8 +63,9 @@ Resolve the changed-file list once with
    machines, partial-failure and rollback paths: correctness that is not
    readable from the diff.
 5. **Recurring-incident area** — the touched paths produced a post-merge defect,
-   revert, or hotfix in roughly the last 90 days
-   (`git log --oneline --since=90.days -- <paths>`).
+   revert, or hotfix in roughly the last 90 days. Evidence is a specific defect,
+   revert, or hotfix commit you can name; ordinary commit traffic on an actively
+   developed path is not evidence, and neither is the path being important.
 6. **Explicitly requested** — a human directly asked for a deep review, or the
    change is a first of its kind the author cannot self-assess. An internal
    `deep` argument passed between tier-aware skills only asserts the recorded
@@ -255,8 +256,16 @@ review is permitted but must be declared with a reason; see step 2.
 Auto mode is available for the `gemini` reviewer, launched through
 [`skills/critique/scripts/run-agy-review.sh`](skills/critique/scripts/run-agy-review.sh).
 The launcher pins `gemini-3.7-flash-high`, literal `--effort high`, accept-edits
-mode, unattended permissions, structured JSON output, and a 60-minute print
-bound; a caller supplies only the repository, PR, base, head, and round. It
+mode, unattended permissions, and structured JSON output. A pass defaults to a
+30-minute bound through `LOCAL_REVIEW_PASS_TIMEOUT_SECONDS`; values above the
+hard 3600-second ceiling are rejected. Under agent-loop the wrapper sets that
+variable itself, to the smallest of what remains of the run's
+`review_timeout_seconds` budget, the configured `hook_timeout_seconds`, and that
+same 3600-second ceiling — less a margin, so the reviewer CLI reaches its own
+timeout and writes a structured result before the wrapper's bound kills it. On
+the shipped defaults the remaining budget is not the binding constraint until
+more than half of it is gone.
+A caller supplies only the repository, PR, base, head, and round. It
 refuses to start unless the current repository, the PR's ownership and head
 repository, local HEAD, PR head, and remote head all match the requested exact
 head over a clean worktree, and unless the reviewer CLI resolves exactly one
