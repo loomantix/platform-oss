@@ -703,10 +703,10 @@ function runCliCommand(argv: string[]): number {
         args.pr === undefined ||
         !args.head ||
         args.commentId === undefined ||
-        !args.bodyFile
+        (!args.bodyFile && !args.contentFile)
       ) {
         fail(
-          'reply requires --repo, --pr, --head, --comment-id, and --body-file',
+          'reply requires --repo, --pr, --head, --comment-id, and --body-file or --content-file',
         );
       }
       const out = reply({
@@ -715,6 +715,11 @@ function runCliCommand(argv: string[]): number {
         head: args.head,
         commentId: args.commentId,
         bodyFile: args.bodyFile,
+        contentFile: args.contentFile,
+        engine: args.engine,
+        round: args.round,
+        fingerprint: args.fingerprint,
+        outcome: args.outcome,
       });
       process.stdout.write(JSON.stringify(out) + '\n');
       break;

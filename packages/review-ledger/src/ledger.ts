@@ -200,28 +200,32 @@ export function threadProtocolRecords(
     if (thread.isResolved !== true) {
       fail('legacy local-review finding thread is unresolved');
     }
-    const used = new Set<number>();
+    // V1 tracked root causes, not numbered occurrences. A later pass could
+    // confirm the correction for earlier passes (including another engine),
+    // and repeated confirmations were normal. These are settled historical
+    // threads only; v3 pairing and exact-head coverage remain strict.
     for (const [findingIndex, finding] of findingsV1) {
-      const matches = dispositionsV1.filter(
+      const settled = dispositionsV1.some(
         ([index, disposition]) =>
           index > findingIndex &&
-          disposition.engine === finding.engine &&
-          disposition.round === finding.round &&
           disposition.fingerprint === finding.fingerprint,
       );
-      if (matches.length !== 1) {
+      if (!settled) {
         fail(
-          'legacy local-review finding lacks exactly one matching disposition',
+          'legacy local-review finding lacks a later root-cause disposition',
         );
       }
-      const dispositionIndex = matches[0]![0];
-      if (used.has(dispositionIndex)) {
-        fail('legacy local-review disposition matches multiple findings');
-      }
-      used.add(dispositionIndex);
     }
-    if (used.size !== dispositionsV1.length) {
-      fail('legacy local-review ledger contains an orphan disposition');
+    for (const [dispositionIndex, disposition] of dispositionsV1) {
+      if (
+        !findingsV1.some(
+          ([index, finding]) =>
+            index < dispositionIndex &&
+            finding.fingerprint === disposition.fingerprint,
+        )
+      ) {
+        fail('legacy local-review ledger contains an orphan disposition');
+      }
     }
   }
 
@@ -1196,12 +1200,55 @@ export function reply(params: ReplyParams): {
   comment_id: number;
   verified: true;
 } {
-  const body = readLegacyBody(
-    params.bodyFile ?? '-',
-    DISPOSITION_V1,
-    params.body,
-  );
+  const content = resolveContent(params);
+  let body: string;
+  if (content !== undefined) {
+    if (
+      !params.engine ||
+      params.round === undefined ||
+      !params.fingerprint ||
+      !params.outcome
+    ) {
+      fail(
+        'legacy reply content requires engine, round, fingerprint, and outcome',
+      );
+    }
+    // Reuse canonical field validation; only the historical wire layout differs.
+    buildDispositionBody({
+      engine: params.engine,
+      round: params.round,
+      head: params.head,
+      fingerprint: params.fingerprint,
+      outcome: params.outcome,
+      occurrence: 1,
+      content,
+    });
+    body = `${DISPOSITION_V1}engine=${params.engine} round=${params.round} head=${params.head} fingerprint=${params.fingerprint} outcome=${params.outcome} -->\n${content}`;
+  } else {
+    body = readLegacyBody(params.bodyFile ?? '-', DISPOSITION_V1, params.body);
+  }
   verifyHead(params.repo, params.pr, params.head);
+  if (content !== undefined) {
+    const thread = reviewThreads(params.repo, params.pr).find(
+      (candidate) =>
+        candidate.comments.nodes[0]?.databaseId === params.commentId,
+    );
+    const actor = currentActor();
+    if (
+      !thread?.comments.nodes.some((row) => {
+        if ((row.author ?? row.user)?.login !== actor) return false;
+        const match = FINDING_V1_RE.exec(String(row.body ?? ''));
+        if (!match || match.groups?.['fingerprint'] !== params.fingerprint)
+          return false;
+        verifyV1Marker(String(row.body), match, 'finding');
+        return true;
+      })
+    ) {
+      fail(
+        'legacy reply must name an actor-owned finding in the target thread',
+      );
+    }
+  }
   const response = jsonOutput(
     [
       'api',
