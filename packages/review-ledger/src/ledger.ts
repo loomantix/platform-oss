@@ -1229,7 +1229,10 @@ export function reply(params: ReplyParams): {
   }
   verifyHead(params.repo, params.pr, params.head);
   if (content !== undefined) {
-    const thread = findRootThread(params.repo, params.pr, params.commentId);
+    const thread = reviewThreads(params.repo, params.pr).find(
+      (candidate) =>
+        candidate.comments.nodes[0]?.databaseId === params.commentId,
+    );
     const actor = currentActor();
     if (
       !thread?.comments.nodes.some((row) => {

@@ -47,7 +47,8 @@ describe('structured legacy disposition repair', () => {
       contentFile,
       'Rechecked the correction at the current head.\n',
     );
-    const record = thread([finding()]);
+    // Legacy reviews sometimes added a second root cause as a thread reply.
+    const record = thread(['Original review discussion.', finding()]);
     let posted: { body: string } | undefined;
     setGitHubRunner({
       currentActor: () => 'reviewer',
