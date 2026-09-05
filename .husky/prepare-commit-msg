@@ -1,0 +1,40 @@
+# Add the DCO `Signed-off-by` trailer that CONTRIBUTING.md requires.
+#
+# This repo pins `core.hooksPath` to `.husky/_`, so a hook installed in a
+# global hooks directory never runs here. This is the in-repo equivalent.
+#
+# It ANNOUNCES what it added rather than doing it silently. CONTRIBUTING
+# frames sign-off as the contributor certifying the Developer Certificate of
+# Origin, so a hook that appends the trailer without saying so would certify
+# on someone's behalf who never read it. The notice prints only when the
+# trailer is actually added, so it stays quiet for anyone already using
+# `git commit -s`.
+
+msgfile="$1"
+[ -n "$msgfile" ] && [ -f "$msgfile" ] || exit 0
+
+# `git var` resolves the identity this commit will actually use, honouring a
+# repo-local override. Bail rather than guess if git cannot resolve one.
+ident=$(git var GIT_AUTHOR_IDENT 2>/dev/null) || exit 0
+name=${ident%% <*}
+rest=${ident#*<}
+email=${rest%%>*}
+[ -n "$name" ] && [ -n "$email" ] || exit 0
+
+trailer="Signed-off-by: $name <$email>"
+
+# Idempotent: an amend, a `-c`/`-C` reuse, or a rebase replaying an already
+# signed commit must not gain a second copy. Comment lines are excluded so the
+# example trailer inside git's own help block does not count as present.
+if grep -v '^#' "$msgfile" | grep -qxF "$trailer"; then
+  exit 0
+fi
+
+# `interpret-trailers` places it in the message's trailer block rather than
+# blindly appending, so it lands below an existing `Co-Authored-By:` instead
+# of splitting the block in two.
+git interpret-trailers --in-place --trailer "$trailer" "$msgfile" 2>/dev/null \
+  || printf '\n%s\n' "$trailer" >>"$msgfile"
+
+echo "husky: added \"$trailer\" (DCO, see CONTRIBUTING.md). Amend to remove it."
+exit 0

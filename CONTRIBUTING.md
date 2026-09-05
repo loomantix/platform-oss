@@ -25,6 +25,10 @@ Signed-off-by: Your Real Name <your.email@example.com>
 
 Use `git commit -s` to add the trailer automatically. CI rejects PRs with unsigned commits.
 
+If you have installed the dev dependencies, the repository's `prepare-commit-msg` hook adds the
+trailer for you and prints a line saying it did, so you can amend it away if you do not intend to
+certify the DCO for that commit. The hook is a convenience, not the authority — CI is still the gate.
+
 ## What we accept
 
 **In scope:**
