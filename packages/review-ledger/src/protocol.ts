@@ -228,7 +228,8 @@ export function matchMarkerLine(
 }
 
 /**
- * Enforce the legacy v1 marker layout: first complete line, non-empty content.
+ * Legacy tools placed their single marker before or after the prose. Require
+ * one standalone marker and non-empty prose without imposing v3's hashed layout.
  */
 export function verifyV1Marker(
   body: string,
@@ -236,10 +237,15 @@ export function verifyV1Marker(
   label: string,
 ): void {
   const matchEnd = match.index + match[0].length;
-  if (match.index !== 0 || !body.slice(matchEnd).startsWith('\n')) {
+  if (
+    (body.match(/<!-- local-review(?:-disposition)?:v1\b/g) ?? []).length !==
+      1 ||
+    (match.index > 0 && body[match.index - 1] !== '\n') ||
+    (matchEnd < body.length && !body.slice(matchEnd).startsWith('\n'))
+  ) {
     fail(`actor-owned v1 ${label} marker is malformed`);
   }
-  if (!body.slice(matchEnd + 1).trim()) {
+  if (!(body.slice(0, match.index) + body.slice(matchEnd)).trim()) {
     fail(`actor-owned v1 ${label} content is empty`);
   }
 }

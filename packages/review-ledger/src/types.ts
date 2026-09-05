@@ -281,6 +281,11 @@ export interface ReplyParams {
   commentId: number;
   bodyFile?: string | undefined;
   body?: string | undefined;
+  contentFile?: string | undefined;
+  engine?: SupportedEngine | undefined;
+  round?: number | undefined;
+  fingerprint?: string | undefined;
+  outcome?: SupportedOutcome | undefined;
 }
 
 /**

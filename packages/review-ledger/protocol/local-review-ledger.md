@@ -473,6 +473,24 @@ evidence, and they do not attest. Coverage counts local engines only.
 
 ## Rebuild context from GitHub
 
+Resolved, authenticated v1 threads are historical root-cause records. Their
+findings may carry the historical `severity=P0` through `P3` and `category`
+annotation pair. Every finding must have a later explicit disposition for its
+fingerprint. The single v1 marker may precede or follow its non-empty prose.
+Every disposition must name an earlier finding in the same
+thread. A later engine or round may confirm the correction for earlier passes;
+plain prose and a resolved flag alone do not establish disposition evidence.
+This compatibility does not grant current-head coverage or relax v3 occurrence
+pairing, content verification, or attestation requirements.
+
+When a settled v1 thread has only prose explaining its correction, re-verify
+the finding and append an explicit disposition using `reply --content-file`
+with `--engine`, `--round`, `--fingerprint`, and `--outcome`, plus the ordinary
+repository, PR, current head, and root comment ID arguments. The helper builds
+the legacy marker and checks that the target thread contains an actor-owned
+finding with that fingerprint. Preserve the original comments; never infer a
+fixed outcome merely from the resolved flag.
+
 At the start of every pass, read:
 
 - the PR description and changed files;
