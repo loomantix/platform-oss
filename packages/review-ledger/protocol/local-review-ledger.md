@@ -389,6 +389,10 @@ per-round evidence, and no automated runner parses it.
 
 ## Resolve the round, then pick the stance
 
+The controller-based instructions below apply only when the installed controller
+supports `status`. Otherwise follow that controller's declared round-selection
+flow within the authorized run; do not count historical runs as current rounds.
+
 Resolve this engine's round number before selecting lanes. Use
 `$AGENT_LOOP_REVIEW_ROUND` when the automated runner set it. Otherwise ask the
 run controller's `status` command for `next_round`: it counts only the
@@ -733,8 +737,15 @@ silence alone is neither completion evidence nor a reason to discard a valid
 result. Reuse verified CI at the exact head when it ran the required full suite;
 state any incomplete or failed local run separately.
 
-The run controller — the engine-specific script that owns run markers, named
-in your `REVIEW_WORKFLOW.md` and distinct from the ledger helper — reports the
+Run resumption belongs to the engine-specific controller, not the ledger helper;
+this package ships no controller commands. Confirm that the installed controller
+supports `status` and `resume-run` before using the contract below. Otherwise,
+follow its existing start/finish recovery flow within the applicable authorization,
+preserving completed evidence and the remaining budget. Do not claim an unsupported
+resume or silently reset the round cap.
+
+A compatible run controller — the engine-specific script that owns run markers,
+named in your `REVIEW_WORKFLOW.md` and distinct from the ledger helper — reports the
 next action through `status --repo ... --pr ... --head ... --engine ...`:
 `start-run`, `review`, `covered`, `resume-run`, `finish-exhausted`, or
 `finished`, with `next_round` present once a run exists.
