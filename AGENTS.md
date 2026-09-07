@@ -1,5 +1,23 @@
 # platform-oss — Agent Guide
 
+## OpenAI documentation (Codex and Agy)
+
+When a task needs facts about OpenAI products or APIs, including Codex
+configuration, use current official OpenAI documentation. This applies to
+both Codex and Agy (Antigravity/Gemini).
+
+- If `openai-docs` is available in the current client, use it and follow its
+  source routing. Do not assume another client's skills or global config apply.
+- Otherwise, use the OpenAI documentation MCP tools when available: search for
+  the topic, then fetch the relevant page. If unavailable or unhelpful, search
+  and open official pages on `developers.openai.com`, `platform.openai.com`,
+  or `learn.chatgpt.com`.
+- Cite supporting pages; state uncertainty when the sources do not establish
+  the answer. Preserve explicitly requested model targets and existing
+  provider choices unless the task authorizes a change.
+- Keep documentation queries generic; never send secrets, personal data, or
+  private repository content to documentation tools or web search.
+
 Public source for reusable `@loomantix/*` infrastructure packages. Apache 2.0 + DCO. See [README.md](README.md) for package overview, [CONTRIBUTING.md](CONTRIBUTING.md) for contribution workflow, and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Public-Repo Policy
