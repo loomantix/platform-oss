@@ -1379,6 +1379,7 @@ export function attest(params: AttestParams): AttestResult {
         );
         if (recovered === null) throw error;
         commentId = recovered.id;
+        body = recovered.body;
         replayed = true;
         created = false;
       } else {

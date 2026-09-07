@@ -806,6 +806,41 @@ describe('attestation identity is one per engine and round', () => {
     },
   );
 
+  it.each([false, true])(
+    'recovers delivered prose without accepting different evidence (conflict=%s)',
+    (conflict) => {
+      const [file, digest] = seal(changedResult());
+      const params = attestParams(file, digest);
+      const original = runner.runGh.bind(runner);
+      let deliveredBody = '';
+      const deliveredId = runner.commentIdSeq;
+      runner.runGh = (args: string[], payload?: unknown): string => {
+        const cmd = args.join(' ');
+        if (cmd.includes('-X POST') && cmd.includes('/issues/')) {
+          const { body } = payload as { body: string };
+          const marker = body.split('\n')[0]!;
+          deliveredBody = `${conflict ? marker.replace(digest, sha('different result')) : marker}\nExplanation from another in-flight retry.\n`;
+          original(args, { body: deliveredBody });
+          throw new LedgerError('Interrupted attestation POST');
+        }
+        return original(args, payload);
+      };
+
+      if (conflict) {
+        expect(() => attest(params)).toThrow(
+          'local-review attestation identity conflicts with existing evidence',
+        );
+      } else {
+        const recovered = attest(params);
+        expect(recovered.verified).toBe(true);
+        expect(recovered.replayed).toBe(true);
+        expect(recovered.comment_id).toBe(deliveredId);
+      }
+      expect(runner.issueComments).toHaveLength(1);
+      expect(runner.issueComments[0]!['body']).toBe(deliveredBody);
+    },
+  );
+
   it('replays sealed evidence when only the explanatory prose changes', () => {
     const [file, digest] = seal(changedResult());
     const first = attest(attestParams(file, digest));
