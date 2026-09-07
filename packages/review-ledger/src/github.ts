@@ -17,6 +17,7 @@ import {
   SHA_RE,
 } from './constants.js';
 import { requireToken, sha256Bytes } from './hash.js';
+import type { ReviewRun } from './runs.js';
 import type {
   GitHubReviewCommentNode,
   GitHubReviewThreadNode,
@@ -414,7 +415,8 @@ export function isAncestor(ancestor: string, descendant: string): boolean {
 }
 
 /**
- * Bind the attested review base to the PR's real base and to local history.
+ * Bind the pinned review base to the target branch lineage and local history.
+ * A target branch fast-forward does not change what this exact-head pass read.
  */
 export function verifyReviewBase(
   repo: string,
@@ -440,8 +442,27 @@ export function verifyReviewBase(
     '--jq',
     '.baseRefOid',
   ]).trim();
-  if (prBase !== base) {
-    fail(`PR base mismatch: expected ${base}, found ${prBase || '<empty>'}`);
+  if (prBase === base) {
+    return;
+  }
+  if (!SHA_RE.test(prBase)) {
+    fail(`PR base is not a commit SHA: found ${prBase || '<empty>'}`);
+  }
+  let descendant: boolean;
+  try {
+    descendant = isAncestor(base, prBase);
+  } catch (error) {
+    if (!(error instanceof LedgerError)) throw error;
+    // An unfetched target branch is the common cause of a failed ancestry
+    // check; a genuine lineage break is reported below without that hint.
+    fail(
+      `could not verify PR base ${prBase} against the pinned base ${base}: ${error.message}; fetch the target branch before retrying`,
+    );
+  }
+  if (!descendant) {
+    fail(
+      `PR base is outside the pinned review lineage: expected a descendant of ${base}, found ${prBase}; the target branch history diverged from the pinned base`,
+    );
   }
 }
 
@@ -632,36 +653,52 @@ function verifyOwnedComment(
 }
 
 /**
- * Find a prior attestation for this engine and round, whatever head it names.
+ * Find a prior attestation for this engine and round in the current run.
  *
- * Attestation identity is `(engine, round)`, not the full marker: a second
+ * Attestation identity is `(run, engine, round)`, not the full marker: a second
  * attestation naming a different head, classification, fingerprint set or
  * result digest is a contradiction to reject, not a new record to append.
+ * `runs` must be the run chain read from the same `rows`, so a caller that
+ * already parsed it does not pay for a second parse of every run marker.
  */
 export function findMatchingAttestation(
   rows: Array<Record<string, unknown>>,
+  runs: ReviewRun[],
   engine: string,
   round: number,
   body: string,
-): number | null {
+): { id: number; body: string } | null {
   const prefixes = [
     `<!-- local-review-pass:v3 engine=${engine} round=${round} `,
     `<!-- local-review-complete:v3 engine=${engine} round=${round} `,
   ];
-  const matches = rows.filter((row) =>
-    prefixes.some((prefix) => String(row['body'] ?? '').startsWith(prefix)),
+  const start = runs.at(-1)?.commentId;
+  const matches = rows.filter(
+    (row) =>
+      (start === undefined ||
+        (typeof row['id'] === 'number' && row['id'] > start)) &&
+      prefixes.some((prefix) => String(row['body'] ?? '').startsWith(prefix)),
   );
   if (matches.length === 0) {
     return null;
   }
-  if (matches.length !== 1) {
-    fail('local-review attestation identity is duplicated');
+  const marker = body.split('\n')[0];
+  let earliest: { id: number; body: string } | null = null;
+  for (const row of matches) {
+    const existingBody = String(row['body']);
+    if (
+      existingBody.split('\n')[0] !== marker ||
+      typeof row['id'] !== 'number'
+    ) {
+      fail(
+        'local-review attestation identity conflicts with existing evidence in this run; recover the original sealed result instead of rewriting it',
+      );
+    }
+    if (earliest === null || row['id'] < earliest.id) {
+      earliest = { id: row['id'], body: existingBody };
+    }
   }
-  const row = matches[0]!;
-  if (row['body'] !== body || typeof row['id'] !== 'number') {
-    fail('local-review attestation identity conflicts with existing evidence');
-  }
-  return row['id'] as number;
+  return earliest;
 }
 
 /**

@@ -55,6 +55,7 @@ describe('CLI command parser and execution', () => {
     ['reply', /reply requires/],
     ['post-pr-comment', /post-pr-comment requires/],
     ['validate-result', /validate-result missing required arguments/],
+    ['finalize', /finalize requires/],
     ['write-result', /write-result missing required arguments/],
     ['write-blocked-result', /write-blocked-result missing required arguments/],
     ['resolve', /resolve requires/],
@@ -63,6 +64,28 @@ describe('CLI command parser and execution', () => {
     ['format-findings', /format-findings requires/],
   ])('dispatches %s to its command-specific validation', (command, message) => {
     expect(() => runCli([command])).toThrowError(message);
+  });
+
+  it.each([
+    ['--head', 'b'.repeat(40)],
+    ['--base', '0'.repeat(40)],
+    ['--engine', 'claude'],
+    ['--round', '1'],
+    ['--expected-result-sha256', 'f'.repeat(64)],
+  ])('refuses finalize with the explicit identity flag %s', (flag, value) => {
+    expect(() =>
+      runCli([
+        'finalize',
+        '--repo',
+        'a/b',
+        '--pr',
+        '1',
+        '--result-file',
+        'result.json',
+        flag,
+        value,
+      ]),
+    ).toThrowError(/finalize reads identity and digest from the saved result/);
   });
 
   it.each(['0', '-1', '1.5', '1junk', '9007199254740992'])(

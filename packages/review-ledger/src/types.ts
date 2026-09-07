@@ -316,6 +316,15 @@ export interface AttestParams extends BaseResultParams {
 }
 
 /**
+ * Parameters for `finalize`: `attest` without the identity and digest fields,
+ * which are derived from the saved result instead.
+ */
+export type FinalizeParams = Omit<
+  AttestParams,
+  'head' | 'engine' | 'round' | 'base' | 'before' | 'expectedResultSha256'
+>;
+
+/**
  * The result of `attest`.
  */
 export interface AttestResult {

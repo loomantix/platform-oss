@@ -53,11 +53,13 @@ import {
   verifyV1Marker,
 } from './protocol.js';
 import {
+  readResult,
   readResultBytes,
   resultHead,
   validateResultData,
   writeResultFile,
 } from './result.js';
+import { reviewRuns } from './runs.js';
 import type {
   AttestParams,
   AttestResult,
@@ -65,6 +67,7 @@ import type {
   DisposeResult,
   DispositionV1Match,
   DispositionV3Match,
+  FinalizeParams,
   FindingV1Match,
   FindingV3Match,
   GitHubReviewCommentNode,
@@ -1330,11 +1333,20 @@ export function attest(params: AttestParams): AttestResult {
     marker = `<!-- local-review-complete:v3 engine=${params.engine} round=${params.round} base=${params.base} before=${params.before} head=${params.head} classification=${data.classification} fingerprints=${fingerprints} result-sha256=${resultHash} -->`;
   }
 
-  const body = `${marker}\n${content}`;
+  let body = `${marker}\n${content}`;
   verifyHead(params.repo, params.pr, params.head);
 
+  const issueComments = getIssueComments(params.repo, params.pr);
+  const runs = reviewRuns(issueComments);
+  const run = runs.at(-1);
+  if (run && (run.base !== params.base || params.round > run.maxRounds)) {
+    fail(
+      'saved review result does not belong to the current run base and round budget',
+    );
+  }
   const existing = findMatchingAttestation(
-    getIssueComments(params.repo, params.pr),
+    issueComments,
+    runs,
     params.engine,
     params.round,
     body,
@@ -1357,13 +1369,17 @@ export function attest(params: AttestParams): AttestResult {
       commentId = getPostedCommentId(response);
     } catch (error) {
       if (error instanceof LedgerError) {
-        const recovered = findMatchingBody(
-          getIssueComments(params.repo, params.pr),
-          marker,
+        const refetched = getIssueComments(params.repo, params.pr);
+        const recovered = findMatchingAttestation(
+          refetched,
+          reviewRuns(refetched),
+          params.engine,
+          params.round,
           body,
         );
         if (recovered === null) throw error;
-        commentId = recovered;
+        commentId = recovered.id;
+        body = recovered.body;
         replayed = true;
         created = false;
       } else {
@@ -1371,13 +1387,23 @@ export function attest(params: AttestParams): AttestResult {
       }
     }
   } else {
-    commentId = existing;
+    commentId = existing.id;
+    // Explanatory prose is not evidence identity. Preserve it on recovery.
+    body = existing.body;
   }
 
   // An attestation that fails its own read-back must not survive: the marker is
   // what later rounds read to decide whether this round happened.
   try {
     verifyIssueComment(params.repo, commentId, body);
+    if (
+      reviewRuns(getIssueComments(params.repo, params.pr)).at(-1)?.id !==
+      run?.id
+    ) {
+      fail(
+        'review run changed during finalization; retry from the saved result after reconciling the current run',
+      );
+    }
     verifyReviewBase(params.repo, params.pr, params.base, params.before);
     verifyHead(params.repo, params.pr, params.head);
   } catch (error) {
@@ -1403,6 +1429,23 @@ export function attest(params: AttestParams): AttestResult {
     result_sha256: resultHash,
     verified: true,
   };
+}
+
+/**
+ * Finish an interrupted pass from its original result, without another model
+ * invocation or manually copied SHAs/digests. All attest checks still apply.
+ */
+export function finalize(params: FinalizeParams): AttestResult {
+  const result = readResult(params.resultFile);
+  return attest({
+    ...params,
+    head: result.afterSha,
+    engine: result.engine,
+    round: result.round,
+    base: result.baseSha,
+    before: result.beforeSha,
+    expectedResultSha256: result.resultSha256,
+  });
 }
 
 /**
