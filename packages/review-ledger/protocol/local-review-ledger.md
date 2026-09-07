@@ -390,9 +390,13 @@ per-round evidence, and no automated runner parses it.
 ## Resolve the round, then pick the stance
 
 Resolve this engine's round number before selecting lanes. Use
-`$AGENT_LOOP_REVIEW_ROUND` when the automated runner set it. Otherwise count the
-`local-review-pass:v3` and `local-review-complete:v3` markers already on the PR
-that name this engine; this pass is one past that count.
+`$AGENT_LOOP_REVIEW_ROUND` when the automated runner set it. Otherwise ask the
+run controller's `status` command for `next_round`: it counts only the
+attestations inside the current authorized run, so a restarted run never
+inherits historical rounds. Only when `status` reports `reason=no_run` —
+a legacy PR with no run boundary — count the `local-review-pass:v3` and
+`local-review-complete:v3` markers on the PR that name this engine; this pass is
+one past that count.
 
 - **Rounds 1–2 — adversarial.** The full stance: assume the diff is guilty and
   run every applicable lane. Fix only confirmed findings whose expected user or
@@ -689,7 +693,19 @@ finishing a saved result, and resuming an aborted run within its original budget
 These operations do not consume another model pass. Never silently reset the
 budget, discard a finding, fabricate evidence, or invoke an unapproved reviewer.
 
-Attestation identity is `(run, engine, round)`. A run is delimited by its
+### Helper version prerequisite
+
+The run-scoped attestation and `finalize` capabilities below require the
+published review-ledger 1.4 or later. They are unavailable in earlier helpers.
+Before activating these capabilities, vendor the compatible
+published bundle and its version/integrity metadata through the normal verified
+dependency update. Never edit the vendored bundle or present unsupported recovery
+as completed. With an earlier helper, preserve the original result and pre-pass snapshot; use
+the existing `validate-result` and `attest` flow only when its ordinary invariants
+accept that evidence. A cross-run identity collision must await the compatible
+helper update, without spending another review pass or rewriting history.
+
+With the compatible helper, attestation identity is `(run, engine, round)`. A run is delimited by its
 authenticated `local-review-run:v1` comment, validated with the controller's
 content digest and supersession chain. Legacy attestations before the first run
 keep their legacy namespace. Restarted round 1 can coexist with historical round
@@ -717,17 +733,31 @@ silence alone is neither completion evidence nor a reason to discard a valid
 result. Reuse verified CI at the exact head when it ran the required full suite;
 state any incomplete or failed local run separately.
 
-Run resumption belongs to the controller that emits `local-review-run:v1`,
-not to the ledger helper, and this package ships no command for it. The
-contract a controller is expected to meet is: a `status` query reporting the
-next action for a repository, pull request, head, and engine; and a
-`resume-run` step for an aborted run that appends a recovery record
-referencing the aborted terminal marker while preserving the run identity,
-completed passes, cleanup latches, and cap, so that a later terminal marker can
-name the resume record and another interruption at the same head remains
-recoverable. Converged and exhausted runs are never reopened this way. Until a
-controller implements that contract, an aborted run is superseded through the
-controller's existing start and finish steps.
+The run controller — the engine-specific script that owns run markers, named
+in your `REVIEW_WORKFLOW.md` and distinct from the ledger helper — reports the
+next action through `status --repo ... --pr ... --head ... --engine ...`:
+`start-run`, `review`, `covered`, `resume-run`, `finish-exhausted`, or
+`finished`, with `next_round` present once a run exists.
+Its `covered` action means this engine has exact-head evidence, including a
+completion after minor or material fixes; it does not assert overall relay
+convergence, which `verify-coverage` and `verify-ledger` decide. A converged or
+exhausted run whose terminal names another head yields `start-run` with
+`reason=terminal_head_stale`: the run is closed, and the new head needs its own
+authorized run, started with `--restart` under a fresh user authorization. For
+an aborted run use `resume-run --repo ... --pr ... --base
+<original-base> --head <current-head>`; this appends a recovery record referencing
+the aborted terminal marker and preserves the run identity, completed passes,
+cleanup latches, and cap. A subsequent terminal marker includes `after=<resume
+comment ID>`, so another interruption at the same head remains recoverable.
+Converged and exhausted runs cannot be reopened this way.
+
+If the run is already active, `resume-run` is a no-op: it reports
+`status=already_active` and `replayed=false` without a recovery comment ID.
+An existing recovery at the requested head may instead replay its actual ID;
+an older recovery is not evidence of a new recovery at the current head.
+This never changes the run identity or remaining round budget. Trailing ASCII
+whitespace on marker-only terminal/recovery records is ignored; leading text,
+malformed identities, and conflicting parent links remain invalid evidence.
 
 A target branch advancing along the pinned base's lineage does not invalidate
 an honest exact-head review record. Keep the original base in the result and
@@ -740,9 +770,11 @@ under the existing authorization; do not send the user a generic ledger error.
 ## Validate before attesting
 
 A scoped run is the right validation for a _fix_. It is never sufficient
-evidence for a _pass_. Before writing any pass or completion attestation, run
-the repository's gating suite unfiltered, and state in the attestation which
-command and config it ran and at which SHA.
+evidence for a _pass_. Before writing any pass or completion attestation,
+verify a successful unfiltered run of the repository's required gating suite
+at the exact final head, and state its command, configuration, gates, and SHA
+in the attestation. Actual full-suite CI at that head satisfies this requirement
+and should be reused; do not rerun a broad local suite solely to duplicate it.
 
 Two failure modes make this non-optional, and both have shipped:
 
@@ -757,15 +789,23 @@ Two failure modes make this non-optional, and both have shipped:
   status; read which jobs actually ran, or run the suite yourself.
 
 Read the consumer repository's declared review gate — the commands its
-`AGENTS.md` (or `CLAUDE.md`) names as the gate — and run those. Where a
-repository declares none, run its broadest practical suite and say so. If the
+`AGENTS.md` (or `CLAUDE.md`) names as the gate — and verify those commands actually
+passed at the final head in CI, or run them locally if that evidence is missing.
+Where a repository declares none, use its broadest practical suite and say so.
+Read the actual CI job scope and required coverage gates; a green check list or
+scoped tests alone cannot establish full-suite coverage. If the
 gating run is genuinely impractical in the environment, the attestation must
 say that plainly instead of implying coverage it does not have.
 
-A gating run that fails is a blocking finding in its own right, even when the
+An unresolved code failure in a gating run is a blocking finding, even when the
 failure predates the round: an attestation cannot certify a head whose suite is
 red. This applies to a `clean` pass too — a round that changed nothing still
 attests to a head, and that head's suite can be red for reasons no lane examined.
+Report every failed or incomplete local run separately. If exact-head CI passed
+but a local run failed, reconcile the discrepancy: reuse CI only when evidence
+shows the local failure was environmental or an interruption, not an unresolved
+code failure. Never relabel that local run as passed or let green CI conceal a
+genuine failing path.
 
 ## Record clean passes and convergence
 
