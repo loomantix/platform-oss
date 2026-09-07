@@ -397,10 +397,12 @@ Resolve this engine's round number before selecting lanes. Use
 `$AGENT_LOOP_REVIEW_ROUND` when the automated runner set it. Otherwise ask the
 run controller's `status` command for `next_round`: it counts only the
 attestations inside the current authorized run, so a restarted run never
-inherits historical rounds. Only when `status` reports `reason=no_run` —
-a legacy PR with no run boundary — count the `local-review-pass:v3` and
-`local-review-complete:v3` markers on the PR that name this engine; this pass is
-one past that count.
+inherits historical rounds. `reason=no_run` alone is not a legacy signal: on a
+PR that holds no v3 attestation it means `start-run`, and no pass runs before
+that authorized run marker exists. Only a legacy PR — one that already carries
+`local-review-pass:v3` or `local-review-complete:v3` markers but no run
+boundary — counts the markers naming this engine; that pass is one past the
+count.
 
 - **Rounds 1–2 — adversarial.** The full stance: assume the diff is guilty and
   run every applicable lane. Fix only confirmed findings whose expected user or
