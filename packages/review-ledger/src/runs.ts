@@ -9,6 +9,11 @@ export interface ReviewRun {
   maxRounds: number;
 }
 
+/** A GitHub issue-comment ID: a positive safe integer. */
+function isCommentId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 const RUN =
   /^<!-- local-review-run:v1 id=([0-9a-f]{64}) tier=(lean|deep) max-rounds=([1-4]) base=([0-9a-f]{40}) start-head=([0-9a-f]{40}) supersedes=(none|[1-9][0-9]*) content-sha256=([0-9a-f]{64}) -->\n/;
 
@@ -31,12 +36,7 @@ export function reviewRuns(rows: Array<Record<string, unknown>>): ReviewRun[] {
       continue;
     const match = RUN.exec(body);
     const commentId = row['id'];
-    if (
-      !match ||
-      typeof commentId !== 'number' ||
-      !Number.isSafeInteger(commentId) ||
-      commentId <= 0
-    ) {
+    if (!match || !isCommentId(commentId)) {
       fail(
         'local-review run marker is malformed; preserve it and repair the run declaration before retrying',
       );
@@ -88,11 +88,7 @@ export function reviewRunForComment(
   commentId: unknown,
 ): ReviewRun | undefined {
   if (runs.length === 0) return undefined;
-  if (
-    typeof commentId !== 'number' ||
-    !Number.isSafeInteger(commentId) ||
-    commentId <= 0
-  ) {
+  if (!isCommentId(commentId)) {
     fail('attestation comment ID is required to recover its review run');
   }
   for (let index = runs.length - 1; index >= 0; index--) {

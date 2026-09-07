@@ -260,7 +260,9 @@ export function writeResultFile(
 /**
  * Read and validate a review-result file.
  */
-export function readResult(resultFile: string): LedgerResult {
+export function readResult(
+  resultFile: string,
+): LedgerResult & { resultSha256: string } {
   const raw = readResultBytes(resultFile);
   const parsed = parseJsonOrFail(
     Buffer.from(raw).toString('utf8'),
@@ -285,8 +287,7 @@ export function readResult(resultFile: string): LedgerResult {
     fail('review result has missing or invalid identity fields');
   }
   const data = validateResultData({ engine, round, base, before, head }, raw);
-  data.resultSha256 = sha256Bytes(raw);
-  return data;
+  return { ...data, resultSha256: sha256Bytes(raw) };
 }
 
 /**

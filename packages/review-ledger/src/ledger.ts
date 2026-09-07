@@ -1336,7 +1336,8 @@ export function attest(params: AttestParams): AttestResult {
   verifyHead(params.repo, params.pr, params.head);
 
   const issueComments = getIssueComments(params.repo, params.pr);
-  const run = reviewRuns(issueComments).at(-1);
+  const runs = reviewRuns(issueComments);
+  const run = runs.at(-1);
   if (run && (run.base !== params.base || params.round > run.maxRounds)) {
     fail(
       'saved review result does not belong to the current run base and round budget',
@@ -1344,6 +1345,7 @@ export function attest(params: AttestParams): AttestResult {
   }
   const existing = findMatchingAttestation(
     issueComments,
+    runs,
     params.engine,
     params.round,
     body,
@@ -1366,14 +1368,16 @@ export function attest(params: AttestParams): AttestResult {
       commentId = getPostedCommentId(response);
     } catch (error) {
       if (error instanceof LedgerError) {
+        const refetched = getIssueComments(params.repo, params.pr);
         const recovered = findMatchingAttestation(
-          getIssueComments(params.repo, params.pr),
+          refetched,
+          reviewRuns(refetched),
           params.engine,
           params.round,
           body,
         );
         if (recovered === null) throw error;
-        commentId = recovered;
+        commentId = recovered.id;
         replayed = true;
         created = false;
       } else {
@@ -1381,9 +1385,9 @@ export function attest(params: AttestParams): AttestResult {
       }
     }
   } else {
-    commentId = existing;
+    commentId = existing.id;
     // Explanatory prose is not evidence identity. Preserve it on recovery.
-    body = String(issueComments.find((row) => row['id'] === existing)!['body']);
+    body = existing.body;
   }
 
   // An attestation that fails its own read-back must not survive: the marker is
@@ -1443,7 +1447,7 @@ export function finalize(
     round: result.round,
     base: result.baseSha,
     before: result.beforeSha,
-    expectedResultSha256: result.resultSha256!,
+    expectedResultSha256: result.resultSha256,
   });
 }
 

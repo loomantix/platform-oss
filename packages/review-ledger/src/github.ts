@@ -17,7 +17,7 @@ import {
   SHA_RE,
 } from './constants.js';
 import { requireToken, sha256Bytes } from './hash.js';
-import { reviewRuns } from './runs.js';
+import type { ReviewRun } from './runs.js';
 import type {
   GitHubReviewCommentNode,
   GitHubReviewThreadNode,
@@ -641,18 +641,21 @@ function verifyOwnedComment(
  * Attestation identity is `(run, engine, round)`, not the full marker: a second
  * attestation naming a different head, classification, fingerprint set or
  * result digest is a contradiction to reject, not a new record to append.
+ * `runs` must be the run chain read from the same `rows`, so a caller that
+ * already parsed it does not pay for a second parse of every run marker.
  */
 export function findMatchingAttestation(
   rows: Array<Record<string, unknown>>,
+  runs: ReviewRun[],
   engine: string,
   round: number,
   body: string,
-): number | null {
+): { id: number; body: string } | null {
   const prefixes = [
     `<!-- local-review-pass:v3 engine=${engine} round=${round} `,
     `<!-- local-review-complete:v3 engine=${engine} round=${round} `,
   ];
-  const start = reviewRuns(rows).at(-1)?.commentId;
+  const start = runs.at(-1)?.commentId;
   const matches = rows.filter(
     (row) =>
       (start === undefined ||
@@ -663,17 +666,22 @@ export function findMatchingAttestation(
     return null;
   }
   const marker = body.split('\n')[0];
+  let earliest: { id: number; body: string } | null = null;
   for (const row of matches) {
+    const existingBody = String(row['body']);
     if (
-      String(row['body']).split('\n')[0] !== marker ||
+      existingBody.split('\n')[0] !== marker ||
       typeof row['id'] !== 'number'
     ) {
       fail(
         'local-review attestation identity conflicts with existing evidence in this run; recover the original sealed result instead of rewriting it',
       );
     }
+    if (earliest === null || row['id'] < earliest.id) {
+      earliest = { id: row['id'], body: existingBody };
+    }
   }
-  return Math.min(...matches.map((row) => row['id'] as number));
+  return earliest;
 }
 
 /**
