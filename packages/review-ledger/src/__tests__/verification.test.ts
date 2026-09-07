@@ -326,6 +326,13 @@ describe('review base and git transition binding', () => {
     );
   });
 
+  it('rejects a pull request base that is not a commit SHA', () => {
+    runner.prBase = '';
+    expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).toThrow(
+      /not a commit SHA/,
+    );
+  });
+
   it('keeps a valid pinned review when the target branch advances', () => {
     runner.prBase = OTHER;
     expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).not.toThrow();
@@ -728,6 +735,41 @@ describe('attestation identity is one per engine and round', () => {
       'saved review result does not belong to the current run base and round budget',
     );
     expect(runner.issueComments).toHaveLength(1);
+  });
+
+  it('rolls back an attestation when the run changes during finalization', () => {
+    const [file, digest] = seal(changedResult());
+    const original = runner.runGh.bind(runner);
+    runner.runGh = (args: string[], payload?: unknown): string => {
+      const cmd = args.join(' ');
+      const out = original(args, payload);
+      if (cmd.includes('-X POST') && cmd.includes('/issues/')) {
+        declareRun('deep', BASE);
+      }
+      return out;
+    };
+    expect(() => attest(attestParams(file, digest))).toThrow(
+      'review run changed during finalization',
+    );
+    expect(runner.issueComments).toHaveLength(1);
+    expect(String(runner.issueComments[0]!['body'])).toMatch(
+      /^<!-- local-review-run:v1 /,
+    );
+  });
+
+  it('replays the earliest delivered attestation among identical retries', () => {
+    const [file, digest] = seal(changedResult());
+    const first = attest(attestParams(file, digest));
+    const marker = String(runner.issueComments[0]!['body']).split('\n')[0]!;
+    runner.issueComments.push({
+      id: runner.commentIdSeq++,
+      user: { login: ACTOR },
+      body: `${marker}\nExplanation from a later in-flight retry.\n`,
+    });
+    const replay = attest(attestParams(file, digest));
+    expect(replay.replayed).toBe(true);
+    expect(replay.comment_id).toBe(first.comment_id);
+    expect(runner.issueComments).toHaveLength(2);
   });
 
   it('attests a restarted round without contradicting historical evidence', () => {

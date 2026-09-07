@@ -55,6 +55,31 @@ describe('review run boundaries', () => {
     expect(() => reviewRuns([first, run(30, 9)])).toThrow(/forked/);
   });
 
+  it('rejects a malformed run marker and a cap that does not match its tier', () => {
+    expect(() =>
+      reviewRuns([{ id: 10, body: '<!-- local-review-run:v1 garbage -->\n' }]),
+    ).toThrow(/malformed/);
+    const content = 'Lean run claiming a deep budget.\n';
+    const id = sha256Text(
+      JSON.stringify({
+        base: BASE,
+        content,
+        max_rounds: 4,
+        start_head: HEAD,
+        supersedes: null,
+        tier: 'lean',
+      }),
+    );
+    expect(() =>
+      reviewRuns([
+        {
+          id: 10,
+          body: `<!-- local-review-run:v1 id=${id} tier=lean max-rounds=4 base=${BASE} start-head=${HEAD} supersedes=none content-sha256=${id} -->\n${content}`,
+        },
+      ]),
+    ).toThrow(/round budget/);
+  });
+
   it('does not accept quoted or fenced run declarations as a new namespace', () => {
     expect(
       reviewRuns([{ ...run(10), body: `Quoted:\n${run(10).body}` }]),

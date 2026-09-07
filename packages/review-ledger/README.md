@@ -63,8 +63,9 @@ review-ledger finalize --repo owner/repo --pr 123 \
   --historical-comment-ids-file /path/to/original-snapshot.json
 ```
 
-The command derives the pinned identity and digest from the saved result and
-performs normal evidence, actor, Git, and exact-head checks. Blocked or incomplete
+The command reads the pinned identity and digest from the saved result, which
+it trusts as the original, and performs normal evidence, actor, Git, and
+exact-head checks; use `attest` when you hold the pre-pass digest. Blocked or incomplete
 results remain incomplete. Explanatory text can differ on a retry without
 rewriting the original attestation. Run boundaries distinguish restarted rounds;
 contradictory evidence within one run is still rejected. A target branch advancing

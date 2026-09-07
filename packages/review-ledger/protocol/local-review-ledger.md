@@ -708,8 +708,10 @@ node <ledger-helper> finalize --repo <owner/repo> --pr <number> \
 ```
 
 Omit the snapshot only when the pass inherited no v3 records. Do not reconstruct
-it after posting findings. `finalize` derives and seals identity from the saved
-result and rechecks every normal attestation invariant. It never converts a
+it after posting findings. `finalize` reads identity and the result digest from
+the saved result, which it trusts as the original, and rechecks every normal
+attestation invariant; a caller holding the pre-pass digest uses `attest`
+instead. It never converts a
 blocked or incomplete result into a pass. A reviewer exit status, timeout, or
 silence alone is neither completion evidence nor a reason to discard a valid
 result. Reuse verified CI at the exact head when it ran the required full suite;
