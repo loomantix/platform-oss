@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   attest,
   finalize,
+  LedgerError,
   currentActor,
   getThreadState,
   readContent,
@@ -696,6 +697,53 @@ describe('attestation identity is one per engine and round', () => {
     expect(runner.issueComments).toHaveLength(3);
     expect(attest(attestParams(file2, digest2)).replayed).toBe(true);
   });
+
+  it.each([false, true])(
+    'scopes interrupted POST recovery to the active run (created=%s)',
+    (created) => {
+      const [file, digest] = seal(changedResult());
+      const params = attestParams(file, digest);
+      const historical = attest(params);
+      const content = 'Restart the bounded review.\n';
+      const runId = sha(
+        JSON.stringify({
+          base: BASE,
+          content,
+          max_rounds: 4,
+          start_head: HEAD,
+          supersedes: null,
+          tier: 'deep',
+        }),
+      );
+      runner.issueComments.push({
+        id: runner.commentIdSeq++,
+        user: { login: ACTOR },
+        body: `<!-- local-review-run:v1 id=${runId} tier=deep max-rounds=4 base=${BASE} start-head=${HEAD} supersedes=none content-sha256=${runId} -->\n${content}`,
+      });
+      const nextCommentId = runner.commentIdSeq;
+      const original = runner.runGh.bind(runner);
+      runner.runGh = (args: string[], payload?: unknown): string => {
+        const cmd = args.join(' ');
+        if (cmd.includes('-X POST') && cmd.includes('/issues/')) {
+          if (created) original(args, payload);
+          throw new LedgerError('Interrupted attestation POST');
+        }
+        return original(args, payload);
+      };
+
+      if (created) {
+        const recovered = attest(params);
+        expect(recovered.verified).toBe(true);
+        expect(recovered.replayed).toBe(true);
+        expect(recovered.comment_id).toBe(nextCommentId);
+        expect(recovered.comment_id).not.toBe(historical.comment_id);
+        expect(runner.issueComments).toHaveLength(3);
+      } else {
+        expect(() => attest(params)).toThrow('Interrupted attestation POST');
+        expect(runner.issueComments).toHaveLength(2);
+      }
+    },
+  );
 
   it('replays sealed evidence when only the explanatory prose changes', () => {
     const [file, digest] = seal(changedResult());

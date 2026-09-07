@@ -1366,9 +1366,10 @@ export function attest(params: AttestParams): AttestResult {
       commentId = getPostedCommentId(response);
     } catch (error) {
       if (error instanceof LedgerError) {
-        const recovered = findMatchingBody(
+        const recovered = findMatchingAttestation(
           getIssueComments(params.repo, params.pr),
-          marker,
+          params.engine,
+          params.round,
           body,
         );
         if (recovered === null) throw error;
