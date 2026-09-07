@@ -66,6 +66,28 @@ describe('CLI command parser and execution', () => {
     expect(() => runCli([command])).toThrowError(message);
   });
 
+  it.each([
+    ['--head', 'b'.repeat(40)],
+    ['--base', '0'.repeat(40)],
+    ['--engine', 'claude'],
+    ['--round', '1'],
+    ['--expected-result-sha256', 'f'.repeat(64)],
+  ])('refuses finalize with the explicit identity flag %s', (flag, value) => {
+    expect(() =>
+      runCli([
+        'finalize',
+        '--repo',
+        'a/b',
+        '--pr',
+        '1',
+        '--result-file',
+        'result.json',
+        flag,
+        value,
+      ]),
+    ).toThrowError(/finalize reads identity and digest from the saved result/);
+  });
+
   it.each(['0', '-1', '1.5', '1junk', '9007199254740992'])(
     'rejects malformed numeric argument %s',
     (value) => {

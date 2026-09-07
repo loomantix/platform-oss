@@ -304,7 +304,26 @@ describe('review base and git transition binding', () => {
   it('rejects a pinned base unrelated to the current pull request base', () => {
     runner.prBase = OTHER;
     runner.isAncestor = (...args: string[]) => args[1] !== OTHER;
-    expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).toThrow();
+    expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).toThrow(
+      /diverged from the pinned base/,
+    );
+  });
+
+  it('asks for a fetch only when the ancestry check itself fails', () => {
+    runner.prBase = OTHER;
+    runner.isAncestor = (...args: string[]) => {
+      if (args[1] === OTHER) {
+        throw new LedgerError('Git ancestry check failed: unknown revision');
+      }
+      return true;
+    };
+    expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).toThrow(
+      /unknown revision; fetch the target branch before retrying/,
+    );
+    runner.isAncestor = (...args: string[]) => args[1] !== OTHER;
+    expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).not.toThrow(
+      /fetch the target branch/,
+    );
   });
 
   it('keeps a valid pinned review when the target branch advances', () => {
@@ -665,6 +684,48 @@ describe('attestation identity is one per engine and round', () => {
     );
     expect(() => attest(attestParams(file2, digest2))).toThrow(
       'local-review attestation identity conflicts with existing evidence',
+    );
+    expect(runner.issueComments).toHaveLength(1);
+  });
+
+  const declareRun = (
+    tier: 'lean' | 'deep',
+    base: string,
+    content = 'Run the bounded review.\n',
+  ): void => {
+    const maxRounds = tier === 'deep' ? 4 : 2;
+    const runId = sha(
+      JSON.stringify({
+        base,
+        content,
+        max_rounds: maxRounds,
+        start_head: HEAD,
+        supersedes: null,
+        tier,
+      }),
+    );
+    runner.issueComments.push({
+      id: runner.commentIdSeq++,
+      user: { login: ACTOR },
+      body: `<!-- local-review-run:v1 id=${runId} tier=${tier} max-rounds=${maxRounds} base=${base} start-head=${HEAD} supersedes=none content-sha256=${runId} -->\n${content}`,
+    });
+  };
+
+  it('refuses a result whose base is not the current run base', () => {
+    declareRun('deep', OTHER);
+    const [file, digest] = seal(changedResult());
+    expect(() => attest(attestParams(file, digest))).toThrow(
+      'saved review result does not belong to the current run base and round budget',
+    );
+    expect(runner.issueComments).toHaveLength(1);
+  });
+
+  it('refuses a round above the current run budget', () => {
+    declareRun('lean', BASE);
+    runner.threadNodes = [fixedThread('fp1', 'blocking', 3)];
+    const [file, digest] = seal(changedResult({ round: 3 }));
+    expect(() => attest({ ...attestParams(file, digest), round: 3 })).toThrow(
+      'saved review result does not belong to the current run base and round budget',
     );
     expect(runner.issueComments).toHaveLength(1);
   });

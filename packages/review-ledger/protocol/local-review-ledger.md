@@ -715,13 +715,17 @@ silence alone is neither completion evidence nor a reason to discard a valid
 result. Reuse verified CI at the exact head when it ran the required full suite;
 state any incomplete or failed local run separately.
 
-The controller's `status --repo ... --pr ... --head ... --engine ...` reports
-the next action. For an aborted run use `resume-run --repo ... --pr ... --base
-<original-base> --head <current-head>`; this appends a recovery record referencing
-the aborted terminal marker and preserves the run identity, completed passes,
-cleanup latches, and cap. A subsequent terminal marker includes `after=<resume
-comment ID>`, so another interruption at the same head remains recoverable.
-Converged and exhausted runs cannot be reopened this way.
+Run resumption belongs to the controller that emits `local-review-run:v1`,
+not to the ledger helper, and this package ships no command for it. The
+contract a controller is expected to meet is: a `status` query reporting the
+next action for a repository, pull request, head, and engine; and a
+`resume-run` step for an aborted run that appends a recovery record
+referencing the aborted terminal marker while preserving the run identity,
+completed passes, cleanup latches, and cap, so that a later terminal marker can
+name the resume record and another interruption at the same head remains
+recoverable. Converged and exhausted runs are never reopened this way. Until a
+controller implements that contract, an aborted run is superseded through the
+controller's existing start and finish steps.
 
 A target branch advancing along the pinned base's lineage does not invalidate
 an honest exact-head review record. Keep the original base in the result and

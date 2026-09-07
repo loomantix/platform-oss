@@ -205,6 +205,7 @@ export type {
   ReplyParams,
   PostPrCommentParams,
   AttestParams,
+  FinalizeParams,
   AttestResult,
   ResolveParams,
   ResolveResult,

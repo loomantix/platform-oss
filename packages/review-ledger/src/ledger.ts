@@ -67,6 +67,7 @@ import type {
   DisposeResult,
   DispositionV1Match,
   DispositionV3Match,
+  FinalizeParams,
   FindingV1Match,
   FindingV3Match,
   GitHubReviewCommentNode,
@@ -1433,12 +1434,7 @@ export function attest(params: AttestParams): AttestResult {
  * Finish an interrupted pass from its original result, without another model
  * invocation or manually copied SHAs/digests. All attest checks still apply.
  */
-export function finalize(
-  params: Omit<
-    AttestParams,
-    'head' | 'engine' | 'round' | 'base' | 'before' | 'expectedResultSha256'
-  >,
-): AttestResult {
+export function finalize(params: FinalizeParams): AttestResult {
   const result = readResult(params.resultFile);
   return attest({
     ...params,

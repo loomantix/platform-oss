@@ -442,9 +442,26 @@ export function verifyReviewBase(
     '--jq',
     '.baseRefOid',
   ]).trim();
-  if (prBase !== base && (!SHA_RE.test(prBase) || !isAncestor(base, prBase))) {
+  if (prBase === base) {
+    return;
+  }
+  if (!SHA_RE.test(prBase)) {
+    fail(`PR base is not a commit SHA: found ${prBase || '<empty>'}`);
+  }
+  let descendant: boolean;
+  try {
+    descendant = isAncestor(base, prBase);
+  } catch (error) {
+    if (!(error instanceof LedgerError)) throw error;
+    // An unfetched target branch is the common cause of a failed ancestry
+    // check; a genuine lineage break is reported below without that hint.
     fail(
-      `PR base is outside the pinned review lineage: expected a descendant of ${base}, found ${prBase || '<empty>'}; fetch the target branch before retrying`,
+      `could not verify PR base ${prBase} against the pinned base ${base}: ${error.message}; fetch the target branch before retrying`,
+    );
+  }
+  if (!descendant) {
+    fail(
+      `PR base is outside the pinned review lineage: expected a descendant of ${base}, found ${prBase}; the target branch history diverged from the pinned base`,
     );
   }
 }
