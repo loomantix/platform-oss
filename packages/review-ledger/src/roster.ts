@@ -20,6 +20,7 @@ import {
   verifyIssueComment,
 } from './github.js';
 import { requireSha, sha256Text } from './hash.js';
+import { reviewRunForComment, reviewRuns } from './runs.js';
 import {
   matchMarkerLine,
   matchProtocol,
@@ -611,7 +612,8 @@ export function attestationsAtHead(
   head: string,
 ): AttestationAtHead[] {
   const found: AttestationAtHead[] = [];
-  const identities = new Set<string>();
+  const identities = new Map<string, string>();
+  const runs = reviewRuns(rows);
   for (const row of rows) {
     const body = String(row['body'] ?? '');
     const pass = matchAttestationMarker(body, PASS_V3_RE);
@@ -622,11 +624,14 @@ export function attestationsAtHead(
     }
     const engine = match.groups['engine'] as SupportedEngine;
     const round = parseInt(match.groups['round']!, 10);
-    const identity = `${engine}|${round}`;
-    if (identities.has(identity)) {
+    const run = reviewRunForComment(runs, row['id']);
+    const identity = `${run?.id ?? 'legacy'}|${engine}|${round}`;
+    const prior = identities.get(identity);
+    if (prior !== undefined && prior !== match[0]) {
       fail('local-review attestation identity is duplicated');
     }
-    identities.add(identity);
+    if (prior !== undefined) continue;
+    identities.set(identity, match[0]);
     if (match.groups['head'] === head) {
       found.push({
         engine,

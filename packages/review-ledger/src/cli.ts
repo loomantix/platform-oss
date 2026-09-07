@@ -26,6 +26,7 @@ import { readContent } from './protocol.js';
 import { requireSha } from './hash.js';
 import {
   attest,
+  finalize,
   dispose,
   postFinding,
   postPrComment,
@@ -812,6 +813,38 @@ function runCliCommand(argv: string[]): number {
         blockerFile: args.blockerFile,
       });
       writeSortedJson(out);
+      break;
+    }
+    case 'finalize': {
+      if (!args.repo || args.pr === undefined || !args.resultFile) {
+        fail(
+          'finalize requires --repo, --pr, and --result-file; reuse the original pre-pass historical-comment-ids file when present',
+        );
+      }
+      if (
+        args.head ||
+        args.base ||
+        args.before ||
+        args.engine ||
+        args.round !== undefined ||
+        args.expectedResultSha256
+      ) {
+        fail(
+          'finalize reads identity and digest from the saved result; use attest for explicit identity checks',
+        );
+      }
+      const out = finalize({
+        repo: args.repo,
+        pr: args.pr,
+        resultFile: args.resultFile,
+        threadsFile: args.threadsFile,
+        allowedHeadsFile: args.allowedHeadsFile,
+        actor: args.actor,
+        historicalCommentIdsFile: args.historicalCommentIdsFile,
+        expectedThreadsSha256: args.expectedThreadsSha256,
+        contentFile: args.contentFile,
+      });
+      process.stdout.write(JSON.stringify(out) + '\n');
       break;
     }
     case 'attest': {

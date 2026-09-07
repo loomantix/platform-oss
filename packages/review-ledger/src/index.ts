@@ -98,6 +98,7 @@ export {
   reply,
   postPrComment,
   attest,
+  finalize,
   resolve,
   resolveThreads,
   reconcile,

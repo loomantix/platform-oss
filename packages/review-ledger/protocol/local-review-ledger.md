@@ -674,8 +674,62 @@ worktree-isolated session refuses a git command carrying a heredoc, redirect, or
 `&&` chain because it cannot statically verify that the command stays inside the
 worktree, and that refusal aborts the pass mid-fix.
 
-If posting, replying, pushing, or resolving fails, stop. Leave the PR draft and
-report the exact unresolved thread; do not silently continue.
+If posting, replying, pushing, or resolving fails, reconcile the observed state
+before retrying the idempotent operation. A lost response is not proof that a
+write failed. Preserve the original result, finding identity, and pre-pass
+snapshot; do not create a replacement review merely to repair bookkeeping.
+Report the unresolved action only when deterministic recovery cannot complete.
+
+## Recover interrupted reviews
+
+The ledger guides a review; routine metadata drift is not a new permission
+boundary. Existing authorization to complete an unfinished review also covers
+reconciling posted comments, refreshing an unchanged roster at the live head,
+finishing a saved result, and resuming an aborted run within its original budget.
+These operations do not consume another model pass. Never silently reset the
+budget, discard a finding, fabricate evidence, or invoke an unapproved reviewer.
+
+Attestation identity is `(run, engine, round)`. A run is delimited by its
+authenticated `local-review-run:v1` comment, validated with the controller's
+content digest and supersession chain. Legacy attestations before the first run
+keep their legacy namespace. Restarted round 1 can coexist with historical round
+1; contradictory evidence within one run still cannot. Identical delivery
+duplicates and changed explanatory prose replay the original evidence without
+rewriting comments. Existing v3 attestation markers remain readable.
+
+When a reviewer leaves a complete structured result but the controller or CLI
+stops before finalization, first verify the actual head and required validation.
+Then finish the original result with review-ledger 1.4 or later:
+
+```bash
+node <ledger-helper> finalize --repo <owner/repo> --pr <number> \
+  --result-file <original-result.json> \
+  --historical-comment-ids-file <original-pre-pass-snapshot.json>
+```
+
+Omit the snapshot only when the pass inherited no v3 records. Do not reconstruct
+it after posting findings. `finalize` derives and seals identity from the saved
+result and rechecks every normal attestation invariant. It never converts a
+blocked or incomplete result into a pass. A reviewer exit status, timeout, or
+silence alone is neither completion evidence nor a reason to discard a valid
+result. Reuse verified CI at the exact head when it ran the required full suite;
+state any incomplete or failed local run separately.
+
+The controller's `status --repo ... --pr ... --head ... --engine ...` reports
+the next action. For an aborted run use `resume-run --repo ... --pr ... --base
+<original-base> --head <current-head>`; this appends a recovery record referencing
+the aborted terminal marker and preserves the run identity, completed passes,
+cleanup latches, and cap. A subsequent terminal marker includes `after=<resume
+comment ID>`, so another interruption at the same head remains recoverable.
+Converged and exhausted runs cannot be reopened this way.
+
+A target branch advancing along the pinned base's lineage does not invalidate
+an honest exact-head review record. Keep the original base in the result and
+fetch missing ancestry before retrying validation. Fresh-base integration and
+release readiness remain separate checks. A different head, unrelated base,
+unresolved evidence conflict, or incomplete reviewer result needs actual work,
+not a marker rewrite. Explain the specific missing work if it cannot be completed
+under the existing authorization; do not send the user a generic ledger error.
 
 ## Validate before attesting
 

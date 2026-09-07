@@ -17,6 +17,7 @@ import {
   SHA_RE,
 } from './constants.js';
 import { requireToken, sha256Bytes } from './hash.js';
+import { reviewRuns } from './runs.js';
 import type {
   GitHubReviewCommentNode,
   GitHubReviewThreadNode,
@@ -414,7 +415,8 @@ export function isAncestor(ancestor: string, descendant: string): boolean {
 }
 
 /**
- * Bind the attested review base to the PR's real base and to local history.
+ * Bind the pinned review base to the target branch lineage and local history.
+ * A target branch fast-forward does not change what this exact-head pass read.
  */
 export function verifyReviewBase(
   repo: string,
@@ -440,8 +442,10 @@ export function verifyReviewBase(
     '--jq',
     '.baseRefOid',
   ]).trim();
-  if (prBase !== base) {
-    fail(`PR base mismatch: expected ${base}, found ${prBase || '<empty>'}`);
+  if (prBase !== base && (!SHA_RE.test(prBase) || !isAncestor(base, prBase))) {
+    fail(
+      `PR base is outside the pinned review lineage: expected a descendant of ${base}, found ${prBase || '<empty>'}; fetch the target branch before retrying`,
+    );
   }
 }
 
@@ -632,9 +636,9 @@ function verifyOwnedComment(
 }
 
 /**
- * Find a prior attestation for this engine and round, whatever head it names.
+ * Find a prior attestation for this engine and round in the current run.
  *
- * Attestation identity is `(engine, round)`, not the full marker: a second
+ * Attestation identity is `(run, engine, round)`, not the full marker: a second
  * attestation naming a different head, classification, fingerprint set or
  * result digest is a contradiction to reject, not a new record to append.
  */
@@ -648,20 +652,28 @@ export function findMatchingAttestation(
     `<!-- local-review-pass:v3 engine=${engine} round=${round} `,
     `<!-- local-review-complete:v3 engine=${engine} round=${round} `,
   ];
-  const matches = rows.filter((row) =>
-    prefixes.some((prefix) => String(row['body'] ?? '').startsWith(prefix)),
+  const start = reviewRuns(rows).at(-1)?.commentId;
+  const matches = rows.filter(
+    (row) =>
+      (start === undefined ||
+        (typeof row['id'] === 'number' && row['id'] > start)) &&
+      prefixes.some((prefix) => String(row['body'] ?? '').startsWith(prefix)),
   );
   if (matches.length === 0) {
     return null;
   }
-  if (matches.length !== 1) {
-    fail('local-review attestation identity is duplicated');
+  const marker = body.split('\n')[0];
+  for (const row of matches) {
+    if (
+      String(row['body']).split('\n')[0] !== marker ||
+      typeof row['id'] !== 'number'
+    ) {
+      fail(
+        'local-review attestation identity conflicts with existing evidence in this run; recover the original sealed result instead of rewriting it',
+      );
+    }
   }
-  const row = matches[0]!;
-  if (row['body'] !== body || typeof row['id'] !== 'number') {
-    fail('local-review attestation identity conflicts with existing evidence');
-  }
-  return row['id'] as number;
+  return Math.min(...matches.map((row) => row['id'] as number));
 }
 
 /**

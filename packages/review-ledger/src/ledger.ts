@@ -53,11 +53,13 @@ import {
   verifyV1Marker,
 } from './protocol.js';
 import {
+  readResult,
   readResultBytes,
   resultHead,
   validateResultData,
   writeResultFile,
 } from './result.js';
+import { reviewRuns } from './runs.js';
 import type {
   AttestParams,
   AttestResult,
@@ -1330,11 +1332,18 @@ export function attest(params: AttestParams): AttestResult {
     marker = `<!-- local-review-complete:v3 engine=${params.engine} round=${params.round} base=${params.base} before=${params.before} head=${params.head} classification=${data.classification} fingerprints=${fingerprints} result-sha256=${resultHash} -->`;
   }
 
-  const body = `${marker}\n${content}`;
+  let body = `${marker}\n${content}`;
   verifyHead(params.repo, params.pr, params.head);
 
+  const issueComments = getIssueComments(params.repo, params.pr);
+  const run = reviewRuns(issueComments).at(-1);
+  if (run && (run.base !== params.base || params.round > run.maxRounds)) {
+    fail(
+      'saved review result does not belong to the current run base and round budget',
+    );
+  }
   const existing = findMatchingAttestation(
-    getIssueComments(params.repo, params.pr),
+    issueComments,
     params.engine,
     params.round,
     body,
@@ -1372,12 +1381,22 @@ export function attest(params: AttestParams): AttestResult {
     }
   } else {
     commentId = existing;
+    // Explanatory prose is not evidence identity. Preserve it on recovery.
+    body = String(issueComments.find((row) => row['id'] === existing)!['body']);
   }
 
   // An attestation that fails its own read-back must not survive: the marker is
   // what later rounds read to decide whether this round happened.
   try {
     verifyIssueComment(params.repo, commentId, body);
+    if (
+      reviewRuns(getIssueComments(params.repo, params.pr)).at(-1)?.id !==
+      run?.id
+    ) {
+      fail(
+        'review run changed during finalization; retry from the saved result after reconciling the current run',
+      );
+    }
     verifyReviewBase(params.repo, params.pr, params.base, params.before);
     verifyHead(params.repo, params.pr, params.head);
   } catch (error) {
@@ -1403,6 +1422,28 @@ export function attest(params: AttestParams): AttestResult {
     result_sha256: resultHash,
     verified: true,
   };
+}
+
+/**
+ * Finish an interrupted pass from its original result, without another model
+ * invocation or manually copied SHAs/digests. All attest checks still apply.
+ */
+export function finalize(
+  params: Omit<
+    AttestParams,
+    'head' | 'engine' | 'round' | 'base' | 'before' | 'expectedResultSha256'
+  >,
+): AttestResult {
+  const result = readResult(params.resultFile);
+  return attest({
+    ...params,
+    head: result.afterSha,
+    engine: result.engine,
+    round: result.round,
+    base: result.baseSha,
+    before: result.beforeSha,
+    expectedResultSha256: result.resultSha256!,
+  });
 }
 
 /**

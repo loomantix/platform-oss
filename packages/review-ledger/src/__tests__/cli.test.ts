@@ -55,6 +55,7 @@ describe('CLI command parser and execution', () => {
     ['reply', /reply requires/],
     ['post-pr-comment', /post-pr-comment requires/],
     ['validate-result', /validate-result missing required arguments/],
+    ['finalize', /finalize requires/],
     ['write-result', /write-result missing required arguments/],
     ['write-blocked-result', /write-blocked-result missing required arguments/],
     ['resolve', /resolve requires/],

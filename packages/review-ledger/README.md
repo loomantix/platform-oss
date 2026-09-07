@@ -52,6 +52,28 @@ bytes extracted from the published tarball are comparable.
 
 ## CLI Usage
 
+### Recover an interrupted pass
+
+Use the original result and pre-pass snapshot; do not rerun a model just to
+recreate a missing attestation:
+
+```bash
+review-ledger finalize --repo owner/repo --pr 123 \
+  --result-file /path/to/original-result.json \
+  --historical-comment-ids-file /path/to/original-snapshot.json
+```
+
+The command derives the pinned identity and digest from the saved result and
+performs normal evidence, actor, Git, and exact-head checks. Blocked or incomplete
+results remain incomplete. Explanatory text can differ on a retry without
+rewriting the original attestation. Run boundaries distinguish restarted rounds;
+contradictory evidence within one run is still rejected. A target branch advancing
+does not invalidate the reviewed base when it remains in the same ancestry.
+
+See [recovery semantics](./protocol/local-review-ledger.md#recover-interrupted-reviews)
+for bounded run resumption and the distinction between bookkeeping recovery and
+missing review work. Complete the required validation before finalization.
+
 The `review-ledger` binary exposes all subcommands:
 
 ### Check Versions

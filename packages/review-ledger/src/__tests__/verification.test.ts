@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   attest,
+  finalize,
   currentActor,
   getThreadState,
   readContent,
@@ -299,9 +300,15 @@ describe('forward-only transition predicate', () => {
 });
 
 describe('review base and git transition binding', () => {
-  it('rejects a base that is not the pull request base', () => {
+  it('rejects a pinned base unrelated to the current pull request base', () => {
     runner.prBase = OTHER;
+    runner.isAncestor = (...args: string[]) => args[1] !== OTHER;
     expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).toThrow();
+  });
+
+  it('keeps a valid pinned review when the target branch advances', () => {
+    runner.prBase = OTHER;
+    expect(() => verifyReviewBase(REPO, PR, BASE, BEFORE)).not.toThrow();
   });
 
   it('rejects a before commit that is not an ancestor of the base', () => {
@@ -530,6 +537,7 @@ describe('writeResult rejects results its evidence does not support', () => {
   it('binds the declared base to the live pull request', () => {
     runner.threadNodes = [fixedThread('fp1')];
     runner.prBase = OTHER;
+    runner.isAncestor = (...args: string[]) => args[1] !== OTHER;
     expect(() => writeResult(params())).toThrow();
   });
 
@@ -658,6 +666,75 @@ describe('attestation identity is one per engine and round', () => {
       'local-review attestation identity conflicts with existing evidence',
     );
     expect(runner.issueComments).toHaveLength(1);
+  });
+
+  it('attests a restarted round without contradicting historical evidence', () => {
+    const [file, digest] = seal(changedResult());
+    const first = attest(attestParams(file, digest));
+    const content = 'Continue the bounded review.\n';
+    const runId = sha(
+      JSON.stringify({
+        base: BASE,
+        content,
+        max_rounds: 4,
+        start_head: HEAD,
+        supersedes: null,
+        tier: 'deep',
+      }),
+    );
+    runner.issueComments.push({
+      id: runner.commentIdSeq++,
+      user: { login: ACTOR },
+      body: `<!-- local-review-run:v1 id=${runId} tier=deep max-rounds=4 base=${BASE} start-head=${HEAD} supersedes=none content-sha256=${runId} -->\n${content}`,
+    });
+    runner.threadNodes = [fixedThread('fp1'), fixedThread('fp2')];
+    const [file2, digest2] = seal(
+      changedResult({ findingFingerprints: ['fp1', 'fp2'] }),
+    );
+    const restarted = attest(attestParams(file2, digest2));
+    expect(restarted.comment_id).not.toBe(first.comment_id);
+    expect(runner.issueComments).toHaveLength(3);
+    expect(attest(attestParams(file2, digest2)).replayed).toBe(true);
+  });
+
+  it('replays sealed evidence when only the explanatory prose changes', () => {
+    const [file, digest] = seal(changedResult());
+    const first = attest(attestParams(file, digest));
+    const originalBody = runner.issueComments[0]!['body'];
+    const note = join(dir, 'recovery-note.md');
+    writeFileSync(note, 'Recovered after an interrupted controller.\n');
+    const replay = attest({ ...attestParams(file, digest), contentFile: note });
+    expect(replay.comment_id).toBe(first.comment_id);
+    expect(replay.replayed).toBe(true);
+    expect(runner.issueComments[0]!['body']).toBe(originalBody);
+  });
+
+  it('finalizes an interrupted pass using identity from the original result', () => {
+    const [file] = seal(changedResult());
+    const recovered = finalize({ repo: REPO, pr: PR, resultFile: file });
+    expect(recovered.verified).toBe(true);
+    expect(finalize({ repo: REPO, pr: PR, resultFile: file }).replayed).toBe(
+      true,
+    );
+    runner.prHead = OTHER;
+    expect(() => finalize({ repo: REPO, pr: PR, resultFile: file })).toThrow();
+    expect(runner.issueComments).toHaveLength(1);
+  });
+
+  it('does not turn a blocked result into a completed review during recovery', () => {
+    const [file] = seal(
+      changedResult({
+        status: 'blocked',
+        classification: null,
+        findingFingerprints: [],
+        finalLaneComplete: false,
+        blocker: 'Reviewer did not finish.',
+      }),
+    );
+    expect(() => finalize({ repo: REPO, pr: PR, resultFile: file })).toThrow(
+      /blocked review results/,
+    );
+    expect(runner.issueComments).toHaveLength(0);
   });
 
   it('removes an attestation whose read-back fails', () => {
