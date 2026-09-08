@@ -18,8 +18,10 @@ an immutable ActiveLoom commit and checked against its SHA-256 before execution.
    release commit. Obtain tag-push authorization before pushing it. Never move
    or reuse a release tag.
 3. Review the build job and its `review-ledger-package` artifact: it contains the
-   exact tarball, `preflight.json`, and `SHA256SUMS`. The protected `npm-publish`
-   job has no checkout, dependency installation, package scripts, or cache.
+   exact tarball, `preflight.json`, and `SHA256SUMS`. The protected `publish`
+   job — "Stage for independent npm approval", gated by the `npm-publish`
+   environment — has no checkout, dependency installation, package scripts, or
+   cache.
 4. An independent reviewer approves the GitHub environment. The job stages the
    artifact and prints the npm stage identifier. Inspect it with
    `npm stage view <stage-id>` and download it with
@@ -41,6 +43,14 @@ Check SHA-256
 `8668ff1c423750aaac56ab17fd3246f993e26f603d303963e8a6be1bdf772356`
 before executing it. Substitute the approved release values:
 
+Import the approved signer's public key into the verification host's GPG keyring
+before running it; the workflow takes that key from
+`https://github.com/BaxterDevs.gpg`, and trust comes from the pinned fingerprint
+below rather than from that account's current key list. Pass the full
+40-character release commit — the verifier rejects an abbreviated one — and keep
+both `--artifact` and `--output` outside the release checkout's worktree, which
+the verifier also enforces.
+
 ```bash
 python3 /tmp/verify-published-package.py \
   --package @loomantix/review-ledger --version <version> \
@@ -54,8 +64,7 @@ python3 /tmp/verify-published-package.py \
   --output <temporary-directory>/verification.json
 ```
 
-Import the approved signer's public key into the verification host's GPG keyring
-first. The verifier requires the tag signature, live remote tag, registry bytes,
+The verifier requires the tag signature, live remote tag, registry bytes,
 registry signatures and the source/workflow-bound SLSA attestation to agree.
 An unavailable or mismatched attestation is a failed verification, not a reason
 to waive provenance for this public-source package.

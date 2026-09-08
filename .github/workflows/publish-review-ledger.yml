@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 # This workflow asserts an exact npm CLI version, so it pins Node to the exact
-# patch that ships it rather than tracking `.nvmrc` like every other workflow
-# here. Both jobs must stay on the same pair. See RELEASING.md.
+# patch that ships it rather than tracking `.nvmrc`. Both jobs must stay on the
+# same pair. See RELEASING.md.
 env:
   RELEASE_NODE_VERSION: 24.18.0
   RELEASE_NPM_VERSION: 11.16.0
@@ -84,7 +84,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$(npm --version)" = "$RELEASE_NPM_VERSION"
-          command -v node npm python3 git gpg openssl
+          for tool in node npm python3 git gpg openssl; do
+            command -v "$tool" >/dev/null || {
+              echo "::error::missing required tool: $tool"
+              exit 1
+            }
+          done
           node --version
           git --version
           gpg --version
