@@ -28,9 +28,9 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version-file: .nvmrc
+          node-version: 24.18.0
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile --ignore-scripts
@@ -71,16 +71,44 @@ jobs:
           pnpm --filter @loomantix/review-ledger pack \
             --pack-destination "$RUNNER_TEMP/review-ledger-package"
 
+      - name: Verify signed release and seal the artifact
+        env:
+          RELEASE_SIGNER: 8B680106EACC77AA538529E61E2DF3CE6E27C317
+        run: |
+          set -euo pipefail
+          test "$(npm --version)" = 11.16.0
+          command -v node npm git gpg openssl
+          node --version
+          git --version
+          gpg --version
+          openssl version
+          curl --fail --silent --show-error --location --proto '=https' \
+            https://github.com/BaxterDevs.gpg -o "$RUNNER_TEMP/release-signer.asc"
+          gpg --batch --import "$RUNNER_TEMP/release-signer.asc"
+          curl --fail --silent --show-error --location --proto '=https' \
+            https://raw.githubusercontent.com/loomantix/activeloom/64a44bb0ad03ecddbc07eb2abdfc4e1ea46be2ae/.codex/skills/publish-npm-package/scripts/release-preflight.py \
+            -o "$RUNNER_TEMP/release-preflight.py"
+          echo "5f80ee73e181bf664374b4583c388f1a75d36572a7888204b6e51bacacf0c93c  $RUNNER_TEMP/release-preflight.py" | sha256sum --check --strict
+          set -- "$RUNNER_TEMP"/review-ledger-package/*.tgz
+          test "$#" -eq 1 && test -f "$1"
+          python3 "$RUNNER_TEMP/release-preflight.py" \
+            --package-dir packages/review-ledger --artifact "$1" \
+            --tag "$GITHUB_REF_NAME" --phase publish --access public \
+            --signer-fingerprint "$RELEASE_SIGNER" \
+            --output "$RUNNER_TEMP/review-ledger-package/preflight.json"
+          cd "$RUNNER_TEMP/review-ledger-package"
+          sha256sum ./*.tgz preflight.json > SHA256SUMS
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: review-ledger-package
-          path: ${{ runner.temp }}/review-ledger-package/*.tgz
+          path: ${{ runner.temp }}/review-ledger-package/
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
 
   publish:
-    name: Publish to npm
+    name: Stage for independent npm approval
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -100,13 +128,18 @@ jobs:
       # registry-url writes token auth config that masks Trusted Publisher OIDC (actions/setup-node#1551).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 24
+          node-version: 24.18.0
+          package-manager-cache: false
 
-      - name: Publish
+      - name: Stage the verified tarball
         run: |
-          set -- ./package/*.tgz
+          set -euo pipefail
+          test "$(npm --version)" = 11.16.0
+          cd package
+          sha256sum --check --strict SHA256SUMS
+          set -- ./*.tgz
           if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
             echo "::error::Expected exactly one package tarball"
             exit 1
           fi
-          npm publish "$1" --registry=https://registry.npmjs.org --access public --provenance --ignore-scripts
+          npm stage publish "$1" --registry=https://registry.npmjs.org --access public --provenance --ignore-scripts
