@@ -46,6 +46,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r --if-present run test
+      - name: Release tag checkout regression
+        run: python3 -m unittest discover -s tests -p 'test_release_tag_checkout.py'
 
   build:
     name: Build
