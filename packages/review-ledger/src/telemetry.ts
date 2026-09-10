@@ -277,7 +277,8 @@ function validateChangeset(value: unknown): Changeset {
   return validated;
 }
 
-function validateFindings(value: unknown): TelemetryFindings {
+/** Validate a complete finding measurement without supplying missing counts. */
+export function validateFindings(value: unknown): TelemetryFindings {
   const source = requireObject(value, 'findings');
   const ladder = requireObject(
     source['bySeverityAndOutcome'],

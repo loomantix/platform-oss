@@ -1,8 +1,81 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runCli } from '../cli.js';
 import { PACKAGE_VERSION, PROTOCOL_VERSION } from '../constants.js';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 describe('CLI command parser and execution', () => {
+  it.each([undefined, {}, { posted: 0 }])(
+    'reports incomplete finding measurements instead of publishing zeros: %s',
+    (measurement) => {
+      const directory = mkdtempSync(join(tmpdir(), 'telemetry-cli-'));
+      const changeset = join(directory, 'changeset.json');
+      writeFileSync(
+        changeset,
+        JSON.stringify({
+          classifierVersion: 1,
+          reviewSignificantFiles: 0,
+          files: { app: 0, test: 0, docsConfig: 0, generated: 0 },
+          linesChanged: {
+            app: 0,
+            test: 0,
+            comment: null,
+            docsConfig: 0,
+            generated: 0,
+            blank: 0,
+          },
+          linesByLanguage: {},
+        }),
+      );
+      const findings = join(directory, 'findings.json');
+      if (measurement !== undefined)
+        writeFileSync(findings, JSON.stringify(measurement));
+      const stdout = vi
+        .spyOn(process.stdout, 'write')
+        .mockImplementation(() => true);
+      try {
+        expect(
+          runCli([
+            'emit-telemetry',
+            '--repo',
+            'owner/repo',
+            '--pr',
+            '123',
+            '--engine',
+            'codex',
+            '--pass-type',
+            'review',
+            '--trigger',
+            'interactive',
+            '--stance',
+            'adversarial',
+            '--status',
+            'changed',
+            '--token-source',
+            'unavailable',
+            '--round',
+            '1',
+            '--base',
+            'a'.repeat(40),
+            '--head',
+            'b'.repeat(40),
+            '--changeset-file',
+            changeset,
+            '--dry-run',
+            ...(measurement === undefined ? [] : ['--findings-file', findings]),
+          ]),
+        ).toBe(0);
+        expect(stdout).toHaveBeenCalledWith(expect.stringMatching(/findings/));
+        expect(stdout).toHaveBeenCalledWith(
+          expect.stringMatching(/"emitted":false/),
+        );
+      } finally {
+        stdout.mockRestore();
+        rmSync(directory, { recursive: true });
+      }
+    },
+  );
   it('outputs protocol version when requested', () => {
     const stdoutSpy = vi
       .spyOn(process.stdout, 'write')

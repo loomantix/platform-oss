@@ -45,6 +45,7 @@ import {
   buildTelemetryRecord,
   emitTelemetry,
   prCommentSink,
+  validateFindings,
 } from './telemetry.js';
 import {
   coverage,
@@ -60,7 +61,6 @@ import type {
   ChangesetReport,
   EmitTelemetryResult,
   ReviewFinding,
-  TelemetryFindingsInput,
   TelemetryLaneInput,
   TelemetryPassType,
   TelemetryReviewTier,
@@ -1027,6 +1027,11 @@ function runCliCommand(argv: string[]): number {
               changeset?: unknown;
             })
           : resolveChangesetReport(args).changeset;
+        if (!args.findingsFile) {
+          fail(
+            'emit-telemetry requires --findings-file; omitted measurements are not zero findings',
+          );
+        }
         const record = buildTelemetryRecord({
           emittedAt: args.emittedAt ?? nowUtcSecond(),
           repo: args.repo,
@@ -1061,12 +1066,9 @@ function runCliCommand(argv: string[]): number {
           truncated: args.truncated === true,
           durationSeconds: parseDurationSeconds(args.durationSeconds),
           changeset: normalizeChangesetInput(changeset),
-          findings: args.findingsFile
-            ? (readJsonFile(
-                args.findingsFile,
-                'findings file',
-              ) as TelemetryFindingsInput)
-            : undefined,
+          findings: validateFindings(
+            readJsonFile(args.findingsFile, 'findings file'),
+          ),
         });
 
         if (args.dryRun) {

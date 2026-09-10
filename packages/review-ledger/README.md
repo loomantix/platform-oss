@@ -270,6 +270,13 @@ review-ledger emit-telemetry --repo owner/repo --pr 123 \
 review-ledger emit-telemetry ... --dry-run
 ```
 
+`--findings-file` is required, including for clean and skipped passes. Supply
+explicit `posted` and `chainInducedRegressions` counts and the full
+`bySeverityAndOutcome` ladder (`blocking`, `major`, `minor`, `nit`, each with
+`validFixed`, `validDeferred`, and `invalidDismissed`). Missing or partial
+measurements return `emitted: false`; they must not become a zero-finding pass.
+The programmatic builder retains its existing optional-input defaults.
+
 The marker is `local-review-telemetry:v1` followed by a JSON payload. Four
 properties are load-bearing:
 
