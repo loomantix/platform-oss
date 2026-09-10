@@ -6,8 +6,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 describe('CLI command parser and execution', () => {
-  it.each([undefined, {}, { posted: 0 }])(
-    'reports incomplete finding measurements instead of publishing zeros: %s',
+  it.each([
+    undefined,
+    {},
+    { posted: 0 },
+    {
+      posted: 0,
+      chainInducedRegressions: 0,
+      bySeverityAndOutcome: Object.fromEntries(
+        ['blocking', 'major', 'minor', 'nit'].map((severity) => [
+          severity,
+          { validFixed: 0, validDeferred: 0, invalidDismissed: 0 },
+        ]),
+      ),
+    },
+  ])(
+    'distinguishes absent findings from measured zero findings: %s',
     (measurement) => {
       const directory = mkdtempSync(join(tmpdir(), 'telemetry-cli-'));
       const changeset = join(directory, 'changeset.json');
@@ -60,16 +74,29 @@ describe('CLI command parser and execution', () => {
             'a'.repeat(40),
             '--head',
             'b'.repeat(40),
+            '--telemetry-run-id',
+            'c'.repeat(64),
             '--changeset-file',
             changeset,
             '--dry-run',
             ...(measurement === undefined ? [] : ['--findings-file', findings]),
           ]),
         ).toBe(0);
-        expect(stdout).toHaveBeenCalledWith(expect.stringMatching(/findings/));
-        expect(stdout).toHaveBeenCalledWith(
-          expect.stringMatching(/"emitted":false/),
-        );
+        if (measurement && 'bySeverityAndOutcome' in measurement) {
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/local-review-telemetry:v1/),
+          );
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/"idempotencyKey": "run:[0-9a-f]{64}"/),
+          );
+        } else {
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/findings/),
+          );
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/"emitted":false/),
+          );
+        }
       } finally {
         stdout.mockRestore();
         rmSync(directory, { recursive: true });
