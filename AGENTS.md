@@ -49,6 +49,15 @@ If work needs non-public context, discuss that context outside this public repos
 - Release tags are package-specific: `<package>-v<semver>`.
 - Publish workflows use npm Trusted Publishing with provenance. Do not add long-lived npm tokens.
 
+## Synced review tooling
+
+Claude, Codex, and Gemini/Agy skills come from `loomantix/activeloom@sync-v2`
+through `.github/workflows/sync-from-upstream.yml`. Configure harness selection,
+substitutions, telemetry, and destination permissions in `.activeloom-config.yml`.
+Changes to synced skills and references belong upstream; local edits are
+overwritten by the next sync. Sync opens PRs against `main` and remains disabled
+when the repository variable `SKIP_UPSTREAM_SYNC` is set.
+
 ## Commands
 
 ```bash

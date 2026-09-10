@@ -18,15 +18,31 @@ this skill reads that decision rather than making its own.
 
 ## Phase 0: Pre-flight
 
+### Controller or one-pass reviewer
+
+A top-level auto request follows the workflow's
+[auto-mode preflight](../../REVIEW_WORKFLOW.md#auto-mode) and
+[run initialization](../../REVIEW_WORKFLOW.md#start-an-interactive-run-before-authorizing-a-pass).
+Resolve the roster's available launchers before spending a pass. A launcher or
+wrapper invocation that requests exactly one pass inherits that run and returns
+to its caller after finalizing the result; it skips Phase 3 and never schedules
+another engine, even when the enclosing run is automatic.
+
 ### Context-window check
 
-This chain invokes `/simplify` and up to six adversarial sub-agents. If this
+This chain invokes cleanup analysis and up to six adversarial sub-agents. If this
 session authored the change or carries dense implementation context, stop and
 recommend a fresh Claude session. A larger context window does not relax this
 gate: authoring rationale anchors the reviewer and is expensive to fan out. See
 [`../../MODEL_NOTES.md`](../../MODEL_NOTES.md) §8.
 
 Proceed in the current session only after an explicit override.
+
+This gate applies before this session performs review. An authoring session
+may still coordinate supported independent reviewers as the auto controller.
+Cleanup and fixes within an already-fresh review do not require another fresh
+session when moving between its sub-skills. This exception does not admit a
+session that implemented the feature before review started.
 
 ### PR-first boundary
 
@@ -68,15 +84,22 @@ Deep-versus-Lean comparison as if the two were measured on the same boundary.
    `status=skipped` under the ledger's wrapper/standalone ownership rule. Return
    after it completes without spending the refactor latch.
 7. Resolve the changed-file list once for the initial packet. If refactorpass
-   commits, that packet ends with its reviewed head: reload the PR head and
+   commits, that packet ends with its reviewed head: resolve the new local head and
    build a new immutable packet before deep critique. If refactorpass is a no-op,
    both lanes may reuse the initial packet. The ledger's diff-delivery rules
    govern both.
-8. Resolve this engine's round number per the ledger — `$AGENT_LOOP_REVIEW_ROUND`
-   when the runner set it, otherwise one past the count of `local-review-pass:v3`
-   and `local-review-complete:v3` markers naming `engine=claude`. Rounds 1–2 are
-   adversarial; round 3 and later are convergence rounds. State which applies
-   before running a lane.
+8. Use the controller-authorized `$AGENT_LOOP_REVIEW_ROUND` when supplied.
+   Otherwise select one past Claude's highest completed round within the latest
+   authenticated `local-review-run:v1` (1 when it has none), using only its
+   pass/complete comments after that run marker. Honor the run's cap and use
+   `.codex/skills/critique/scripts/local-review-handoff.py authorize-pass`, the
+   shared run controller. If it is absent, report that and stop.
+   Follow the workflow's run initialization when no run exists. An ended run,
+   including an aborted one, needs fresh restart authorization; this controller
+   has no budget-preserving resume command. Earlier runs do not consume a new
+   run's budget, and PR-wide history cannot substitute for an authenticated run.
+   Rounds 1–2 are adversarial; round 3 and later are convergence rounds. State
+   which applies before running a lane.
 
 ### Tier gate
 
@@ -111,7 +134,14 @@ it to return. Do not stop when the sub-skill returns.
 ## Phase 2: Deep critique
 
 Reload the PR head and ledger. When refactorpass moved the head, rebuild the
-immutable review packet from the same pinned base through that new head. Then
+immutable review packet from the same pinned base through the new local head.
+Inside a wrapper whose `$AGENT_LOOP_REVIEW_PUSH_HELPER` is set, cleanup
+remains unpublished until critique's single final
+push: retain the original PR head and pre-pass snapshot, and carry forward
+the pending cleanup finding identities and latch. Do not re-enter a fresh-pass
+head-equality gate or replace the enclosing before SHA. Finding anchors still
+use GitHub's current published patch; local cleanup lines are not new anchors.
+Then
 `Skill(skill="critique", args="<pr-number> deep")`, passing the resolved round so
 the lane selects the matching stance.
 
@@ -140,8 +170,9 @@ regular file and call `write-blocked-result`.
 
 ## Phase 3: Auto-mode relay
 
-Skip this phase in session mode, where the user starts the next reviewer in a
-fresh terminal.
+Only the top-level auto controller enters this phase. Skip it in session mode,
+where the user starts the next reviewer in a fresh terminal, and in a one-pass
+launcher or wrapper invocation, which returns its result to its caller.
 
 In auto mode, read the effective roster and exact-head coverage from the ledger,
 then start each declared reviewer that holds no attestation at the current head.
@@ -164,9 +195,13 @@ The launcher exiting zero is necessary and not sufficient. After it returns,
 confirm that engine's authenticated attestation at the exact reviewed head with
 the ledger helper's `verify-coverage`. A nonzero exit with attestation present
 means the reviewer's CLI reported a turn-level error over work that landed —
-report it, re-run the round, and change nothing in the launcher. A zero exit
+report it and follow the workflow's bounded recovery without changing the
+launcher or discarding valid evidence. A zero exit
 with no attestation at that head means the round is not covered. State the
-launcher exit, the structured status, and the coverage result.
+launcher exit, the structured status, and the coverage result. A valid blocked
+result returns to the outer controller's
+[recovery decision](../../REVIEW_WORKFLOW.md#recover-a-blocked-pass); it is not
+automatically a terminal failure of the whole run.
 
 ## Phase 4: Handoff
 
@@ -191,13 +226,14 @@ Next local step:
   The outer runner decides convergence from the exact-head v3 results.
 ```
 
-A convergence round that found no blocking defect ends the loop. Say so and name
-the ship step; do not report the remaining rounds as owed.
+A clean convergence pass returns to the controller for remaining exact-head
+coverage and ledger verification. Recommend shipment after those are complete;
+do not spend unused rounds merely because they remain.
 
 Classify by effect, not path or finding severity. A correctness, security,
 deployment/sync, or review-integrity fix may be material even when it touches a
-test or workflow, and a fixed `major` whose fix edited only comments, only docs,
-or only tests is `minor` — the severity of the finding never sets the
+test or workflow. A non-behavioral clarification may be `minor`, but a test fix
+that prevents false success is `material` — the severity of the finding never sets the
 classification of the pass. Minor means low-risk non-behavioral cleanup or
 polish. Every attestation stays exact to its reviewed head; the outer round owns
 any explicit minor-transition convergence decision.

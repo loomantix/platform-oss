@@ -1,7 +1,11 @@
-# Substitution values for the upstream sync engine.
-# Used to generate `.github/copilot-instructions.md` from the synced template.
-# See https://github.com/loomantix/claude-platform/blob/main/docs/getting-started.md
-# for the schema and full key list.
+# Unified ActiveLoom consumer configuration.
+# https://github.com/loomantix/activeloom/blob/main/docs/sync.md
+harnesses: [claude, codex, gemini]
+
+# Explicit until the tagged distribution enables telemetry by default.
+telemetry:
+  emit: 'on'
+  extract: 'on'
 
 substitutions:
   PROJECT_NAME: platform-oss
@@ -112,51 +116,51 @@ substitutions:
       fire-and-forget by contract; layer durability above the sink
       callback if you need it.
 
-# Platform-oss consumes the full set of skills + agents synced from the
-# upstream manifest. No per-target overrides are required here.
 skip_targets: []
 
-# Sync destination allowlist (loomantix/platform#96). Every write/delete
-# the upstream `sync-targets.yml` manifest performs against this consumer
-# must match at least one pattern below. Shifts the trust boundary from
-# "upstream maintainer didn't get fooled" to "platform-oss explicitly opted
-# in to each destination path." Gitignore-flavored globs: `**` matches any
-# path tail; `*` matches a single path segment.
-#
-# Tightness rationale:
-#   - `.claude/skills/**` + `.claude/agents/**` + `.claude/hooks/**` are
-#     broad because their contents only execute when a developer invokes a
-#     skill or sub-agent — no auto-run primitive — and adding new skills /
-#     agents is expected fleet evolution.
-#   - `.github/workflows/dco.yml` is explicit (no `**`). Workflows auto-run
-#     on push, so widening to `.github/workflows/**` would let a compromised
-#     upstream drop an arbitrary CI job — a critical risk on a public OSS
-#     repo where workflows publish to npm and sign provenance.
-#   - `.claude/settings.json`, `.claude/REVIEW_WORKFLOW.md`,
-#     `.claude/MODEL_NOTES.md`, `.claude/SKILL_AUTHORING.md`, and
-#     `.claude/references/local-review-ledger.md` are explicit to keep the
-#     trusted-config surface narrow.
+# Harness code is opt-in; shared workflow writes remain explicitly bounded.
 allowed_destinations:
-  - .claude/agents/**
-  - .claude/skills/**
-  - .claude/hooks/**
-  - .claude/settings.json
-  - .claude/REVIEW_WORKFLOW.md
-  - .claude/MODEL_NOTES.md
-  - .claude/SKILL_AUTHORING.md
-  - .claude/references/local-review-ledger.md
-  - .claude/references/house-tokens.css
   - .github/copilot-instructions.md
   - .github/workflows/dco.yml
   - agent-loop-instructions.md
+  - .claude/skills/**
+  - .claude/agents/**
+  - .claude/hooks/**
+  - .claude/prompt-stack.json
+  - .claude/references/local-review-ledger.md
+  - .claude/references/house-tokens.css
+  - .claude/REVIEW_WORKFLOW.md
+  - .claude/MODEL_NOTES.md
+  - .claude/SKILL_AUTHORING.md
+  - .claude/settings.json
+  - .codex/skills/**
+  - .codex/agents/**
+  - .codex/hooks/**
+  - .codex/prompt-stack.json
+  - .codex/references/review-chain-runner.md
+  - .codex/references/roles/code-explorer.md
+  - .codex/references/roles/code-architect.md
+  - .codex/references/roles/code-reviewer.md
+  - .codex/references/roles/silent-failure-hunter.md
+  - .codex/references/roles/type-design-analyzer.md
+  - .codex/references/roles/comment-analyzer.md
+  - .codex/references/roles/pr-test-analyzer.md
+  - .codex/references/roles/security-reviewer.md
+  - .codex/references/local-review-ledger.md
+  - .codex/REVIEW_WORKFLOW.md
+  - .agents/skills/**
+  - .agents/agents/**
+  - .agents/hooks/**
+  - .agents/references/roles/code-explorer.md
+  - .agents/references/roles/code-architect.md
+  - .agents/references/roles/code-reviewer.md
+  - .agents/references/roles/silent-failure-hunter.md
+  - .agents/references/roles/type-design-analyzer.md
+  - .agents/references/roles/comment-analyzer.md
+  - .agents/references/roles/pr-test-analyzer.md
+  - .agents/references/roles/security-reviewer.md
+  - .agents/references/local-review-ledger.md
+  - .agents/REVIEW_WORKFLOW.md
 
-# Per-file consent for sensitive destinations. `allowed_destinations` bounds
-# where the sync may write; this bounds what may be done to the sensitive
-# files inside that surface, and the two are checked independently.
-#
-# This repo requires DCO sign-off, so it syncs the shared `dco.yml` workflow
-# rather than opting out of it. A workflow runs with this repository's
-# secrets and permissions, so the engine requires the destination be named
-# explicitly before it will overwrite one.
 allow_sensitive_writes:
   - .github/workflows/dco.yml
