@@ -6,8 +6,10 @@ node_modules
 pnpm-lock.yaml
 **/*.d.ts
 
-# Synced from upstream — formatting belongs upstream at loomantix/claude-platform
+# Synced from upstream — formatting belongs upstream at loomantix/activeloom
 .claude/**
+.codex/**
+.agents/**
 .github/copilot-instructions.md
 
 # Python (leak scanner) — handled by ruff/black if/when added
