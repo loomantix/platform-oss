@@ -270,6 +270,12 @@ review-ledger emit-telemetry --repo owner/repo --pr 123 \
 review-ledger emit-telemetry ... --dry-run
 ```
 
+For controller-managed reviews, supply `--telemetry-run-id <64-hex-run-id>`
+(`runId` in the builder API) to separate restarted rounds at the same head.
+Retries within that run retain the same key. Existing explicit
+`--idempotency-key` values take precedence; callers without a controller must
+save one unique key per pass and reuse it only for that pass's retries.
+
 `--findings-file` is required, including for clean and skipped passes. Supply
 explicit `posted` and `chainInducedRegressions` counts and the full
 `bySeverityAndOutcome` ladder (`blocking`, `major`, `minor`, `nit`, each with

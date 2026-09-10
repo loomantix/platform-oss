@@ -140,6 +140,7 @@ interface CliArgs {
   durationSeconds?: string | undefined;
   emittedAt?: string | undefined;
   idempotencyKey?: string | undefined;
+  telemetryRunId?: string | undefined;
   promptSurfaces?: string[] | undefined;
   truncated?: boolean | undefined;
   dryRun?: boolean | undefined;
@@ -334,6 +335,9 @@ function parseCliArgs(argv: string[]): CliArgs {
         break;
       case '--engine-version':
         args.engineVersion = parseVal(arg);
+        break;
+      case '--telemetry-run-id':
+        args.telemetryRunId = parseVal(arg);
         break;
       case '--pass-type':
         args.passType = parseEnum(arg, parseVal(arg), TELEMETRY_PASS_TYPES);
@@ -1037,6 +1041,7 @@ function runCliCommand(argv: string[]): number {
           repo: args.repo,
           pr: args.pr,
           idempotencyKey: args.idempotencyKey,
+          runId: args.telemetryRunId,
           engine: args.engineRaw,
           engineVersion: args.engineVersion ?? null,
           passType: args.passType,
