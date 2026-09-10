@@ -1,20 +1,13 @@
-# Sync canonical files from loomantix/claude-platform — produces verified commits.
+# Sync canonical files from loomantix/activeloom — produces verified commits.
 #
 # Adapted from the upstream template at:
-# https://github.com/loomantix/claude-platform/blob/main/.github/workflows/sync-from-upstream.yml.template
+# https://github.com/loomantix/activeloom/blob/main/.github/workflows/sync-from-upstream.yml.template
 #
 # How this works:
 #
 #   1. Authenticates as a GitHub App via `actions/create-github-app-token@v1`.
-#      Required secrets on this repo (org-allowlisted to billing-substrate
-#      and platform-oss only):
-#        - LOOM_OSS_BOT_APP_ID         (App id — loomantix-org secret scoped
-#                                       to OSS consumer repos only)
-#        - LOOM_OSS_BOT_APP_PRIVATE_KEY (PEM-encoded private key — same scope)
-#      The `loomantix-sync-public` App must be installed on this repo with
-#      `contents: write`, `pull_requests: write`, and `workflows: write`.
-#      Separate from the `loomantix` App (which signs commits on private fleet
-#      repos) so a compromise here cannot mint tokens against private code.
+#      Uses the repository's existing sync App credentials.
+#      The App needs contents, pull-requests and workflows write permissions.
 #
 #   2. Replaces `git commit + git push` with `scripts/create-signed-commit.py`
 #      from the cloned upstream repo. That script uses the GitHub Contents
@@ -26,7 +19,7 @@
 #      github-actions[bot]) for both the commit creation and the
 #      `gh pr create` call.
 #
-# Trust model: UPSTREAM_REF defaults to a tag (`sync-v1`), not `main`, so
+# Trust model: UPSTREAM_REF defaults to a tag (`sync-v2`), not `main`, so
 # pushes to upstream main don't auto-propagate. Bumping the tag is the
 # deliberate gate. Kill switch via `SKIP_UPSTREAM_SYNC` repo variable.
 
@@ -46,8 +39,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM_REPO: loomantix/claude-platform
-  UPSTREAM_REF: sync-v1
+  UPSTREAM_REPO: loomantix/activeloom
+  UPSTREAM_REF: sync-v2
   SYNC_BRANCH_PREFIX: sync/upstream
   PR_BASE_BRANCH: main
 
@@ -109,7 +102,8 @@ jobs:
           set -euo pipefail
           python3 /tmp/upstream/scripts/sync-engine.py \
             --upstream-repo /tmp/upstream \
-            --consumer-dir .
+            --consumer-dir . \
+            --reject-consumer-symlinks
 
       - name: Detect changes
         id: diff
@@ -174,7 +168,7 @@ jobs:
           # date-stamped branch). `gh pr create` errors if a PR already
           # exists for $BRANCH; fall through to gh pr edit on that path.
           PR_TITLE="Sync from ${UPSTREAM_REPO}"
-          PR_BODY="Automated sync from \`${UPSTREAM_REPO}@${UPSTREAM_REF}\`. Review the diff carefully before merging — substituted content reflects current \`.platform-config.yml\`."
+          PR_BODY="Automated sync from \`${UPSTREAM_REPO}@${UPSTREAM_REF}\`. Review the diff carefully before merging — substituted content reflects current \`.activeloom-config.yml\`."
           if ! gh pr create \
                 --base "${PR_BASE_BRANCH}" \
                 --head "$BRANCH" \

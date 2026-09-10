@@ -1,6 +1,6 @@
 ---
 name: grill
-description: A relentless interview that stress-tests a plan or design until nothing is silently assumed.
+description: A relentless pre-code interview that stress-tests a plan or design until nothing is silently assumed.
 disable-model-invocation: true
 argument-hint: (optional) the idea, plan, or decision to stress-test
 ---
