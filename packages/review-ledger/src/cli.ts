@@ -1026,16 +1026,16 @@ function runCliCommand(argv: string[]): number {
             'emit-telemetry requires --pass-type, --trigger, --stance, --status, --token-source, --round, --base, and --head',
           );
         }
-        const changeset = args.changesetFile
-          ? (readJsonFile(args.changesetFile, 'changeset file') as {
-              changeset?: unknown;
-            })
-          : resolveChangesetReport(args).changeset;
         if (!args.findingsFile) {
           fail(
             'emit-telemetry requires --findings-file; omitted measurements are not zero findings',
           );
         }
+        const changeset = args.changesetFile
+          ? (readJsonFile(args.changesetFile, 'changeset file') as {
+              changeset?: unknown;
+            })
+          : resolveChangesetReport(args).changeset;
         const record = buildTelemetryRecord({
           emittedAt: args.emittedAt ?? nowUtcSecond(),
           repo: args.repo,
