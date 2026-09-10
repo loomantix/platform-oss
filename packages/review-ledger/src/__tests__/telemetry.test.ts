@@ -116,6 +116,14 @@ describe('buildTelemetryRecord', () => {
     expect(record.idempotencyKey).toBe('owner/repo:123:claude:review:3:head');
   });
 
+  it('separates restarted runs at the same head while keeping retries stable', () => {
+    const first = buildTelemetryRecord(params({ runId: 'a'.repeat(64) }));
+    const retry = buildTelemetryRecord(params({ runId: 'a'.repeat(64) }));
+    const restarted = buildTelemetryRecord(params({ runId: 'b'.repeat(64) }));
+    expect(first.idempotencyKey).toBe(retry.idempotencyKey);
+    expect(first.idempotencyKey).not.toBe(restarted.idempotencyKey);
+  });
+
   it('defaults finding counts to zero but never token counts', () => {
     const record = buildTelemetryRecord(
       params({

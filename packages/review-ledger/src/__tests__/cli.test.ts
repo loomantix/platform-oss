@@ -1,8 +1,108 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runCli } from '../cli.js';
 import { PACKAGE_VERSION, PROTOCOL_VERSION } from '../constants.js';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 describe('CLI command parser and execution', () => {
+  it.each([
+    undefined,
+    {},
+    { posted: 0 },
+    {
+      posted: 0,
+      chainInducedRegressions: 0,
+      bySeverityAndOutcome: Object.fromEntries(
+        ['blocking', 'major', 'minor', 'nit'].map((severity) => [
+          severity,
+          { validFixed: 0, validDeferred: 0, invalidDismissed: 0 },
+        ]),
+      ),
+    },
+  ])(
+    'distinguishes absent findings from measured zero findings: %s',
+    (measurement) => {
+      const directory = mkdtempSync(join(tmpdir(), 'telemetry-cli-'));
+      const changeset = join(directory, 'changeset.json');
+      writeFileSync(
+        changeset,
+        JSON.stringify({
+          classifierVersion: 1,
+          reviewSignificantFiles: 0,
+          files: { app: 0, test: 0, docsConfig: 0, generated: 0 },
+          linesChanged: {
+            app: 0,
+            test: 0,
+            comment: null,
+            docsConfig: 0,
+            generated: 0,
+            blank: 0,
+          },
+          linesByLanguage: {},
+        }),
+      );
+      const findings = join(directory, 'findings.json');
+      if (measurement !== undefined)
+        writeFileSync(findings, JSON.stringify(measurement));
+      const stdout = vi
+        .spyOn(process.stdout, 'write')
+        .mockImplementation(() => true);
+      try {
+        expect(
+          runCli([
+            'emit-telemetry',
+            '--repo',
+            'owner/repo',
+            '--pr',
+            '123',
+            '--engine',
+            'codex',
+            '--pass-type',
+            'review',
+            '--trigger',
+            'interactive',
+            '--stance',
+            'adversarial',
+            '--status',
+            'changed',
+            '--token-source',
+            'unavailable',
+            '--round',
+            '1',
+            '--base',
+            'a'.repeat(40),
+            '--head',
+            'b'.repeat(40),
+            '--telemetry-run-id',
+            'c'.repeat(64),
+            '--changeset-file',
+            changeset,
+            '--dry-run',
+            ...(measurement === undefined ? [] : ['--findings-file', findings]),
+          ]),
+        ).toBe(0);
+        if (measurement && 'bySeverityAndOutcome' in measurement) {
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/local-review-telemetry:v1/),
+          );
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/"idempotencyKey": "run:[0-9a-f]{64}"/),
+          );
+        } else {
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/findings/),
+          );
+          expect(stdout).toHaveBeenCalledWith(
+            expect.stringMatching(/"emitted":false/),
+          );
+        }
+      } finally {
+        stdout.mockRestore();
+        rmSync(directory, { recursive: true });
+      }
+    },
+  );
   it('outputs protocol version when requested', () => {
     const stdoutSpy = vi
       .spyOn(process.stdout, 'write')

@@ -45,6 +45,7 @@ import {
   buildTelemetryRecord,
   emitTelemetry,
   prCommentSink,
+  validateFindings,
 } from './telemetry.js';
 import {
   coverage,
@@ -60,7 +61,6 @@ import type {
   ChangesetReport,
   EmitTelemetryResult,
   ReviewFinding,
-  TelemetryFindingsInput,
   TelemetryLaneInput,
   TelemetryPassType,
   TelemetryReviewTier,
@@ -140,6 +140,7 @@ interface CliArgs {
   durationSeconds?: string | undefined;
   emittedAt?: string | undefined;
   idempotencyKey?: string | undefined;
+  telemetryRunId?: string | undefined;
   promptSurfaces?: string[] | undefined;
   truncated?: boolean | undefined;
   dryRun?: boolean | undefined;
@@ -334,6 +335,9 @@ function parseCliArgs(argv: string[]): CliArgs {
         break;
       case '--engine-version':
         args.engineVersion = parseVal(arg);
+        break;
+      case '--telemetry-run-id':
+        args.telemetryRunId = parseVal(arg);
         break;
       case '--pass-type':
         args.passType = parseEnum(arg, parseVal(arg), TELEMETRY_PASS_TYPES);
@@ -1022,6 +1026,11 @@ function runCliCommand(argv: string[]): number {
             'emit-telemetry requires --pass-type, --trigger, --stance, --status, --token-source, --round, --base, and --head',
           );
         }
+        if (!args.findingsFile) {
+          fail(
+            'emit-telemetry requires --findings-file; omitted measurements are not zero findings',
+          );
+        }
         const changeset = args.changesetFile
           ? (readJsonFile(args.changesetFile, 'changeset file') as {
               changeset?: unknown;
@@ -1032,6 +1041,7 @@ function runCliCommand(argv: string[]): number {
           repo: args.repo,
           pr: args.pr,
           idempotencyKey: args.idempotencyKey,
+          runId: args.telemetryRunId,
           engine: args.engineRaw,
           engineVersion: args.engineVersion ?? null,
           passType: args.passType,
@@ -1061,12 +1071,9 @@ function runCliCommand(argv: string[]): number {
           truncated: args.truncated === true,
           durationSeconds: parseDurationSeconds(args.durationSeconds),
           changeset: normalizeChangesetInput(changeset),
-          findings: args.findingsFile
-            ? (readJsonFile(
-                args.findingsFile,
-                'findings file',
-              ) as TelemetryFindingsInput)
-            : undefined,
+          findings: validateFindings(
+            readJsonFile(args.findingsFile, 'findings file'),
+          ),
         });
 
         if (args.dryRun) {

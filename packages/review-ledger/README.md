@@ -270,6 +270,43 @@ review-ledger emit-telemetry --repo owner/repo --pr 123 \
 review-ledger emit-telemetry ... --dry-run
 ```
 
+For controller-managed reviews, supply `--telemetry-run-id <64-hex-run-id>`
+(`runId` in the builder API) to separate restarted rounds at the same head.
+Retries within that run retain the same key. Existing explicit
+`--idempotency-key` values take precedence; callers without a controller must
+save one unique key per pass and reuse it only for that pass's retries.
+
+`--findings-file` is required, including for clean and skipped passes. Supply
+explicit `posted` and `chainInducedRegressions` counts and the full
+`bySeverityAndOutcome` ladder (`blocking`, `major`, `minor`, `nit`, each with
+`validFixed`, `validDeferred`, and `invalidDismissed`). Missing or partial
+measurements return `emitted: false`; they must not become a zero-finding pass.
+The programmatic builder retains its existing optional-input defaults.
+
+A pass with nothing to measure — a `clean` pass, a docs/config-only `skipped`
+pass, or a `blocked` pass that ended before it dispositioned anything — must
+still write a findings file, spelling the zeros out:
+
+```json
+{
+  "posted": 0,
+  "bySeverityAndOutcome": {
+    "blocking": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "major": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "minor": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "nit": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 }
+  },
+  "chainInducedRegressions": 0
+}
+```
+
+A measured zero and an omitted measurement are different claims, which is why
+the zeros are written rather than inferred. Because emission is never fatal, an
+invocation that omits the file reports `emitted: false` and still exits 0, so a
+caller that skips this step loses the record without ever failing. Update the
+callers that emit on these early-return paths before, or together with, the
+bundle update that carries this requirement.
+
 The marker is `local-review-telemetry:v1` followed by a JSON payload. Four
 properties are load-bearing:
 

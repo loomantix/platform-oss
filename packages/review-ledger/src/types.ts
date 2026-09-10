@@ -832,6 +832,8 @@ export interface TelemetryRecord {
 
 /** The fields `buildTelemetryRecord` needs to assemble a record. */
 export interface BuildTelemetryParams {
+  /** Controller run identity; separates restarted passes from retries. */
+  runId?: string | undefined;
   emittedAt: string;
   repo: string;
   pr: number;

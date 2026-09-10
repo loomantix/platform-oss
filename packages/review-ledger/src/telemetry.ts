@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   CANONICAL_TOKEN_BUCKETS,
   OPEN_TOKEN_RE,
@@ -277,7 +278,8 @@ function validateChangeset(value: unknown): Changeset {
   return validated;
 }
 
-function validateFindings(value: unknown): TelemetryFindings {
+/** Validate a complete finding measurement without supplying missing counts. */
+export function validateFindings(value: unknown): TelemetryFindings {
   const source = requireObject(value, 'findings');
   const ladder = requireObject(
     source['bySeverityAndOutcome'],
@@ -355,15 +357,27 @@ export function telemetryIdempotencyKey(fields: {
   passType: TelemetryPassType;
   round: number;
   headSha: string;
+  runId?: string | undefined;
 }): string {
-  return [
+  const fieldsForKey = [
     fields.repo,
     String(fields.pr),
     fields.engine,
     fields.passType,
     String(fields.round),
     fields.headSha,
-  ].join(':');
+  ];
+  if (fields.runId !== undefined) {
+    if (!SHA_64_RE.test(fields.runId))
+      fail('telemetry runId must be a lowercase SHA-256 digest');
+    return (
+      'run:' +
+      createHash('sha256')
+        .update(JSON.stringify([fields.runId, ...fieldsForKey]))
+        .digest('hex')
+    );
+  }
+  return fieldsForKey.join(':');
 }
 
 /**
@@ -614,6 +628,7 @@ export function buildTelemetryRecord(
       passType: params.passType,
       round: params.round,
       headSha: params.headSha,
+      runId: params.runId,
     });
 
   return validateTelemetryRecord({
