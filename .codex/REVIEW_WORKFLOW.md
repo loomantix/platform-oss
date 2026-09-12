@@ -709,6 +709,22 @@ hand-back is the head rule, not a separate obligation.
 
 ## Pass Telemetry
 
+At the pass boundary, create and save this pass's idempotency key:
+
+```bash
+node .codex/skills/critique/scripts/telemetry-pass-key.js \
+  <owner/repo> <pr> <controller-run-id-or-standalone> <authenticated-actor> \
+  <engine> <review-or-refactor-or-hosted> <round> <reviewed-head>
+```
+
+Use the controller's authenticated run ID when present. `standalone` creates
+a fresh attempt identity; invoke it once and retain its returned key in the
+pass's private working files. Pass `--idempotency-key <returned-key>` to every
+emission, reusing it on a retry. Different actors and restarted runs must not
+share keys. Never regenerate a standalone key to retry publication. If key
+creation fails, report telemetry failure rather than falling back to a key
+that may identify a different pass. This works with existing ledger bundles.
+
 Every pass records what it cost, as a `local-review-telemetry:v1` marker in its
 own PR comment. The record carries token buckets per exact model, classified
 line churn, finding dispositions, and the pass identity needed to ask whether
@@ -725,6 +741,12 @@ re-priceable.
 
 ### Two gates: measuring and publishing
 
+Repository defaults come from the synced sibling `review-telemetry.json` beside
+this harness's usage helper. Non-empty process environment values override
+those defaults. Missing configuration enables publication and extraction; malformed
+configuration disables both gates with an error. See `docs/sync.md` upstream
+for the required sync destinations.
+
 Extraction and emission are separate decisions and have separate gates. Both
 are read by the usage helper and nowhere else; both are environment
 configuration set once, never an interactive prompt during a pass, because a
@@ -732,20 +754,19 @@ prompt would block an autonomous run.
 
 | Variable                        | Governs                             | Default           |
 | ------------------------------- | ----------------------------------- | ----------------- |
-| `LOOM_REVIEW_TELEMETRY`         | emitting a record to a pull request | off               |
+| `LOOM_REVIEW_TELEMETRY`         | emitting a record to a pull request | on                |
 | `LOOM_REVIEW_TELEMETRY_EXTRACT` | measuring this pass at all          | the emission gate |
 
 Each accepts exactly `on` or `off`. Any other non-empty value is neither: the
 helper stays disabled and says why, so a typo reads as a misconfiguration
 rather than as a deliberate opt-out.
 
-Publication is the part that warrants an opt-in rollout, so it is the part that
-keeps the original variable and its original meaning — nothing changes for a
-repository that has already set it. Measurement is separable because a local
-consumer of usage data has no business publishing anything: set
-`LOOM_REVIEW_TELEMETRY_EXTRACT=on` with the emission gate off and the numbers
-are available while emission is structurally unreachable rather than merely
-unrequested.
+Publication defaults on for every review pass. Set `telemetry.emit: off` in the
+consumer's sync configuration — not in the rendered `review-telemetry.json`,
+whose only keys are the two variables named above — or set
+`LOOM_REVIEW_TELEMETRY=off` in the process environment to opt out. Extraction inherits emission unless explicitly set,
+so an emission opt-out also disables extraction by default. For local-only
+measurement, set `LOOM_REVIEW_TELEMETRY_EXTRACT=on` with emission off.
 
 The helper reports `enabled` for extraction and `emit` for emission on every
 payload, in every mode and on every failure path. **Invoke `emit-telemetry`
@@ -917,6 +938,35 @@ force-moved whenever content changes, so two consumers "on sync-v1" at different
 times are running different prompts and the tag carries no content identity.
 
 ### Count the findings
+
+Before every emission attempt, including `clean`, `changed`, `skipped`, and
+`blocked` exits, write this pass's complete findings object to an owner-only
+regular file and pass its path as `--findings-file`. This step also applies to
+early returns before the normal end-of-pass sequence and to a spent cleanup
+latch. Never omit the file or reuse a previous pass's measurements.
+
+Use the all-zero object below only when this pass is known to have posted or
+dispositioned no findings and introduced no chain-induced regressions. Status
+alone does not establish zero: a blocked pass may have posted findings before
+it failed, and a clean pass may have deferred or dismissed findings. Preserve
+those actual counts. Include posted threads whose disposition is still pending
+in `posted`; count only completed dispositions in the outcome buckets. Do not
+invent a `validDeferred` disposition to make the totals equal.
+
+If any required finding count is unknown, re-derive it from this pass's own
+finding threads and dispositions on the pull request before doing anything
+else. That ledger is the source of truth for `posted` and for the completed
+outcome buckets, so "unknown" is a property of a failed query, not of what the
+pass happens to remember. Declaring the measurement unavailable without
+attempting it is the cheapest exit from this section and the one that costs the
+record, so it is not available.
+
+Only when that re-derivation itself fails: do not fabricate zeros or send an
+incomplete file. Report `telemetry not emitted: findings measurement
+unavailable`, naming which count could not be established, do not invoke
+`emit-telemetry`, and return through the existing nonfatal telemetry path.
+Missing token usage is separate: it does not prevent emission when findings
+counts are known.
 
 Write this pass's own dispositions to a regular file with the active
 file-editing tool — never a heredoc or command substitution:

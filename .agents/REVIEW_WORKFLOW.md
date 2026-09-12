@@ -484,3 +484,133 @@ Invocation:
   metadata. Only the concise verified finding and its disposition belong there.
 - Stop at the configured cap and preserve recovery state when reviewers do not
   converge.
+
+## Pass Telemetry
+
+At the pass boundary, create and save this pass's idempotency key:
+
+```bash
+node .agents/skills/critique/scripts/telemetry-pass-key.js \
+  <owner/repo> <pr> <controller-run-id-or-standalone> <authenticated-actor> \
+  <engine> <review-or-refactor-or-hosted> <round> <reviewed-head>
+```
+
+Use the controller's authenticated run ID when present. `standalone` creates
+a fresh attempt identity; invoke it once and retain its returned key in the
+pass's private working files. Pass `--idempotency-key <returned-key>` to every
+emission, reusing it on a retry. Different actors and restarted runs must not
+share keys. Never regenerate a standalone key to retry publication. If key
+creation fails, report telemetry failure rather than falling back to a key
+that may identify a different pass. This works with existing ledger bundles.
+
+Every review and cleanup pass attempts one `local-review-telemetry:v1` PR
+comment after finalizing its review result, including blocked and skipped
+passes. Telemetry is best-effort: report failure and continue without changing
+the review outcome. Never read prior telemetry into reviewer context; filter
+all comments carrying the `local-review-telemetry:` prefix.
+
+Before reading or classifying the diff, resolve the repository, PR, literal
+base/head SHAs, engine, pass type, round, and stance. Resolve the engine from
+the runtime actually running the pass — `gemini` or `antigravity` — the same
+way the skills do; never hardcode it. A misattributed record is counted against
+the wrong engine and skews both series, which is worse than the absent
+measurement this distribution already reports. Then invoke:
+
+```bash
+node .agents/skills/critique/scripts/usage-snapshot.js snapshot
+```
+
+The helper reads repository gates from its synced `review-telemetry.json` and
+non-empty environment overrides. `LOOM_REVIEW_TELEMETRY` governs publication;
+`LOOM_REVIEW_TELEMETRY_EXTRACT` governs measurement and inherits publication
+when unset. Missing gates default on. Set `telemetry.emit: off` in the
+consumer's sync configuration — not in the rendered `review-telemetry.json`,
+whose only keys are the two variables named above — or set
+`LOOM_REVIEW_TELEMETRY=off` to opt out; extraction also turns off unless
+explicitly enabled. An invalid value is not an opt-out: it disables the gate
+and reports an error, so a typo reads as a misconfiguration rather than as a
+deliberate `off`.
+Never infer permission from anything except the helper's `emit` field.
+
+This distribution has no pass-scoped usage adapter. The helper truthfully reports
+`tokenSource: unavailable` and no token buckets; do not guess counts from
+context size, another engine's log, or a whole-session estimate. At the end of
+each pass run the helper with `delta` and retain this unavailable provenance.
+Record elapsed wall time only when a start/end clock was actually captured.
+
+When `emit` is true, invoke the ledger's `emit-telemetry` command with:
+
+- `--repo`, `--pr`, `--engine` (the engine resolved at the pass boundary),
+  `--base`, and `--head` from the pass boundary;
+- `--pass-type review` or `refactor`, `--round`, and `--stance`;
+- `--review-tier lean` or `deep` when resolved;
+- `--trigger autonomous` for a runner invocation, otherwise `interactive`;
+- `--status clean`, `changed`, `blocked`, or `skipped` as actually observed;
+- `--token-source unavailable`, omitting token/model/version arguments;
+- `--findings-file` pointing to an explicit numeric findings object below.
+
+Omit `--changeset-file` to use the package's changeset classifier. `skipped`
+is reserved for a changeset with zero review-significant files; a cleanup
+that stops at its previously spent latch reports `clean`. Pass the original
+boundary even when fixes moved the head; do not silently attribute the pass
+to a different diff. Omit prompt hashes until this harness has a hasher.
+
+### Count the findings
+
+Before every emission attempt, including `clean`, `changed`, `skipped`, and
+`blocked` exits, write this pass's complete findings object to an owner-only
+regular file and pass its path as `--findings-file`. This step also applies to
+early returns before the normal end-of-pass sequence and to a spent cleanup
+latch. Never omit the file or reuse a previous pass's measurements.
+
+Use the all-zero object below only when this pass is known to have posted or
+dispositioned no findings and introduced no chain-induced regressions. Status
+alone does not establish zero: a blocked pass may have posted findings before
+it failed, and a clean pass may have deferred or dismissed findings. Preserve
+those actual counts. Include posted threads whose disposition is still pending
+in `posted`; count only completed dispositions in the outcome buckets. Do not
+invent a `validDeferred` disposition to make the totals equal.
+
+If any required finding count is unknown, re-derive it from this pass's own
+finding threads and dispositions on the pull request before doing anything
+else. That ledger is the source of truth for `posted` and for the completed
+outcome buckets, so "unknown" is a property of a failed query, not of what the
+pass happens to remember. Declaring the measurement unavailable without
+attempting it is the cheapest exit from this section and the one that costs the
+record, so it is not available.
+
+Only when that re-derivation itself fails: do not fabricate zeros or send an
+incomplete file. Report `telemetry not emitted: findings measurement
+unavailable`, naming which count could not be established. Do not invoke
+`emit-telemetry` on this branch, do not retry it, and do not let the omission
+change the pass result or its reported findings — this harness defines no other
+nonfatal telemetry path, so the reporting is the whole of it. Missing token
+usage is separate: it does not prevent emission when findings counts are known.
+
+```json
+{
+  "posted": 0,
+  "bySeverityAndOutcome": {
+    "blocking": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "major": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "minor": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 },
+    "nit": { "validFixed": 0, "validDeferred": 0, "invalidDismissed": 0 }
+  },
+  "chainInducedRegressions": 0
+}
+```
+
+The findings file contains `posted`, `chainInducedRegressions`, and
+`bySeverityAndOutcome`. The latter has one object for each of `blocking`,
+`major`, `minor`, and `nit`, each containing `validFixed`, `validDeferred`, and
+`invalidDismissed` integer counts. Derive these from findings and dispositions
+this pass actually posted, including dispositions of older findings in
+`posted`. Count a chain-induced regression only when its new fingerprint's
+anchor traces to an earlier fix on this PR. Explicit zeros mean measured zero;
+never omit the file and assume the package knows what happened. Carry no
+finding titles, paths, transcript text, or other prose into telemetry.
+
+If the pass fails before its mandatory identity is resolved, report
+`telemetry not emitted: boundary unresolved`. Otherwise blocked passes follow
+the same emission path. Report the returned `emitted` result and reason;
+never retry a telemetry failure into a review or treat missing usage as zero.

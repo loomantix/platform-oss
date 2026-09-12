@@ -5,11 +5,29 @@ description: PR-first cleanup pass for Antigravity or Gemini CLI. Use when the u
 
 # Refactor Pass
 
+## Findings before telemetry emission
+
+Before every telemetry emission attempt, including an early `skipped`, `blocked`,
+or spent-latch return, follow [Count the findings](../../REVIEW_WORKFLOW.md#count-the-findings):
+write the complete measured findings file and supply `--findings-file`.
+Preserve findings posted before an interruption; unknown counts are not zeros.
+If counts cannot be established, report `telemetry not emitted: findings measurement unavailable`
+and follow the existing nonfatal telemetry path.
+
 Run a structured, behavior-preserving cleanup pass on an open draft PR before
 adversarial review. This is not a broad refactor, and it is not a step that
 repeats each review round: it is the active engine's **one** cleanup pass on that
 PR. Resolve the active runtime as `gemini` or `antigravity`; use `codex` only
 when Codex is actually running the pass.
+
+## Pass measurement
+
+Follow "Pass Telemetry" in `.agents/REVIEW_WORKFLOW.md`. After resolving the
+mandatory pass identity and before diff classification, run the usage helper's
+`snapshot`. On every terminal path, including skip and blocked, finalize the
+review result first, then run `delta` and attempt emission only when `emit` is
+true. Report publication failures and unavailable usage explicitly. A failure
+before identity resolution reports `telemetry not emitted: boundary unresolved`.
 
 ## Context Window Check
 
