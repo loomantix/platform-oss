@@ -6,6 +6,15 @@ argument-hint: PR number (e.g., 42), optionally followed by "deep" (e.g., 42 dee
 
 # reviewit — post-push AI review cycle
 
+## Findings before telemetry emission
+
+Before every telemetry emission attempt, including an early `skipped`, `blocked`,
+or spent-latch return, follow [Count the findings](../../REVIEW_WORKFLOW.md#count-the-findings):
+write the complete measured findings file and supply `--findings-file`.
+Preserve findings posted before an interruption; unknown counts are not zeros.
+If counts cannot be established, report `telemetry not emitted: findings measurement unavailable`
+and follow the existing nonfatal telemetry path.
+
 You are orchestrating the post-push AI review cycle for an open pull request.
 
 **Lean mode (default)**: Two reviewers are fired at the same iteration watermark — Gemini Flash and GitHub Copilot — but handling is staggered. Act on Gemini as soon as it returns, push those fixes, then collect Copilot when it finishes before starting the next iteration. Cap is **2 iterations**.
@@ -22,6 +31,20 @@ default path and uses the draft PR ledger with `/deepcritique <pr>` and
 `/codex-review <pr>`.
 
 This replaces the older `/review-cycle` skill. Auto-trigger of Gemini and Copilot is intentionally disabled — `/reviewit` is the only path that fires AI review.
+
+## Hosted pass telemetry
+
+Follow "Pass Telemetry" in `.claude/REVIEW_WORKFLOW.md` for gates,
+identity keys, numeric findings, and best-effort emission. For each requested
+hosted reviewer in each iteration, capture its reviewed head and create a
+separate saved key before dispatch. After handling its findings, emit one
+record with `--pass-type hosted`, that reviewer's engine (`gemini` or
+`copilot`), and the actual iteration and outcome, including blocked/timeouts.
+Do not use coordinator-session usage as hosted-reviewer usage: when the
+provider exposes no attributable counts, use `--token-source unavailable`
+and no token buckets. Record only that reviewer's actual posted findings and
+dispositions; unavailable review results are blocked, never clean. Do not
+count a nested local critique twice. Report emission failures in the summary.
 
 ## Mode resolution
 

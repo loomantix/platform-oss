@@ -5,9 +5,27 @@ description: PR-first adversarial code review for Antigravity or Gemini CLI. Use
 
 # Critique
 
+## Findings before telemetry emission
+
+Before every telemetry emission attempt, including an early `skipped`, `blocked`,
+or spent-latch return, follow [Count the findings](../../REVIEW_WORKFLOW.md#count-the-findings):
+write the complete measured findings file and supply `--findings-file`.
+Preserve findings posted before an interruption; unknown counts are not zeros.
+If counts cannot be established, report `telemetry not emitted: findings measurement unavailable`
+and follow the existing nonfatal telemetry path.
+
 Review an open draft PR adversarially. The goal is to catch bugs, missing tests,
 security issues, and convention violations while preserving every verified
 finding and disposition in the PR.
+
+## Pass measurement
+
+Follow "Pass Telemetry" in `.agents/REVIEW_WORKFLOW.md`. After resolving the
+mandatory pass identity and before diff classification, run the usage helper's
+`snapshot`. On every terminal path, including skip and blocked, finalize the
+review result first, then run `delta` and attempt emission only when `emit` is
+true. Report publication failures and unavailable usage explicitly. A failure
+before identity resolution reports `telemetry not emitted: boundary unresolved`.
 
 ## Context Window Check
 
