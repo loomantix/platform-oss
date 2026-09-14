@@ -305,6 +305,16 @@ describe('classifyRangeEffect', () => {
       '/*\n * @type {string}\n */\nlet value = 1;',
       '/**\n * @type {string}\n */\nlet value = 1;',
     ],
+    [
+      'webpack magic',
+      "export const load = () => import(/* webpackIgnore: false */ './x');",
+      "export const load = () => import(/* webpackIgnore: true */ './x');",
+    ],
+    [
+      'triple-slash reference',
+      '/// <reference types="node" />\nexport const value = 1;',
+      '/// <reference types="bun" />\nexport const value = 1;',
+    ],
   ])('preserves the complete %s comment', (_label, before, after) => {
     withDiff(
       'M\tsrc/settings.js',

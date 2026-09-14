@@ -170,9 +170,11 @@ function commentSkeleton(source: string, extension: string): string {
     // determine whether a source consumer recognizes them (for example JSDoc).
     // Preserve the entire comment whenever any directive-like content appears.
     // A hash followed by a word may name a tool annotation; Markdown headings
-    // and numeric issue references alone do not establish a directive.
+    // and numeric issue references alone do not establish a directive. Bundler
+    // magic comments are camelCase (`webpackChunkName`), and a triple-slash
+    // comment's value begins with `/` (`/// <reference types="node" />`).
     const hasDirective =
-      /@|#[a-z_]|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|webpack|vite|globals?|exported|sourceMappingURL|sourceURL|debugId)\b/i.test(
+      /^\/|@|#[a-z_]|\b(?:webpack|turbopack)|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|vite|globals?|exported|sourceMappingURL|sourceURL|debugId)\b/i.test(
         comment.value,
       );
     const lineBreak = /[\n\r\u2028\u2029]/.test(comment.value) ? '\n' : '';
