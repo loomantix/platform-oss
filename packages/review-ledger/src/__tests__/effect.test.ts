@@ -317,7 +317,27 @@ describe('classifyRangeEffect', () => {
     expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
   });
 
-  it('classifies an actual zero-context JSDoc diff and rejects a mode change', () => {
+  it.each([
+    '/* #__PURE__ */\nconst value = 1;',
+    '//# sourceMappingURL=original.js.map\nconst value = 1;',
+    '//# debugId=synthetic-debug-reference\nconst value = 1;',
+    '/* #tool_annotation */\nconst value = 1;',
+  ])('preserves hash annotations as directives: %s', (before) => {
+    const after = before.startsWith('/*')
+      ? '/* prose */\nconst value = 1;'
+      : '// prose\nconst value = 1;';
+    withDiff(
+      'M\tsrc/identity.ts',
+      {},
+      {
+        [`${BEFORE}:src/identity.ts`]: before,
+        [`${AFTER}:src/identity.ts`]: after,
+      },
+    );
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+  });
+
+  it('classifies a real JSDoc edit with Markdown and issue references, and rejects a mode change', () => {
     const directory = mkdtempSync(join(tmpdir(), 'review-effect-'));
     const git = (args: string[]) =>
       execFileSync('git', args, { cwd: directory, encoding: 'utf8' });
@@ -340,12 +360,12 @@ describe('classifyRangeEffect', () => {
       };
       writeFileSync(
         join(directory, 'identity.ts'),
-        '/**\n * Existing guard.\n */\nexport const identity = (value: string) => value;\n',
+        '/**\n * # Notes\n * Existing guard.\n * See issue #42.\n */\nexport const identity = (value: string) => value;\n',
       );
       const before = commit();
       writeFileSync(
         join(directory, 'identity.ts'),
-        '/**\n * The existing guard preserves input.\n */\nexport const identity = (value: string) => value;\n',
+        '/**\n * # Notes\n * The existing guard preserves input.\n * See issue #42.\n */\nexport const identity = (value: string) => value;\n',
       );
       const after = commit();
       setGitHubRunner({

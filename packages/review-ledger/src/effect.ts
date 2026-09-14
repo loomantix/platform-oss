@@ -169,8 +169,10 @@ function commentSkeleton(source: string, extension: string): string {
     // Directives can span several lines, and their opening delimiter can
     // determine whether a source consumer recognizes them (for example JSDoc).
     // Preserve the entire comment whenever any directive-like content appears.
+    // A hash followed by a word may name a tool annotation; Markdown headings
+    // and numeric issue references alone do not establish a directive.
     const hasDirective =
-      /[@#]|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|webpack|vite|globals?|exported|sourceMappingURL|sourceURL)\b/i.test(
+      /@|#[a-z_]|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|webpack|vite|globals?|exported|sourceMappingURL|sourceURL|debugId)\b/i.test(
         comment.value,
       );
     const lineBreak = /[\n\r\u2028\u2029]/.test(comment.value) ? '\n' : '';
