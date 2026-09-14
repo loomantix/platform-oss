@@ -678,6 +678,30 @@ describe('writeResult rejects results its evidence does not support', () => {
     expect(out.classification).toBe('minor');
   });
 
+  it.each([
+    ['const value = 1;', '// Preserve the value.\nconst value = 1;'],
+    ['// Preserve the value.\nconst value = 1;', 'const value = 1;'],
+    [
+      '// Preserve the value.\nconst value = 1;',
+      '// Preserve the\n// value.\nconst value = 1;',
+    ],
+  ])('finalizes a minor prose-reshaping result', (before, after) => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/identity.ts\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/identity.ts`]: before,
+      [`${HEAD}:src/identity.ts`]: after,
+    };
+    const result = writeResult(params({ classification: 'minor' }));
+    expect(result).toMatchObject({
+      status: 'changed',
+      classification: 'minor',
+      finalLaneComplete: true,
+      findingFingerprints: ['fp1'],
+    });
+    expect(existsSync(`${resultPath()}.recovery.json`)).toBe(false);
+  });
+
   it('rejects a minor result when an inline Flow comment type changed', () => {
     runner.threadNodes = [fixedThread('fp1')];
     runner.diffNameStatus = 'M\tsrc/settings.js\n';

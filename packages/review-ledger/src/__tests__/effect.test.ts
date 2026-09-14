@@ -291,6 +291,145 @@ describe('classifyRangeEffect', () => {
 
   it.each([
     [
+      'inline prose insertion',
+      'export const value = 1;',
+      'export /* Preserve the value. */ const value = 1;',
+      'non-behavioral',
+    ],
+    [
+      'prose removal between separate tokens',
+      'const value = /* Preserve the value. */ 1;',
+      'const value = 1;',
+      'non-behavioral',
+    ],
+    [
+      'block and line comment reshaping',
+      'const a = 1;\n/* Preserve the next value. */\nconst b = 2;',
+      'const a = 1;\n// Preserve the\n// next value.\nconst b = 2;',
+      'non-behavioral',
+    ],
+    [
+      'prose after a hashbang',
+      '#!/usr/bin/env node\nconst value = 1;',
+      '#!/usr/bin/env node\n// Preserve the value.\nconst value = 1;',
+      'non-behavioral',
+    ],
+    [
+      'removal that merges operator tokens',
+      'let value = 1; value+/* prose */+ +value;',
+      'let value = 1; value++ +value;',
+      'behavioral',
+    ],
+    [
+      'removal that merges identifier tokens',
+      'const value = 1, typeofvalue = 2; typeof/* prose */value;',
+      'const value = 1, typeofvalue = 2; typeofvalue;',
+      'behavioral',
+    ],
+    [
+      'postfix semicolon insertion',
+      'let a = 1, b = 2; a/* prose */++\nb;',
+      'let a = 1, b = 2; a/* prose\n */++\nb;',
+      'behavioral',
+    ],
+    [
+      'prose inserted between a directive and code',
+      '/* istanbul ignore next */\nconst value = 1;',
+      '/* istanbul ignore next */\n// Inserted prose.\nconst value = 1;',
+      'behavioral',
+    ],
+    [
+      'directive moved between statements',
+      '/*#__PURE__*/ run();\nother();',
+      'run();\n/*#__PURE__*/ other();',
+      'behavioral',
+    ],
+    [
+      'trailing directive',
+      'const value = 1;\n//# sourceMappingURL=one.map',
+      'const value = 1;\n//# sourceMappingURL=two.map',
+      'behavioral',
+    ],
+    [
+      'numeric token spelling',
+      'const n = 0x10;',
+      'const n = 16;',
+      'behavioral',
+    ],
+    [
+      'string token spelling',
+      'const value = "\\x61";',
+      'const value = "a";',
+      'behavioral',
+    ],
+  ])('preserves token boundaries for %s', (_label, before, after, expected) => {
+    withDiff(
+      'M\tsrc/identity.ts',
+      {},
+      {
+        [`${BEFORE}:src/identity.ts`]: before,
+        [`${AFTER}:src/identity.ts`]: after,
+      },
+    );
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe(expected);
+  });
+
+  it('accepts real Git prose insertion, removal, and rewrapping while rejecting executable changes', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'review-comment-shape-'));
+    const git = (args: string[]) =>
+      execFileSync('git', args, { cwd: directory, encoding: 'utf8' });
+    const code = 'export const value = 1;\n';
+    const commit = (source: string) => {
+      writeFileSync(join(directory, 'identity.ts'), source);
+      git(['add', 'identity.ts']);
+      git([
+        '-c',
+        'user.name=Example',
+        '-c',
+        'user.email=example@example.invalid',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '-qm',
+        'comment fixture',
+      ]);
+      return git(['rev-parse', 'HEAD']).trim();
+    };
+    try {
+      git(['init', '-q']);
+      let before = commit(code);
+      setGitHubRunner({
+        runGh() {
+          throw new Error('unexpected gh call');
+        },
+        runGit: git,
+      });
+      for (const source of [
+        `// Preserve the existing value.\n${code}`,
+        `// Preserve the\n// existing value.\n${code}`,
+        code,
+        `/**\n * Preserve the existing value.\n */\n${code}`,
+        code,
+        'export /* ordinary prose */ const value = 1;\n',
+        'export const value = /* ordinary prose */ 1;\n',
+        code,
+        `${code}// Trailing prose.\n`,
+        code,
+      ]) {
+        const after = commit(source);
+        expect(classifyRangeEffect(before, after)).toBe('non-behavioral');
+        before = after;
+      }
+      expect(
+        classifyRangeEffect(before, commit('export const value = 2;\n')),
+      ).toBe('behavioral');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
       'CommonJS top-level return',
       'cjs',
       '// Old prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',

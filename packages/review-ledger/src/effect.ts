@@ -143,11 +143,60 @@ const JAVASCRIPT_EXTENSIONS = new Set([
 ]);
 
 /**
- * Compare complete JavaScript/TypeScript sources with prose comments erased.
- * Parsing both blobs establishes lexical context even when a diff starts inside
- * a comment, template, regular expression, or JSX text. Everything outside a
- * comment must remain byte-identical. Keep line terminators inside block
- * comments because they participate in automatic semicolon insertion.
+ * A checked lexical range from the parser's untyped token array.
+ */
+interface SourceToken {
+  start: number;
+  end: number;
+  label: string;
+}
+
+function sourceToken(value: unknown, length: number): SourceToken {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('parser token is not an object');
+  }
+  const token = value as Record<string, unknown>;
+  const type = token['type'];
+  const label =
+    typeof type === 'string'
+      ? type
+      : typeof type === 'object' && type !== null && 'label' in type
+        ? type.label
+        : undefined;
+  const start = token['start'];
+  const end = token['end'];
+  if (
+    typeof label !== 'string' ||
+    typeof start !== 'number' ||
+    typeof end !== 'number' ||
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 0 ||
+    end < start ||
+    end > length
+  ) {
+    throw new Error('parser token has an invalid source range');
+  }
+  return { start, end, label };
+}
+
+function isDirective(value: string): boolean {
+  // Preserve complete comments: tool and type directives can span lines, and
+  // their delimiters matter. Hash headings and numeric references remain prose.
+  return (
+    /^\s*(?::|flow-include\b)/.test(value) ||
+    /^\/|@|#[a-z_]|\b(?:webpack|turbopack)|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|vite|globals?|exported|sourceMappingURL|sourceURL|debugId)\b/i.test(
+      value,
+    )
+  );
+}
+
+/**
+ * Compare executable tokens and line-terminator boundaries, allowing ordinary
+ * comments to be inserted, removed, or rewrapped. Token bytes stay exact, and
+ * line breaks between tokens remain significant for automatic semicolon
+ * insertion. A gap containing a directive is preserved verbatim, including its
+ * placement relative to adjacent code and comments.
  * HTML-like comments (`<!--`) are code in modules and TypeScript, so Annex B
  * parsing is disabled and they fail closed.
  */
@@ -156,43 +205,58 @@ function commentSkeleton(source: string, extension: string): string {
     sourceType: extension === '.cjs' ? 'commonjs' : 'unambiguous',
     annexB: false,
     attachComment: false,
+    tokens: true,
     plugins: [
       'decorators-legacy',
       ...(/\.[cm]?tsx?$/.test(extension) ? ['typescript' as const] : []),
       ...(/\.(?:[cm]?jsx?|tsx)$/.test(extension) ? ['jsx' as const] : []),
     ],
   });
-  let offset = 0;
-  const parts: string[] = [];
+  const tokens: unknown = parsed.tokens;
+  if (!Array.isArray(tokens)) throw new Error('parser tokens are unavailable');
+  const comments = new Map<number, { end: number; directive: boolean }>();
   for (const comment of parsed.comments ?? []) {
-    if (comment.start == null || comment.end == null) {
-      throw new Error('comment has no source range');
-    }
-    parts.push(source.slice(offset, comment.start));
-    // Directives can span several lines, and their opening delimiter can
-    // determine whether a source consumer recognizes them (for example JSDoc).
-    // Preserve the entire comment whenever any directive-like content appears.
-    // A hash followed by a word may name a tool annotation; Markdown headings
-    // and numeric issue references alone do not establish a directive. Bundler
-    // magic comments are camelCase (`webpackChunkName`), and a triple-slash
-    // comment's value begins with `/` (`/// <reference types="node" />`).
-    // Flow's colon and flow-include comments also carry type syntax.
-    const hasDirective =
-      /^\s*(?::|flow-include\b)/.test(comment.value) ||
-      /^\/|@|#[a-z_]|\b(?:webpack|turbopack)|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|vite|globals?|exported|sourceMappingURL|sourceURL|debugId)\b/i.test(
-        comment.value,
-      );
-    const lineBreak = /[\n\r\u2028\u2029]/.test(comment.value) ? '\n' : '';
-    parts.push(
-      JSON.stringify([
-        comment.type,
-        lineBreak,
-        hasDirective ? source.slice(comment.start, comment.end) : null,
-      ]),
-    );
-    offset = comment.end;
+    const span = sourceToken(comment, source.length);
+    comments.set(span.start, {
+      end: span.end,
+      directive: isDirective(comment.value),
+    });
   }
-  parts.push(source.slice(offset));
+  let offset = 0;
+  let lastEnd = 0;
+  let seenComments = 0;
+  let directiveInGap = false;
+  const parts: Array<readonly [string, string, string | boolean]> = [];
+  for (const value of tokens) {
+    const token = sourceToken(value, source.length);
+    if (token.start < lastEnd) throw new Error('parser tokens overlap');
+    lastEnd = token.end;
+    const comment = comments.get(token.start);
+    if (comment?.end === token.end) {
+      seenComments += 1;
+      directiveInGap ||= comment.directive;
+      continue;
+    }
+    const gap = source.slice(offset, token.start);
+    parts.push([
+      token.label,
+      source.slice(token.start, token.end),
+      directiveInGap
+        ? gap
+        : parts.length > 0 &&
+          token.label !== 'eof' &&
+          /[\n\r\u2028\u2029]/.test(gap),
+    ]);
+    offset = token.end;
+    directiveInGap = false;
+  }
+  if (
+    seenComments !== comments.size ||
+    parts.at(-1)?.[0] !== 'eof' ||
+    lastEnd !== source.length
+  ) {
+    throw new Error('parser tokens did not cover the complete source');
+  }
   return JSON.stringify(parts);
 }
 
