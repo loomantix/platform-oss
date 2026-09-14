@@ -325,6 +325,34 @@ describe('classifyRangeEffect', () => {
       '// New prose.\nreturn;',
       'behavioral',
     ],
+    [
+      'TypeScript HTML-like comment',
+      'ts',
+      'run();\n// Old prose.',
+      'run();\n<!-- Old prose.',
+      'behavioral',
+    ],
+    [
+      'ESM HTML-like comment edit',
+      'mjs',
+      'let value = limit <!--0',
+      'let value = limit <!--0; globalThis.flag = 1;',
+      'behavioral',
+    ],
+    [
+      'JSX prose in JavaScript',
+      'js',
+      'export const view = <div />; // Old prose.',
+      'export const view = <div />; // New prose.',
+      'non-behavioral',
+    ],
+    [
+      'JSX executable change in JavaScript',
+      'js',
+      'export const view = <div />; // Old prose.',
+      'export const view = <span />; // Old prose.',
+      'behavioral',
+    ],
   ])('respects %s', (_label, extension, before, after, expected) => {
     const path = `src/settings.${extension}`;
     withDiff(

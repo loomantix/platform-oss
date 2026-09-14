@@ -148,15 +148,18 @@ const JAVASCRIPT_EXTENSIONS = new Set([
  * a comment, template, regular expression, or JSX text. Everything outside a
  * comment must remain byte-identical. Keep line terminators inside block
  * comments because they participate in automatic semicolon insertion.
+ * HTML-like comments (`<!--`) are code in modules and TypeScript, so Annex B
+ * parsing is disabled and they fail closed.
  */
 function commentSkeleton(source: string, extension: string): string {
   const parsed = parse(source, {
     sourceType: extension === '.cjs' ? 'commonjs' : 'unambiguous',
+    annexB: false,
     attachComment: false,
     plugins: [
       'decorators-legacy',
       ...(/\.[cm]?tsx?$/.test(extension) ? ['typescript' as const] : []),
-      ...(['.tsx', '.jsx'].includes(extension) ? ['jsx' as const] : []),
+      ...(/\.(?:[cm]?jsx?|tsx)$/.test(extension) ? ['jsx' as const] : []),
     ],
   });
   let offset = 0;
