@@ -37,6 +37,7 @@ import {
   resolve,
   verifyLedger,
   writeResult,
+  recoverResult,
 } from './ledger.js';
 import { readResult, validateResult, writeBlockedResult } from './result.js';
 import { classifyFiles, classifyRange, parseDiffPatch } from './changeset.js';
@@ -107,6 +108,7 @@ interface CliArgs {
   actor?: string | undefined;
   historicalCommentIdsFile?: string | undefined;
   expectedResultSha256?: string | undefined;
+  expectedRecoverySha256?: string | undefined;
   expectedThreadsSha256?: string | undefined;
   blockerFile?: string | undefined;
   classification?: SupportedClassification | undefined;
@@ -457,6 +459,9 @@ function parseCliArgs(argv: string[]): CliArgs {
       case '--expected-result-sha256':
         args.expectedResultSha256 = parseVal(arg);
         break;
+      case '--expected-recovery-sha256':
+        args.expectedRecoverySha256 = parseVal(arg);
+        break;
       case '--expected-threads-sha256':
         args.expectedThreadsSha256 = parseVal(arg);
         break;
@@ -765,6 +770,7 @@ function runCliCommand(argv: string[]): number {
       writeSortedJson(out);
       break;
     }
+    case 'recover-result':
     case 'write-result': {
       if (
         !args.head ||
@@ -778,7 +784,7 @@ function runCliCommand(argv: string[]): number {
       ) {
         fail('write-result missing required arguments');
       }
-      const out = writeResult({
+      const params = {
         head: args.head,
         engine: args.engine,
         round: args.round,
@@ -791,7 +797,22 @@ function runCliCommand(argv: string[]): number {
         actor: args.actor,
         historicalCommentIdsFile: args.historicalCommentIdsFile,
         classification: args.classification,
-      });
+      };
+      if (
+        args.command === 'recover-result' &&
+        (!args.expectedRecoverySha256 || args.classification !== undefined)
+      ) {
+        fail(
+          'recover-result requires --expected-recovery-sha256 and reads classification from the saved candidate',
+        );
+      }
+      const out =
+        args.command === 'recover-result'
+          ? recoverResult({
+              ...params,
+              expectedRecoverySha256: args.expectedRecoverySha256!,
+            })
+          : writeResult(params);
       writeSortedJson(out);
       break;
     }

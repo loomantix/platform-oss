@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { classifyRangeEffect } from '../effect.js';
 import { resetGitHubRunner, setGitHubRunner } from '../github.js';
 import type { GitHubRunner } from '../types.js';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const BEFORE = 'a'.repeat(40);
 const AFTER = 'b'.repeat(40);
@@ -15,12 +19,19 @@ const AFTER = 'b'.repeat(40);
 function withDiff(
   nameStatus: string,
   patches: Record<string, string> = {},
+  sources: Record<string, string> = {},
 ): void {
   const runner: GitHubRunner = {
     runGh() {
       throw new Error('unexpected gh call');
     },
     runGit(args: string[]): string {
+      if (args[0] === 'show') {
+        const source = sources[args[1]!];
+        if (source === undefined) throw new Error('missing source blob');
+        return source;
+      }
+      if (args.includes('--summary')) return '';
       if (args.includes('--name-status')) {
         return `${nameStatus}\n`;
       }
@@ -167,11 +178,20 @@ describe('classifyRangeEffect', () => {
   });
 
   it('accepts a balanced block comment and rejects code sharing its line', () => {
-    withDiff('M\tsrc/user.ts', {
-      'src/user.ts': ['@@ -1 +1 @@', '-/* old note */', '+/* new note */'].join(
-        '\n',
-      ),
-    });
+    withDiff(
+      'M\tsrc/user.ts',
+      {
+        'src/user.ts': [
+          '@@ -1 +1 @@',
+          '-/* old note */',
+          '+/* new note */',
+        ].join('\n'),
+      },
+      {
+        [`${BEFORE}:src/user.ts`]: '/* old note */',
+        [`${AFTER}:src/user.ts`]: '/* new note */',
+      },
+    );
     expect(classifyRangeEffect(BEFORE, AFTER)).toBe('non-behavioral');
 
     withDiff('M\tsrc/user.ts', {
@@ -182,6 +202,149 @@ describe('classifyRangeEffect', () => {
       ].join('\n'),
     });
     expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+  });
+
+  it.each([
+    [
+      'JSDoc interior',
+      '/**\n * Existing guard.\n */\nexport const identity = (value: string) => value;\n',
+      '/**\n * The existing guard preserves input.\n */\nexport const identity = (value: string) => value;\n',
+      'non-behavioral',
+    ],
+    [
+      'multiline prose',
+      '/* Old prose. */\nconst value = 1;',
+      '/* New prose. */\nconst value = 1;',
+      'non-behavioral',
+    ],
+    [
+      'template contents',
+      'const value = `\n/* Old prose. */\n`;',
+      'const value = `\n/* New prose. */\n`;',
+      'behavioral',
+    ],
+    [
+      'template interpolation',
+      'const value = `text ${1}`;',
+      'const value = `text ${2}`;',
+      'behavioral',
+    ],
+    [
+      'regular expression',
+      'const value = /old\\/*/;',
+      'const value = /new\\/*/;',
+      'behavioral',
+    ],
+    [
+      'multiplication',
+      'const value = 1\n * 2;',
+      'const value = 1\n * 3;',
+      'behavioral',
+    ],
+    [
+      'runtime edit beside comment',
+      '/* Prose. */ const value = 1;',
+      '/* New prose. */ const value = 2;',
+      'behavioral',
+    ],
+    [
+      'semicolon insertion',
+      'function value() { return /* prose */ 1; }',
+      'function value() { return /* prose\n */ 1; }',
+      'behavioral',
+    ],
+    [
+      'type directive',
+      '// @ts-check\nconst value = 1;',
+      '// @ts-nocheck\nconst value = 1;',
+      'behavioral',
+    ],
+    [
+      'JSDoc type',
+      '/** @type {string} */\nlet value;',
+      '/** @type {number} */\nlet value;',
+      'behavioral',
+    ],
+    [
+      'coverage directive',
+      '/* istanbul ignore next */\nconst value = 1;',
+      '/* prose */\nconst value = 1;',
+      'behavioral',
+    ],
+    [
+      'unclosed comment',
+      '/* prose */\nconst value = 1;',
+      '/* prose\nconst value = 1;',
+      'behavioral',
+    ],
+  ])('reads full lexical context for %s', (_label, before, after, expected) => {
+    withDiff(
+      'M\tsrc/identity.ts',
+      {},
+      {
+        [`${BEFORE}:src/identity.ts`]: before,
+        [`${AFTER}:src/identity.ts`]: after,
+      },
+    );
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe(expected);
+  });
+
+  it('classifies an actual zero-context JSDoc diff and rejects a mode change', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'review-effect-'));
+    const git = (args: string[]) =>
+      execFileSync('git', args, { cwd: directory, encoding: 'utf8' });
+    try {
+      git(['init', '-q']);
+      const commit = () => {
+        git(['add', '.']);
+        git([
+          '-c',
+          'user.name=Example',
+          '-c',
+          'user.email=example@example.invalid',
+          '-c',
+          'commit.gpgsign=false',
+          'commit',
+          '-qm',
+          'fixture',
+        ]);
+        return git(['rev-parse', 'HEAD']).trim();
+      };
+      writeFileSync(
+        join(directory, 'identity.ts'),
+        '/**\n * Existing guard.\n */\nexport const identity = (value: string) => value;\n',
+      );
+      const before = commit();
+      writeFileSync(
+        join(directory, 'identity.ts'),
+        '/**\n * The existing guard preserves input.\n */\nexport const identity = (value: string) => value;\n',
+      );
+      const after = commit();
+      setGitHubRunner({
+        runGh() {
+          throw new Error('unexpected gh call');
+        },
+        runGit: git,
+      });
+      expect(classifyRangeEffect(before, after)).toBe('non-behavioral');
+      git(['update-index', '--chmod=+x', 'identity.ts']);
+      git([
+        '-c',
+        'user.name=Example',
+        '-c',
+        'user.email=example@example.invalid',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '-qm',
+        'mode fixture',
+      ]);
+      expect(
+        classifyRangeEffect(after, git(['rev-parse', 'HEAD']).trim()),
+      ).toBe('behavioral');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('fails closed on an unknown extension, a rename, and a missing git seam', () => {

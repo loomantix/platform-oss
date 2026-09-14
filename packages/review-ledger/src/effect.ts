@@ -1,4 +1,5 @@
 import { getGitHubRunner } from './github.js';
+import { parse } from '@babel/parser';
 
 /**
  * Whether a Git range altered a surface that executes.
@@ -130,6 +131,73 @@ const COMMENT_SYNTAX: ReadonlyMap<string, CommentSyntax> = new Map([
   ['.sql', { line: ['--'], block: [['/*', '*/'] as const] }],
 ]);
 
+const JAVASCRIPT_EXTENSIONS = new Set([
+  '.ts',
+  '.tsx',
+  '.mts',
+  '.cts',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+]);
+
+/**
+ * Compare complete JavaScript/TypeScript sources with prose comments erased.
+ * Parsing both blobs establishes lexical context even when a diff starts inside
+ * a comment, template, regular expression, or JSX text. Everything outside a
+ * comment must remain byte-identical. Keep line terminators inside block
+ * comments because they participate in automatic semicolon insertion.
+ */
+function commentSkeleton(source: string, extension: string): string {
+  const parsed = parse(source, {
+    sourceType: 'unambiguous',
+    attachComment: false,
+    plugins: [
+      'decorators-legacy',
+      ...(/\.[cm]?tsx?$/.test(extension) ? ['typescript' as const] : []),
+      ...(['.tsx', '.jsx'].includes(extension) ? ['jsx' as const] : []),
+    ],
+  });
+  let offset = 0;
+  const parts: string[] = [];
+  for (const comment of parsed.comments ?? []) {
+    if (comment.start == null || comment.end == null) {
+      throw new Error('comment has no source range');
+    }
+    parts.push(source.slice(offset, comment.start));
+    // Preserve directive-like lines: comments can configure type checking,
+    // bundling, linting, coverage, and other source consumers. Unknown syntax
+    // still fails closed at the parser; this is deliberately conservative.
+    const directives = comment.value
+      .split(/\r\n|[\n\r\u2028\u2029]/)
+      .filter((line) =>
+        /[@#]|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|webpack|vite|globals?|exported|sourceMappingURL|sourceURL)\b/i.test(
+          line,
+        ),
+      );
+    const lineBreak = /[\n\r\u2028\u2029]/.test(comment.value) ? '\n' : '';
+    parts.push(JSON.stringify([comment.type, lineBreak, directives]));
+    offset = comment.end;
+  }
+  parts.push(source.slice(offset));
+  return JSON.stringify(parts);
+}
+
+function isCommentOnlySource(
+  before: string,
+  after: string,
+  extension: string,
+): boolean {
+  try {
+    return (
+      commentSkeleton(before, extension) === commentSkeleton(after, extension)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function extensionOf(path: string): string {
   const base = path.slice(path.lastIndexOf('/') + 1);
   const dot = base.lastIndexOf('.');
@@ -156,7 +224,11 @@ function isDocsOrConfig(path: string): boolean {
   // cannot read anyway. A script that lives under `docs/` still executes, so
   // let rule 2 decide it: a comment-only edit there is still inert, an edit to
   // one of its statements is not.
-  if (DOCS_DIR_RE.test(`/${path}`) && !COMMENT_SYNTAX.has(extensionOf(path))) {
+  if (
+    DOCS_DIR_RE.test(`/${path}`) &&
+    !COMMENT_SYNTAX.has(extensionOf(path)) &&
+    !JAVASCRIPT_EXTENSIONS.has(extensionOf(path))
+  ) {
     return true;
   }
   const base = basenameOf(path);
@@ -236,10 +308,9 @@ function classifyLine(
 /**
  * Whether every added and removed line in one path's patch is a comment.
  *
- * Block state is tracked independently per side and only across that side's own
- * lines, so a hunk that starts mid-block is read as continuing it. That is the
- * conservative direction: it can only accept lines a full parse would also
- * accept, because a line inside a block comment is inert either way.
+ * This fallback for other languages has no unchanged lexical context and
+ * rejects hunks that start inside a block. JavaScript and TypeScript use the
+ * full-source parser instead.
  */
 function isCommentOnlyPatch(patch: string, syntax: CommentSyntax): boolean {
   let leftBlock = false;
@@ -310,7 +381,7 @@ export function classifyRangeEffect(
     return 'non-behavioral';
   }
 
-  const paths: string[] = [];
+  const paths: Array<{ code: string; path: string }> = [];
   for (const row of status.split(/\r?\n/)) {
     if (row === '') {
       continue;
@@ -321,14 +392,41 @@ export function classifyRangeEffect(
     if (code === undefined || path === undefined || !/^[AMD]$/.test(code)) {
       return 'behavioral';
     }
-    paths.push(path);
+    paths.push({ code, path });
   }
 
-  for (const path of paths) {
+  for (const { code, path } of paths) {
     if (isDocsOrConfig(path) || isTestPath(path)) {
       continue;
     }
-    const syntax = COMMENT_SYNTAX.get(extensionOf(path));
+    const extension = extensionOf(path);
+    if (JAVASCRIPT_EXTENSIONS.has(extension)) {
+      // Creating/deleting source or changing its mode is not a prose edit.
+      if (code !== 'M') return 'behavioral';
+      try {
+        const summary = runner.runGit([
+          'diff',
+          '--summary',
+          '--no-renames',
+          `${before}..${after}`,
+          '--',
+          path,
+        ]);
+        if (
+          summary.trim() !== '' ||
+          !isCommentOnlySource(
+            runner.runGit(['show', `${before}:${path}`]),
+            runner.runGit(['show', `${after}:${path}`]),
+            extension,
+          )
+        )
+          return 'behavioral';
+      } catch {
+        return 'behavioral';
+      }
+      continue;
+    }
+    const syntax = COMMENT_SYNTAX.get(extension);
     if (syntax === undefined) {
       return 'behavioral';
     }

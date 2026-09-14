@@ -10,7 +10,7 @@ The review ledger uses an open draft pull request as a durable ledger of actor-o
 - **Multi-Engine Support**: Unified contract for `codex`, `claude`, `gemini`, and `antigravity` reviewer engines.
 - **Declared Rosters & Coverage**: A pull request declares its author engine and zero, one, or two reviewer engines; coverage is then derived from attestations naming the exact current head.
 - **Published Protocol**: The engine-neutral contract every engine follows ships in the tarball at [`protocol/local-review-ledger.md`](./protocol/local-review-ledger.md), so each platform repository vendors one source of truth instead of maintaining its own copy.
-- **Standalone CLI & TypeScript API**: Zero npm runtime dependencies, dual ESM/CJS distribution, and CLI executable (`review-ledger`).
+- **Standalone CLI & TypeScript API**: Self-contained vendored CLI, dual ESM/CJS distribution, and CLI executable (`review-ledger`).
 
 ## Installation
 
@@ -74,6 +74,17 @@ does not invalidate the reviewed base when it remains in the same ancestry.
 See [recovery semantics](./protocol/local-review-ledger.md#recover-interrupted-reviews)
 for bounded run resumption and the distinction between bookkeeping recovery and
 missing review work. Complete the required validation before finalization.
+
+When `write-result` reached a completed candidate but its final verification
+failed, it writes a blocked result plus `<result-file>.recovery.json`. Preserve
+both files. A controller that observed the successful worker return can retry
+`recover-result` with the original identity arguments and
+`--expected-recovery-sha256 <digest-pinned-at-worker-return>`, reusing the
+original historical snapshot and omitting `--classification`. The command
+revalidates all live evidence and writes the completed result; ordinary
+validation and attestation still follow. It cannot recover an unfinished review
+or create a new run. An explicit successful `write-result` retry archives any
+obsolete recovery sidecar under its digest.
 
 The `review-ledger` binary exposes all subcommands:
 

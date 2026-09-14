@@ -1,6 +1,6 @@
 {
   "name": "@loomantix/review-ledger",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "type": "module",
   "description": "Deterministic local-review ledger protocol, verification, and CLI for multi-engine code review relays.",
   "repository": {
@@ -55,5 +55,8 @@
     "build": "tsup",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@babel/parser": "7.29.3"
   }
 }

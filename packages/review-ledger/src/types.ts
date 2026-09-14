@@ -144,6 +144,14 @@ export interface WriteResultParams extends BaseResultParams {
   classification?: SupportedClassification | undefined;
 }
 
+/** Parameters for recovering a completed, digest-pinned result candidate. */
+export interface RecoverResultParams extends Omit<
+  WriteResultParams,
+  'classification'
+> {
+  expectedRecoverySha256: string;
+}
+
 /**
  * Parameters for `writeBlockedResult`.
  */

@@ -175,6 +175,10 @@ importers:
         version: 4.1.5(@opentelemetry/api@1.9.1)(@types/node@25.6.0)(happy-dom@20.9.0)(vite@8.0.10(@types/node@25.6.0)(esbuild@0.27.7)(jiti@2.6.1)(terser@5.46.2)(yaml@2.8.4))
 
   packages/review-ledger:
+    dependencies:
+      '@babel/parser':
+        specifier: 7.29.3
+        version: 7.29.3
     devDependencies:
       '@types/node':
         specifier: 'catalog:'
