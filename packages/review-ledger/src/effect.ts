@@ -192,9 +192,11 @@ function isDirective(value: string): boolean {
 }
 
 /**
- * Respect explicit module extensions and reject ambiguous comment ranges.
+ * Respect explicit module extensions and reject ambiguous lexical structure.
  * Without imports or exports, an unambiguous parse may treat module `await`
- * as an identifier and executable regular-expression text as a script comment.
+ * as an identifier and executable regular-expression text as a script comment,
+ * so a script parse must tokenize identically as a module. Scripts may also
+ * treat HTML-like markers as comments that this parser reads as code.
  */
 function parseSource(
   source: string,
@@ -217,24 +219,29 @@ function parseSource(
     ],
   };
   const parsed = parse(source, options);
+  if (parsed.program.sourceType !== 'module' && /<!--|-->/.test(source)) {
+    throw new Error('script source contains an HTML-like comment marker');
+  }
   if (
     options.sourceType === 'unambiguous' &&
     parsed.program.sourceType === 'script'
   ) {
-    let module: ReturnType<typeof parse>;
-    try {
-      module = parse(source, { ...options, sourceType: 'module' });
-    } catch (error) {
-      // A script-only construct cannot hide valid module code.
-      if (error instanceof SyntaxError) return parsed;
-      throw error;
-    }
-    const ranges = (file: ReturnType<typeof parse>) =>
-      JSON.stringify(
-        (file.comments ?? []).map(({ start, end }) => [start, end]),
+    // A module parse failure or any token difference fails closed.
+    const module = parse(source, { ...options, sourceType: 'module' });
+    const shape = (file: ReturnType<typeof parse>) => {
+      const tokens: unknown = file.tokens;
+      if (!Array.isArray(tokens)) {
+        throw new Error('parser tokens are unavailable');
+      }
+      return JSON.stringify(
+        tokens.map((value) => {
+          const token = sourceToken(value, source.length);
+          return [token.start, token.end, token.label];
+        }),
       );
-    if (ranges(parsed) !== ranges(module)) {
-      throw new Error('module and script parses disagree on comment ranges');
+    };
+    if (shape(parsed) !== shape(module)) {
+      throw new Error('module and script parses disagree on tokens');
     }
   }
   return parsed;
