@@ -702,6 +702,17 @@ describe('writeResult rejects results its evidence does not support', () => {
     expect(existsSync(`${resultPath()}.recovery.json`)).toBe(false);
   });
 
+  it('rejects a minor result for executable code hidden by a script parse', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/identity.mjs\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/identity.mjs`]:
+        'const r = await /[//]/.source; x = [\n 0]',
+      [`${HEAD}:src/identity.mjs`]: 'const r = await /[//]/.flags; y = [\n 0]',
+    };
+    expect(() => writeResult(params({ classification: 'minor' }))).toThrow();
+  });
+
   it('rejects a minor result when an inline Flow comment type changed', () => {
     runner.threadNodes = [fixedThread('fp1')];
     runner.diffNameStatus = 'M\tsrc/settings.js\n';

@@ -428,6 +428,78 @@ describe('classifyRangeEffect', () => {
     }
   });
 
+  it.each(['.mjs', '.mts', '.js', '.jsx', '.ts', '.tsx'])(
+    'rejects executable module changes hidden by a script parse in %s',
+    (extension) => {
+      const path = `src/identity${extension}`;
+      withDiff(
+        `M\t${path}`,
+        {},
+        {
+          [`${BEFORE}:${path}`]: 'const r = await /[//]/.source; x = [\n 0]',
+          [`${AFTER}:${path}`]: 'const r = await /[//]/.flags; y = [\n 0]',
+        },
+      );
+      expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+    },
+  );
+
+  it.each(['.mjs', '.mts'])(
+    'accepts prose around an unchanged explicit module expression in %s',
+    (extension) => {
+      const path = `src/identity${extension}`;
+      const source = 'const r = await /[//]/.source; x = [\n 0]';
+      withDiff(
+        `M\t${path}`,
+        {},
+        {
+          [`${BEFORE}:${path}`]: `// Read the pattern.\n${source}`,
+          [`${AFTER}:${path}`]: `// Read the existing pattern.\n${source}`,
+        },
+      );
+      expect(classifyRangeEffect(BEFORE, AFTER)).toBe('non-behavioral');
+    },
+  );
+
+  it('rejects the module regression with real Git blobs accepted by Node', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'review-module-comment-'));
+    const git = (args: string[]) =>
+      execFileSync('git', args, { cwd: directory, encoding: 'utf8' });
+    const commit = (source: string) => {
+      execFileSync(process.execPath, ['--input-type=module', '--check'], {
+        input: source,
+      });
+      writeFileSync(join(directory, 'identity.mjs'), source);
+      git(['add', 'identity.mjs']);
+      git([
+        '-c',
+        'user.name=Example',
+        '-c',
+        'user.email=example@example.invalid',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '-qm',
+        'module fixture',
+      ]);
+      return git(['rev-parse', 'HEAD']).trim();
+    };
+    try {
+      git(['init', '-q']);
+      const before = commit('const r = await /[//]/.source; x = [\n 0]');
+      const after = commit('const r = await /[//]/.flags; y = [\n 0]');
+      setGitHubRunner({
+        runGh() {
+          throw new Error('unexpected gh call');
+        },
+        runGit: git,
+      });
+      expect(classifyRangeEffect(before, after)).toBe('behavioral');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     [
       'CommonJS top-level return',

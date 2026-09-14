@@ -1,5 +1,5 @@
 import { getGitHubRunner } from './github.js';
-import { parse } from '@babel/parser';
+import { parse, type ParserOptions } from '@babel/parser';
 
 /**
  * Whether a Git range altered a surface that executes.
@@ -192,17 +192,21 @@ function isDirective(value: string): boolean {
 }
 
 /**
- * Compare executable tokens and line-terminator boundaries, allowing ordinary
- * comments to be inserted, removed, or rewrapped. Token bytes stay exact, and
- * line breaks between tokens remain significant for automatic semicolon
- * insertion. A gap containing a directive is preserved verbatim, including its
- * placement relative to adjacent code and comments.
- * HTML-like comments (`<!--`) are code in modules and TypeScript, so Annex B
- * parsing is disabled and they fail closed.
+ * Respect explicit module extensions and reject ambiguous comment ranges.
+ * Without imports or exports, an unambiguous parse may treat module `await`
+ * as an identifier and executable regular-expression text as a script comment.
  */
-function commentSkeleton(source: string, extension: string): string {
-  const parsed = parse(source, {
-    sourceType: extension === '.cjs' ? 'commonjs' : 'unambiguous',
+function parseSource(
+  source: string,
+  extension: string,
+): ReturnType<typeof parse> {
+  const options: ParserOptions = {
+    sourceType: /\.[cm][jt]s$/.test(extension)
+      ? extension.startsWith('.m')
+        ? 'module'
+        : 'commonjs'
+      : 'unambiguous',
+    // HTML-like comments are executable in modules and TypeScript.
     annexB: false,
     attachComment: false,
     tokens: true,
@@ -211,7 +215,40 @@ function commentSkeleton(source: string, extension: string): string {
       ...(/\.[cm]?tsx?$/.test(extension) ? ['typescript' as const] : []),
       ...(/\.(?:[cm]?jsx?|tsx)$/.test(extension) ? ['jsx' as const] : []),
     ],
-  });
+  };
+  const parsed = parse(source, options);
+  if (
+    options.sourceType === 'unambiguous' &&
+    parsed.program.sourceType === 'script'
+  ) {
+    let module: ReturnType<typeof parse>;
+    try {
+      module = parse(source, { ...options, sourceType: 'module' });
+    } catch (error) {
+      // A script-only construct cannot hide valid module code.
+      if (error instanceof SyntaxError) return parsed;
+      throw error;
+    }
+    const ranges = (file: ReturnType<typeof parse>) =>
+      JSON.stringify(
+        (file.comments ?? []).map(({ start, end }) => [start, end]),
+      );
+    if (ranges(parsed) !== ranges(module)) {
+      throw new Error('module and script parses disagree on comment ranges');
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Compare executable tokens and line-terminator boundaries, allowing ordinary
+ * comments to be inserted, removed, or rewrapped. Token bytes stay exact, and
+ * line breaks between tokens remain significant for automatic semicolon
+ * insertion. A gap containing a directive is preserved verbatim, including its
+ * placement relative to adjacent code and comments.
+ */
+function commentSkeleton(source: string, extension: string): string {
+  const parsed = parseSource(source, extension);
   const tokens: unknown = parsed.tokens;
   if (!Array.isArray(tokens)) throw new Error('parser tokens are unavailable');
   const comments = new Map<number, { end: number; directive: boolean }>();
