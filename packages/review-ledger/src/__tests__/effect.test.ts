@@ -289,6 +289,34 @@ describe('classifyRangeEffect', () => {
     expect(classifyRangeEffect(BEFORE, AFTER)).toBe(expected);
   });
 
+  it.each([
+    [
+      'multiline JSDoc type',
+      '/**\n * @type {{\n *   enabled: boolean\n * }}\n */\nconst settings = { enabled: true };',
+      '/**\n * @type {{\n *   enabled: string\n * }}\n */\nconst settings = { enabled: true };',
+    ],
+    [
+      'multiline lint directive',
+      '/* eslint\n  no-console: "off"\n */\nconsole.log("ready");',
+      '/* eslint\n  no-console: "error"\n */\nconsole.log("ready");',
+    ],
+    [
+      'JSDoc opening delimiter',
+      '/*\n * @type {string}\n */\nlet value = 1;',
+      '/**\n * @type {string}\n */\nlet value = 1;',
+    ],
+  ])('preserves the complete %s comment', (_label, before, after) => {
+    withDiff(
+      'M\tsrc/settings.js',
+      {},
+      {
+        [`${BEFORE}:src/settings.js`]: before,
+        [`${AFTER}:src/settings.js`]: after,
+      },
+    );
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe('behavioral');
+  });
+
   it('classifies an actual zero-context JSDoc diff and rejects a mode change', () => {
     const directory = mkdtempSync(join(tmpdir(), 'review-effect-'));
     const git = (args: string[]) =>

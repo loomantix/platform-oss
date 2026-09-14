@@ -634,6 +634,21 @@ describe('writeResult rejects results its evidence does not support', () => {
     );
   });
 
+  it('rejects a minor result when a multiline JSDoc type changed', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/settings.js\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/settings.js`]:
+        '/**\n * @type {{\n *   enabled: boolean\n * }}\n */\nconst settings = { enabled: true };',
+      [`${HEAD}:src/settings.js`]:
+        '/**\n * @type {{\n *   enabled: string\n * }}\n */\nconst settings = { enabled: true };',
+    };
+    expect(() => writeResult(params({ classification: 'minor' }))).toThrow(
+      'minor classification requires a non-behavioral change range',
+    );
+    expect(readResult(resultPath()).status).toBe('blocked');
+  });
+
   it('writes a minor result when the fix moved no executing line', () => {
     runner.threadNodes = [fixedThread('fp1')];
     runner.diffNameStatus = 'M\tsrc/user.ts\n';

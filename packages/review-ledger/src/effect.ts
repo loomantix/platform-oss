@@ -166,18 +166,21 @@ function commentSkeleton(source: string, extension: string): string {
       throw new Error('comment has no source range');
     }
     parts.push(source.slice(offset, comment.start));
-    // Preserve directive-like lines: comments can configure type checking,
-    // bundling, linting, coverage, and other source consumers. Unknown syntax
-    // still fails closed at the parser; this is deliberately conservative.
-    const directives = comment.value
-      .split(/\r\n|[\n\r\u2028\u2029]/)
-      .filter((line) =>
-        /[@#]|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|webpack|vite|globals?|exported|sourceMappingURL|sourceURL)\b/i.test(
-          line,
-        ),
+    // Directives can span several lines, and their opening delimiter can
+    // determine whether a source consumer recognizes them (for example JSDoc).
+    // Preserve the entire comment whenever any directive-like content appears.
+    const hasDirective =
+      /[@#]|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|webpack|vite|globals?|exported|sourceMappingURL|sourceURL)\b/i.test(
+        comment.value,
       );
     const lineBreak = /[\n\r\u2028\u2029]/.test(comment.value) ? '\n' : '';
-    parts.push(JSON.stringify([comment.type, lineBreak, directives]));
+    parts.push(
+      JSON.stringify([
+        comment.type,
+        lineBreak,
+        hasDirective ? source.slice(comment.start, comment.end) : null,
+      ]),
+    );
     offset = comment.end;
   }
   parts.push(source.slice(offset));
