@@ -291,6 +291,52 @@ describe('classifyRangeEffect', () => {
 
   it.each([
     [
+      'CommonJS top-level return',
+      'cjs',
+      '// Old prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+      '// New prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+      'non-behavioral',
+    ],
+    [
+      'CommonJS new.target',
+      'cjs',
+      '// Old prose.\nmodule.exports = new.target;',
+      '// New prose.\nmodule.exports = new.target;',
+      'non-behavioral',
+    ],
+    [
+      'CommonJS executable change',
+      'cjs',
+      '// Old prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+      '// New prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 43;',
+      'behavioral',
+    ],
+    [
+      'CommonJS directive change',
+      'cjs',
+      '// @ts-check\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+      '// @ts-nocheck\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+      'behavioral',
+    ],
+    [
+      'invalid ESM top-level return',
+      'mjs',
+      '// Old prose.\nreturn;',
+      '// New prose.\nreturn;',
+      'behavioral',
+    ],
+  ])('respects %s', (_label, extension, before, after, expected) => {
+    const path = `src/settings.${extension}`;
+    withDiff(
+      `M\t${path}`,
+      {},
+      { [`${BEFORE}:${path}`]: before, [`${AFTER}:${path}`]: after },
+    );
+    expect(classifyRangeEffect(BEFORE, AFTER)).toBe(expected);
+  });
+
+  it.each([
+    [
       'multiline JSDoc type',
       '/**\n * @type {{\n *   enabled: boolean\n * }}\n */\nconst settings = { enabled: true };',
       '/**\n * @type {{\n *   enabled: string\n * }}\n */\nconst settings = { enabled: true };',
@@ -314,6 +360,26 @@ describe('classifyRangeEffect', () => {
       'triple-slash reference',
       '/// <reference types="node" />\nexport const value = 1;',
       '/// <reference types="bun" />\nexport const value = 1;',
+    ],
+    [
+      'Flow type annotation',
+      'export const value /*: number */ = 1;',
+      'export const value /*: string */ = 1;',
+    ],
+    [
+      'Flow type include',
+      'export class Settings { /*:: enabled: boolean; */ }',
+      'export class Settings { /*:: enabled: string; */ }',
+    ],
+    [
+      'Flow named type include',
+      'export class Settings { /*flow-include enabled: boolean; */ }',
+      'export class Settings { /*flow-include enabled: string; */ }',
+    ],
+    [
+      'multiline Flow type include',
+      '/* ::\n type Settings = {\n enabled: boolean\n };\n */\nexport const value = 1;',
+      '/* ::\n type Settings = {\n enabled: string\n };\n */\nexport const value = 1;',
     ],
   ])('preserves the complete %s comment', (_label, before, after) => {
     withDiff(

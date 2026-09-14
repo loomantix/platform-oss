@@ -664,6 +664,33 @@ describe('writeResult rejects results its evidence does not support', () => {
     expect(out.classification).toBe('minor');
   });
 
+  it('writes a minor result for prose in a CommonJS file with a top-level return', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/settings.cjs\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/settings.cjs`]:
+        '// Old prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+      [`${HEAD}:src/settings.cjs`]:
+        '// New prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+    };
+    const out = writeResult(params({ classification: 'minor' }));
+    expect(out.status).toBe('changed');
+    expect(out.classification).toBe('minor');
+  });
+
+  it('rejects a minor result when an inline Flow comment type changed', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/settings.js\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/settings.js`]: 'export const value /*: number */ = 1;',
+      [`${HEAD}:src/settings.js`]: 'export const value /*: string */ = 1;',
+    };
+    expect(() => writeResult(params({ classification: 'minor' }))).toThrow(
+      'minor classification requires a non-behavioral change range',
+    );
+    expect(readResult(resultPath()).status).toBe('blocked');
+  });
+
   it('writes a result the ledger supports', () => {
     runner.threadNodes = [fixedThread('fp1')];
     const out = writeResult(params());

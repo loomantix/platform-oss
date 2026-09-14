@@ -151,7 +151,7 @@ const JAVASCRIPT_EXTENSIONS = new Set([
  */
 function commentSkeleton(source: string, extension: string): string {
   const parsed = parse(source, {
-    sourceType: 'unambiguous',
+    sourceType: extension === '.cjs' ? 'commonjs' : 'unambiguous',
     attachComment: false,
     plugins: [
       'decorators-legacy',
@@ -173,7 +173,9 @@ function commentSkeleton(source: string, extension: string): string {
     // and numeric issue references alone do not establish a directive. Bundler
     // magic comments are camelCase (`webpackChunkName`), and a triple-slash
     // comment's value begins with `/` (`/// <reference types="node" />`).
+    // Flow's colon and flow-include comments also carry type syntax.
     const hasDirective =
+      /^\s*(?::|flow-include\b)/.test(comment.value) ||
       /^\/|@|#[a-z_]|\b(?:webpack|turbopack)|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|vite|globals?|exported|sourceMappingURL|sourceURL|debugId)\b/i.test(
         comment.value,
       );
