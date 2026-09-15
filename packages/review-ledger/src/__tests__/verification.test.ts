@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -17,6 +23,9 @@ import {
   verifyLedger,
   verifyReviewBase,
   writeResult,
+  recoverResult,
+  readResult,
+  writeBlockedResult,
 } from '../index.js';
 import { resetGitHubRunner, setGitHubRunner } from '../github.js';
 import type { GitHubReviewThreadNode, GitHubRunner } from '../types.js';
@@ -129,6 +138,7 @@ class ConfigurableRunner implements GitHubRunner {
   diffNameStatus = '';
   /** `git diff --unified=0` body, keyed by path. */
   diffPatches: Record<string, string> = {};
+  sourceBlobs: Record<string, string> = {};
 
   runGh(args: string[], payload?: unknown): string {
     const cmd = args.join(' ');
@@ -218,6 +228,12 @@ class ConfigurableRunner implements GitHubRunner {
   }
 
   runGit(args: string[]): string {
+    if (args[0] === 'show') {
+      const source = this.sourceBlobs[args[1]!];
+      if (source === undefined) throw new Error('source blob unavailable');
+      return source;
+    }
+    if (args.includes('--summary')) return '';
     if (args[0] === 'rev-parse' && args[1] === 'HEAD') return this.localHead;
     if (args[0] === 'rev-parse' && args[1] === '--verify') {
       return args[2]!.replace(/\^\{commit\}$/, '');
@@ -618,15 +634,96 @@ describe('writeResult rejects results its evidence does not support', () => {
     );
   });
 
+  it('rejects a minor result when a multiline JSDoc type changed', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/settings.js\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/settings.js`]:
+        '/**\n * @type {{\n *   enabled: boolean\n * }}\n */\nconst settings = { enabled: true };',
+      [`${HEAD}:src/settings.js`]:
+        '/**\n * @type {{\n *   enabled: string\n * }}\n */\nconst settings = { enabled: true };',
+    };
+    expect(() => writeResult(params({ classification: 'minor' }))).toThrow(
+      'minor classification requires a non-behavioral change range',
+    );
+    expect(readResult(resultPath()).status).toBe('blocked');
+  });
+
   it('writes a minor result when the fix moved no executing line', () => {
     runner.threadNodes = [fixedThread('fp1')];
     runner.diffNameStatus = 'M\tsrc/user.ts\n';
     runner.diffPatches = {
       'src/user.ts': ['@@ -4 +4 @@', '-// old note', '+// new note'].join('\n'),
     };
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/user.ts`]: '// old note\nconst value = 1;',
+      [`${HEAD}:src/user.ts`]: '// new note\nconst value = 1;',
+    };
     const out = writeResult(params({ classification: 'minor' }));
     expect(out.status).toBe('changed');
     expect(out.classification).toBe('minor');
+  });
+
+  it('writes a minor result for prose in a CommonJS file with a top-level return', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/settings.cjs\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/settings.cjs`]:
+        '// Old prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+      [`${HEAD}:src/settings.cjs`]:
+        '// New prose.\nif (process.env.SKIP_FIXTURE) return;\nmodule.exports = 42;',
+    };
+    const out = writeResult(params({ classification: 'minor' }));
+    expect(out.status).toBe('changed');
+    expect(out.classification).toBe('minor');
+  });
+
+  it.each([
+    ['const value = 1;', '// Preserve the value.\nconst value = 1;'],
+    ['// Preserve the value.\nconst value = 1;', 'const value = 1;'],
+    [
+      '// Preserve the value.\nconst value = 1;',
+      '// Preserve the\n// value.\nconst value = 1;',
+    ],
+  ])('finalizes a minor prose-reshaping result', (before, after) => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/identity.ts\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/identity.ts`]: before,
+      [`${HEAD}:src/identity.ts`]: after,
+    };
+    const result = writeResult(params({ classification: 'minor' }));
+    expect(result).toMatchObject({
+      status: 'changed',
+      classification: 'minor',
+      finalLaneComplete: true,
+      findingFingerprints: ['fp1'],
+    });
+    expect(existsSync(`${resultPath()}.recovery.json`)).toBe(false);
+  });
+
+  it('rejects a minor result for executable code hidden by a script parse', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/identity.mjs\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/identity.mjs`]:
+        'const r = await /[//]/.source; x = [\n 0]',
+      [`${HEAD}:src/identity.mjs`]: 'const r = await /[//]/.flags; y = [\n 0]',
+    };
+    expect(() => writeResult(params({ classification: 'minor' }))).toThrow();
+  });
+
+  it('rejects a minor result when an inline Flow comment type changed', () => {
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/settings.js\n';
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/settings.js`]: 'export const value /*: number */ = 1;',
+      [`${HEAD}:src/settings.js`]: 'export const value /*: string */ = 1;',
+    };
+    expect(() => writeResult(params({ classification: 'minor' }))).toThrow(
+      'minor classification requires a non-behavioral change range',
+    );
+    expect(readResult(resultPath()).status).toBe('blocked');
   });
 
   it('writes a result the ledger supports', () => {
@@ -635,6 +732,142 @@ describe('writeResult rejects results its evidence does not support', () => {
     expect(out.status).toBe('changed');
     expect(out.findingFingerprints).toEqual(['fp1']);
     expect(out.resultSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe('completed result finalization recovery', () => {
+  const params = () => ({
+    repo: REPO,
+    pr: PR,
+    head: HEAD,
+    engine: 'claude' as const,
+    round: 1,
+    base: BASE,
+    before: BEFORE,
+    resultFile: resultPath(),
+    historicalCommentIdsFile: join(dir, 'historical.json'),
+  });
+  const receiptPath = () => `${resultPath()}.recovery.json`;
+  const prepare = () => {
+    writeFileSync(params().historicalCommentIdsFile, '[]\n');
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/identity.ts\n';
+    // The review is complete, but an unavailable blob prevents the final
+    // non-behavioral proof. No reviewer must run when the blob becomes available.
+    expect(() => writeResult({ ...params(), classification: 'minor' })).toThrow(
+      'non-behavioral',
+    );
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/identity.ts`]:
+        '/**\n * Existing guard.\n */\nconst value = 1;',
+      [`${HEAD}:src/identity.ts`]:
+        '/**\n * Clarified existing guard.\n */\nconst value = 1;',
+    };
+    return {
+      ...params(),
+      expectedRecoverySha256: sha(readFileSync(receiptPath(), 'utf8')),
+    };
+  };
+
+  it('preserves the blocked bytes and complete candidate, then rechecks and replays recovery', () => {
+    const recovery = prepare();
+    const blocked = readFileSync(resultPath(), 'utf8');
+    const receipt = readFileSync(receiptPath(), 'utf8');
+    expect(readResult(resultPath()).status).toBe('blocked');
+    expect(statSync(receiptPath()).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(receipt).blockedResult).toBe(blocked);
+    const result = recoverResult(recovery);
+    expect(result).toMatchObject({
+      status: 'changed',
+      classification: 'minor',
+      findingFingerprints: ['fp1'],
+      finalLaneComplete: true,
+    });
+    expect(recoverResult(recovery)).toEqual(result);
+    expect(readFileSync(receiptPath(), 'utf8')).toBe(receipt);
+    expect(runner.issueComments).toEqual([]);
+  });
+
+  it.each([
+    'digest',
+    'snapshot',
+    'actor',
+    'repo',
+    'pr',
+    'round',
+    'base',
+    'before',
+    'head',
+    'result',
+    'ledger',
+    'live-head',
+    'source',
+  ])('rejects changed %s evidence without rewriting the result', (change) => {
+    const recovery = prepare();
+    if (change === 'digest') recovery.expectedRecoverySha256 = '0'.repeat(64);
+    if (change === 'snapshot')
+      writeFileSync(recovery.historicalCommentIdsFile, '[1]\n');
+    if (change === 'actor') runner.actor = 'different-actor';
+    if (change === 'repo') recovery.repo = 'example/different';
+    if (change === 'pr') recovery.pr += 1;
+    if (change === 'round') recovery.round += 1;
+    if (change === 'base') recovery.base = OTHER;
+    if (change === 'before') recovery.before = OTHER;
+    if (change === 'head') recovery.head = OTHER;
+    if (change === 'result')
+      writeBlockedResult({
+        ...params(),
+        blocker: 'Review has an unresolved defect.',
+      });
+    if (change === 'ledger') runner.threadNodes = [];
+    if (change === 'live-head') runner.prHead = OTHER;
+    if (change === 'source') runner.sourceBlobs = {};
+    const original = readFileSync(resultPath(), 'utf8');
+    expect(() => recoverResult(recovery)).toThrow();
+    expect(readFileSync(resultPath(), 'utf8')).toBe(original);
+    expect(runner.issueComments).toEqual([]);
+  });
+
+  it('does not create a completed candidate for an unfinished review', () => {
+    writeFileSync(params().historicalCommentIdsFile, '[]\n');
+    expect(() => writeResult({ ...params(), classification: 'minor' })).toThrow(
+      'ledger evidence',
+    );
+    writeBlockedResult({ ...params(), blocker: 'Review has not finished.' });
+    expect(existsSync(receiptPath())).toBe(false);
+    expect(() =>
+      recoverResult({ ...params(), expectedRecoverySha256: '0'.repeat(64) }),
+    ).toThrow();
+  });
+});
+
+describe('explicit result retry', () => {
+  it('archives an earlier recovery receipt when the new result succeeds', () => {
+    const params = {
+      repo: REPO,
+      pr: PR,
+      head: HEAD,
+      engine: 'claude' as const,
+      round: 1,
+      base: BASE,
+      before: BEFORE,
+      resultFile: resultPath(),
+      classification: 'minor' as const,
+    };
+    runner.threadNodes = [fixedThread('fp1')];
+    runner.diffNameStatus = 'M\tsrc/identity.ts\n';
+    expect(() => writeResult(params)).toThrow('non-behavioral');
+    const path = `${resultPath()}.recovery.json`;
+    const original = readFileSync(path, 'utf8');
+    runner.sourceBlobs = {
+      [`${BEFORE}:src/identity.ts`]: '// Old prose\nconst value = 1;',
+      [`${HEAD}:src/identity.ts`]: '// New prose\nconst value = 1;',
+    };
+    expect(writeResult(params).status).toBe('changed');
+    expect(existsSync(path)).toBe(false);
+    expect(
+      readFileSync(`${resultPath()}.recovery.${sha(original)}.json`, 'utf8'),
+    ).toBe(original);
   });
 });
 

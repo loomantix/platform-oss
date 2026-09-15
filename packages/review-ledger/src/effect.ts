@@ -1,4 +1,5 @@
 import { getGitHubRunner } from './github.js';
+import { parse, type ParserOptions } from '@babel/parser';
 
 /**
  * Whether a Git range altered a surface that executes.
@@ -130,6 +131,193 @@ const COMMENT_SYNTAX: ReadonlyMap<string, CommentSyntax> = new Map([
   ['.sql', { line: ['--'], block: [['/*', '*/'] as const] }],
 ]);
 
+const JAVASCRIPT_EXTENSIONS = new Set([
+  '.ts',
+  '.tsx',
+  '.mts',
+  '.cts',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+]);
+
+/**
+ * A checked lexical range from the parser's untyped token array.
+ */
+interface SourceToken {
+  start: number;
+  end: number;
+  label: string;
+}
+
+function sourceToken(value: unknown, length: number): SourceToken {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('parser token is not an object');
+  }
+  const token = value as Record<string, unknown>;
+  const type = token['type'];
+  const label =
+    typeof type === 'string'
+      ? type
+      : typeof type === 'object' && type !== null && 'label' in type
+        ? type.label
+        : undefined;
+  const start = token['start'];
+  const end = token['end'];
+  if (
+    typeof label !== 'string' ||
+    typeof start !== 'number' ||
+    typeof end !== 'number' ||
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 0 ||
+    end < start ||
+    end > length
+  ) {
+    throw new Error('parser token has an invalid source range');
+  }
+  return { start, end, label };
+}
+
+function isDirective(value: string): boolean {
+  // Preserve complete comments: tool and type directives can span lines, and
+  // their delimiters matter. Hash headings and numeric references remain prose.
+  return (
+    /^\s*(?::|flow-include\b)/.test(value) ||
+    /^\/|@|#[a-z_]|\b(?:webpack|turbopack)|\b(?:eslint|istanbul|c8|v8|prettier|jshint|jslint|tslint|vite|globals?|exported|sourceMappingURL|sourceURL|debugId)\b/i.test(
+      value,
+    )
+  );
+}
+
+/**
+ * Respect explicit module extensions and reject ambiguous lexical structure.
+ * Without imports or exports, an unambiguous parse may treat module `await`
+ * as an identifier and executable regular-expression text as a script comment,
+ * so a script parse must tokenize identically as a module. Scripts may also
+ * treat HTML-like markers as comments that this parser reads as code.
+ */
+function parseSource(
+  source: string,
+  extension: string,
+): ReturnType<typeof parse> {
+  const options: ParserOptions = {
+    sourceType: /\.[cm][jt]s$/.test(extension)
+      ? extension.startsWith('.m')
+        ? 'module'
+        : 'commonjs'
+      : 'unambiguous',
+    // HTML-like comments are executable in modules and TypeScript.
+    annexB: false,
+    attachComment: false,
+    tokens: true,
+    plugins: [
+      'decorators-legacy',
+      ...(/\.[cm]?tsx?$/.test(extension) ? ['typescript' as const] : []),
+      ...(/\.(?:[cm]?jsx?|tsx)$/.test(extension) ? ['jsx' as const] : []),
+    ],
+  };
+  const parsed = parse(source, options);
+  if (parsed.program.sourceType !== 'module' && /<!--|-->/.test(source)) {
+    throw new Error('script source contains an HTML-like comment marker');
+  }
+  if (
+    options.sourceType === 'unambiguous' &&
+    parsed.program.sourceType === 'script'
+  ) {
+    // A module parse failure or any token difference fails closed.
+    const module = parse(source, { ...options, sourceType: 'module' });
+    const shape = (file: ReturnType<typeof parse>) => {
+      const tokens: unknown = file.tokens;
+      if (!Array.isArray(tokens)) {
+        throw new Error('parser tokens are unavailable');
+      }
+      return JSON.stringify(
+        tokens.map((value) => {
+          const token = sourceToken(value, source.length);
+          return [token.start, token.end, token.label];
+        }),
+      );
+    };
+    if (shape(parsed) !== shape(module)) {
+      throw new Error('module and script parses disagree on tokens');
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Compare executable tokens and line-terminator boundaries, allowing ordinary
+ * comments to be inserted, removed, or rewrapped. Token bytes stay exact, and
+ * line breaks between tokens remain significant for automatic semicolon
+ * insertion. A gap containing a directive is preserved verbatim, including its
+ * placement relative to adjacent code and comments.
+ */
+function commentSkeleton(source: string, extension: string): string {
+  const parsed = parseSource(source, extension);
+  const tokens: unknown = parsed.tokens;
+  if (!Array.isArray(tokens)) throw new Error('parser tokens are unavailable');
+  const comments = new Map<number, { end: number; directive: boolean }>();
+  for (const comment of parsed.comments ?? []) {
+    const span = sourceToken(comment, source.length);
+    comments.set(span.start, {
+      end: span.end,
+      directive: isDirective(comment.value),
+    });
+  }
+  let offset = 0;
+  let lastEnd = 0;
+  let seenComments = 0;
+  let directiveInGap = false;
+  const parts: Array<readonly [string, string, string | boolean]> = [];
+  for (const value of tokens) {
+    const token = sourceToken(value, source.length);
+    if (token.start < lastEnd) throw new Error('parser tokens overlap');
+    lastEnd = token.end;
+    const comment = comments.get(token.start);
+    if (comment?.end === token.end) {
+      seenComments += 1;
+      directiveInGap ||= comment.directive;
+      continue;
+    }
+    const gap = source.slice(offset, token.start);
+    parts.push([
+      token.label,
+      source.slice(token.start, token.end),
+      directiveInGap
+        ? gap
+        : parts.length > 0 &&
+          token.label !== 'eof' &&
+          /[\n\r\u2028\u2029]/.test(gap),
+    ]);
+    offset = token.end;
+    directiveInGap = false;
+  }
+  if (
+    seenComments !== comments.size ||
+    parts.at(-1)?.[0] !== 'eof' ||
+    lastEnd !== source.length
+  ) {
+    throw new Error('parser tokens did not cover the complete source');
+  }
+  return JSON.stringify(parts);
+}
+
+function isCommentOnlySource(
+  before: string,
+  after: string,
+  extension: string,
+): boolean {
+  try {
+    return (
+      commentSkeleton(before, extension) === commentSkeleton(after, extension)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function extensionOf(path: string): string {
   const base = path.slice(path.lastIndexOf('/') + 1);
   const dot = base.lastIndexOf('.');
@@ -156,7 +344,11 @@ function isDocsOrConfig(path: string): boolean {
   // cannot read anyway. A script that lives under `docs/` still executes, so
   // let rule 2 decide it: a comment-only edit there is still inert, an edit to
   // one of its statements is not.
-  if (DOCS_DIR_RE.test(`/${path}`) && !COMMENT_SYNTAX.has(extensionOf(path))) {
+  if (
+    DOCS_DIR_RE.test(`/${path}`) &&
+    !COMMENT_SYNTAX.has(extensionOf(path)) &&
+    !JAVASCRIPT_EXTENSIONS.has(extensionOf(path))
+  ) {
     return true;
   }
   const base = basenameOf(path);
@@ -236,10 +428,9 @@ function classifyLine(
 /**
  * Whether every added and removed line in one path's patch is a comment.
  *
- * Block state is tracked independently per side and only across that side's own
- * lines, so a hunk that starts mid-block is read as continuing it. That is the
- * conservative direction: it can only accept lines a full parse would also
- * accept, because a line inside a block comment is inert either way.
+ * This fallback for other languages has no unchanged lexical context and
+ * rejects hunks that start inside a block. JavaScript and TypeScript use the
+ * full-source parser instead.
  */
 function isCommentOnlyPatch(patch: string, syntax: CommentSyntax): boolean {
   let leftBlock = false;
@@ -310,7 +501,7 @@ export function classifyRangeEffect(
     return 'non-behavioral';
   }
 
-  const paths: string[] = [];
+  const paths: Array<{ code: string; path: string }> = [];
   for (const row of status.split(/\r?\n/)) {
     if (row === '') {
       continue;
@@ -321,14 +512,41 @@ export function classifyRangeEffect(
     if (code === undefined || path === undefined || !/^[AMD]$/.test(code)) {
       return 'behavioral';
     }
-    paths.push(path);
+    paths.push({ code, path });
   }
 
-  for (const path of paths) {
+  for (const { code, path } of paths) {
     if (isDocsOrConfig(path) || isTestPath(path)) {
       continue;
     }
-    const syntax = COMMENT_SYNTAX.get(extensionOf(path));
+    const extension = extensionOf(path);
+    if (JAVASCRIPT_EXTENSIONS.has(extension)) {
+      // Creating/deleting source or changing its mode is not a prose edit.
+      if (code !== 'M') return 'behavioral';
+      try {
+        const summary = runner.runGit([
+          'diff',
+          '--summary',
+          '--no-renames',
+          `${before}..${after}`,
+          '--',
+          path,
+        ]);
+        if (
+          summary.trim() !== '' ||
+          !isCommentOnlySource(
+            runner.runGit(['show', `${before}:${path}`]),
+            runner.runGit(['show', `${after}:${path}`]),
+            extension,
+          )
+        )
+          return 'behavioral';
+      } catch {
+        return 'behavioral';
+      }
+      continue;
+    }
+    const syntax = COMMENT_SYNTAX.get(extension);
     if (syntax === undefined) {
       return 'behavioral';
     }

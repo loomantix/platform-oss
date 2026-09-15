@@ -60,6 +60,12 @@ import {
   writeResultFile,
 } from './result.js';
 import { reviewRuns } from './runs.js';
+import {
+  archiveResultRecovery,
+  historicalSnapshotDigest,
+  readResultRecovery,
+  saveResultRecovery,
+} from './recovery.js';
 import type {
   AttestParams,
   AttestResult,
@@ -80,6 +86,7 @@ import type {
   PreflightAnchorResult,
   ReconcileParams,
   ReconcileResult,
+  RecoverResultParams,
   ReopenOccurrenceParams,
   ReopenOccurrenceResult,
   ReplyParams,
@@ -737,7 +744,8 @@ export function verifyResultEvidence(
  * Derive and persist a review result from the verified ledger state.
  */
 export function writeResult(params: WriteResultParams): LedgerResult {
-  assertActor(params.actor);
+  const actor = assertActor(params.actor);
+  const historicalSha256 = historicalSnapshotDigest(params);
   verifyReviewBase(params.repo, params.pr, params.base, params.before);
   verifyGitTransition(params.before, params.head, params.head);
   // Result derivation always reads live threads. A snapshot's seal proves only
@@ -800,14 +808,6 @@ export function writeResult(params: WriteResultParams): LedgerResult {
   ) {
     fail('convergence review results cannot fix non-blocking findings');
   }
-  if (
-    changed &&
-    params.classification === 'minor' &&
-    classifyRangeEffect(params.before, params.head) === 'behavioral'
-  ) {
-    fail('minor classification requires a non-behavioral change range');
-  }
-
   const value: Record<string, unknown> = {
     version: PROTOCOL_VERSION,
     status: changed ? 'changed' : 'clean',
@@ -821,18 +821,53 @@ export function writeResult(params: WriteResultParams): LedgerResult {
     finalLaneComplete: true,
   };
 
-  validateResultData(params, Buffer.from(JSON.stringify(value) + '\n', 'utf8'));
-  verifyResultEvidence(params, threads, {
-    data: value as unknown as LedgerResult,
-    allowedHeads,
-    historicalCommentIds,
-  });
-
+  const candidate = validateResultData(params, JSON.stringify(value));
+  try {
+    verifyResultEvidence(params, threads, {
+      data: candidate,
+      allowedHeads,
+      historicalCommentIds,
+    });
+  } catch (error) {
+    saveResultRecovery(params, candidate, actor, historicalSha256);
+    throw error;
+  }
+  if (historicalSnapshotDigest(params) !== historicalSha256) {
+    fail('pre-pass comment snapshot changed during result derivation');
+  }
   writeResultFile(params.resultFile, value);
+  archiveResultRecovery(params.resultFile);
   const raw = readResultBytes(params.resultFile);
   const resultSha256 = sha256Bytes(raw);
 
-  return { ...(value as unknown as LedgerResult), resultSha256 };
+  return { ...candidate, resultSha256 };
+}
+
+/**
+ * Retry finalization of a saved completed review without running a reviewer or
+ * changing its classification, identity, findings, or round. Ordinary attest
+ * still verifies and publishes the result after the caller's validation gates.
+ */
+export function recoverResult(params: RecoverResultParams): LedgerResult {
+  const actor = assertActor(params.actor);
+  verifyHead(params.repo, params.pr, params.head);
+  const candidate = readResultRecovery(params, actor);
+  const threads = reviewThreads(params.repo, params.pr);
+  const historicalCommentIds = loadHistoricalCommentIds(
+    params.historicalCommentIdsFile,
+  );
+  verifyResultEvidence(params, threads, {
+    data: candidate,
+    historicalCommentIds,
+  });
+  // Recheck the sealed local inputs after network verification, before writing.
+  readResultRecovery(params, actor);
+  verifyHead(params.repo, params.pr, params.head);
+  writeResultFile(params.resultFile, { ...candidate });
+  return {
+    ...candidate,
+    resultSha256: sha256Bytes(readResultBytes(params.resultFile)),
+  };
 }
 
 /**
