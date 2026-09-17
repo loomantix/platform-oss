@@ -314,7 +314,11 @@ For confirmed fixes, including cleanup inherited from refactorpass:
    the finding and is not evidence for the pass. Name the command, config, and
    SHA in the attestation. A red gating run is itself a blocking finding, even
    when it predates this round, and applies to a `clean` pass just as much as a
-   changed one;
+   changed one. Under agent-loop (`$AGENT_LOOP_REVIEW_CONTRACT_VERSION` is set)
+   skip this run: the wrapper's validation hook is the gating run on the exact
+   head after the pass, and its result stops the pass when red. Run focused
+   validation for your fixes only, and write the result only after every
+   command you started has finished;
 7. after the final lane, write the v3 structured result. Under agent-loop the
    wrapper owns the committed-pass marker.
 
@@ -380,6 +384,10 @@ launcher â€” `.claude/skills/critique/scripts/run-agy-review.sh` for `gemini` â€
 rule before returning. A one-pass invocation leaves reviewer scheduling to its
 outer controller. Use `write-result` for `clean` or `changed`, and use
 `write-blocked-result` with an owner-only blocker file for `blocked`.
+If finalization preserves `<result-file>.recovery.json`, keep it and the
+helper-written blocked result for the outer controller; report the failure
+without overwriting either file. Use a new blocker only for unfinished review
+work.
 
 ## Boundaries
 

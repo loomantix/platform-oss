@@ -297,12 +297,20 @@ role references needed for the selected lenses.
     dispositions findings and is not evidence for the pass. Name the command,
     config, and SHA in the attestation. A red gating run is itself a blocking
     finding, even when it predates this round, and applies to a `clean` pass
-    just as much as a changed one.
+    just as much as a changed one. Under agent-loop
+    (`$AGENT_LOOP_REVIEW_CONTRACT_VERSION` is set) skip this run: the wrapper's
+    validation hook is the gating run on the exact head after the pass, and its
+    result stops the pass when red. Run targeted validation for your fixes
+    only, and write the result only after every command you started has
+    finished.
 13. Always use the ledger helper's `write-result` command to create the v3
     structured result at `$AGENT_LOOP_REVIEW_RESULT_FILE` when set. The outer
     wrapper validates it and owns the pass/completion attestation. Inside
     agent-loop, omit thread and transition files so the helper fetches and
-    derives them. For a blocked pass, call `write-blocked-result` with an
+    derives them. If finalization preserves `<result-file>.recovery.json`, keep
+    it and the helper-written blocked result for the outer controller; report
+    the failure without overwriting either file. For unfinished review work,
+    call `write-blocked-result` with an
     owner-only blocker file. Outside agent-loop, create the complete
     review-thread export and ordered
     forward-only before-to-after head list as private temporary files, use

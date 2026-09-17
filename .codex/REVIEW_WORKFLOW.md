@@ -15,6 +15,23 @@ The Codex control surface must be installed even when another engine starts
 the command. If it is absent, report the missing installation; do not substitute
 a raw reviewer CLI or silently fall back to a conversational auto loop.
 
+Reviewer model, effort, and engine order come from the user's review profile, a
+file outside every repository that the `review-setup` skill creates and edits.
+Before starting a run, read it with
+`python3 -I .codex/skills/critique/scripts/review-profile.py show --repo <owner/repo>`.
+When it reports `"configured": false`, run `review-setup` with the user first;
+never start a run on settings the user has not confirmed. Unless the user names a
+plan, read the tier's order from `review-profile.py order --tier <lean|deep> --repo <owner/repo>`.
+Use `--chain` for a one-engine order and `--cycle --until-converged` for two or
+three engines. A one-engine chain reports plan completion; it cannot establish
+independent convergence. The runner pins each engine's settings when the run
+starts, so a profile change applies to the next run, not the one in progress.
+
+In Claude Code, start the runner with the Bash tool's `run_in_background` and
+wait for its completion notification instead of polling: a chain outlasts any
+foreground command timeout. When it returns, read the exit status and final JSON
+line and act on the outcome table in the runner usage.
+
 Each worker owns one pass only. The runner owns launch order, result verification,
 attestation, and bounded progression. Existing handoff sessions and the separate
 issue-implementation `agent-loop` keep their own contracts. An active legacy run
@@ -31,13 +48,12 @@ resolved as well as unresolved threads before reviewing the current head.
 
 Load [the local review ledger](references/local-review-ledger.md) before running
 `refactorpass`, `critique`, `deepcritique`, `pr-critique`, or local review hooks.
-That file is the engine-neutral protocol published by the
-[`@loomantix/review-ledger`](https://www.npmjs.com/package/@loomantix/review-ledger)
-project and vendored verbatim into every engine repository, so all engines read
-the same contract. The helper bundle beside it is vendored from that package's
-published tarball and pinned by `review-ledger.version` and
-`review-ledger.integrity`; CI byte-compares the bundle, not this document, so a
-protocol edit must land upstream rather than here. Where the protocol writes
+That file is the engine-neutral protocol from ActiveLoom's
+`packages/review-ledger` package, vendored verbatim into every harness root so
+all engines read the same contract. The helper bundle beside it is built from
+that package and pinned by `review-ledger.version` and `review-ledger.integrity`;
+ActiveLoom CI rebuilds the bundle and fails when a vendored copy differs, so a
+helper change belongs in the package source rather than here. Where the protocol writes
 `<ledger-helper>`, this engine's path is:
 
 ```text
@@ -78,7 +94,8 @@ an independent Claude reviewer only through the synced, tested
 `.codex/skills/critique/scripts/run-claude-review.sh` launcher. Never invoke the
 raw `claude` CLI directly or hand-compose an equivalent command. Never supply
 or override Claude's model, effort, permission, persistence, or output options;
-the launcher owns those settings and pins literal `--effort low`. Do not set
+the launcher owns those settings, taking model and effort from the confirmed
+review profile or the run's pinned settings. Do not set
 `CLAUDE_REVIEW_CLI` outside launcher tests. A missing, incompatible, or failed
 launcher is a blocker, not permission to fall back to the raw CLI.
 The launcher also owns a 45-minute pass timeout. Operators may lower it with
@@ -88,7 +105,7 @@ are rejected.
 The contract-v4 `agent-loop` is the sole exception: its wrapper directly
 invokes the separately tested
 `.codex/skills/agent-loop/scripts/run-codex-review.sh`, which starts Claude with
-the same pinned effort, permission, persistence, and output policy against an
+its own literal `--effort low` and the same permission, persistence, and output policy against an
 immutable base-blob `.claude` snapshot. Interactive review and every
 non-agent-loop caller continue to use `run-claude-review.sh` only.
 
@@ -104,15 +121,16 @@ modes silently in the middle of a round.
   never change an in-flight roster implicitly. For a newly declared relay the
   default direct interactive reviewer engine is `gemini`, launched through the
   Agy CLI only via `.codex/skills/critique/scripts/run-agy-review.sh`. That
-  launcher pins `gemini-3.7-flash-high`, literal `--effort high`, accept-edits
-  mode, unattended permissions, structured output, and the same 30-minute
-  default / 3600-second hard pass bound;
+  launcher takes its model and effort from the confirmed review profile or the
+  run's pinned settings (recommended: `gemini-3.7-flash-high` at `high`) and pins
+  accept-edits mode, unattended permissions, structured output, and the same
+  30-minute default / 3600-second hard pass bound;
   callers cannot supply or override them. It also requires Agy to resolve the
   current `deepcritique` skill, resolves its real target, and validates a
   structurally compatible relay surface from a clean, exact-commit companion
   checkout before review. A consumer may explicitly retain Claude through the
-  tested `run-claude-review.sh` launcher, which keeps its literal `--effort low`
-  contract. Agy starts a fresh one-shot by omitting continuation flags, but the
+  tested `run-claude-review.sh` launcher, which resolves its model and effort
+  the same way. Agy starts a fresh one-shot by omitting continuation flags, but the
   current CLI has no equivalent of Claude's `--no-session-persistence`; retain
   the Claude path when local conversation persistence is prohibited. Never
   hand-compose either CLI command. After the reviewer returns, validate its
@@ -162,6 +180,19 @@ engine in a fresh terminal.
    worktree, prove their trees match, and obtain explicit approval for a
    lease-protected force-push before rewriting published history. Repositories
    whose effective target-branch rules accept unsigned commits are unchanged.
+
+   Before creating a new run, `start-run` also counts the PR's behaviour commits
+   (non-merge commits whose headline starts `feat`, `fix`, or `perf`) and its
+   changed files that GitHub returns without a patch. At six or more behaviour
+   commits, or any patchless file, it refuses until the caller records
+   `--scope-decision keep` or `--scope-decision split`. Decide whether the PR
+   bundles independent changes before round 1 is spent: an over-scoped change
+   spends its round budget on fixes whose interactions each new reviewer finds
+   again. The decision and both counts are bound into the run content as a
+   `local-review-scope:v1` marker. The checkpoint never changes the tier, a
+   reviewer's instructions, or which findings are reported, and replaying an
+   existing run is unaffected.
+
    The helper fixes the cap at two Lean rounds or four Deep rounds. A later run
    on the same PR requires the current run to be ended and a new, explicit user
    authorization passed with `--restart`; a new session alone is not a restart.

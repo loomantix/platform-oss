@@ -15,6 +15,23 @@ The Codex control surface must be installed even when another engine starts
 the command. If it is absent, report the missing installation; do not substitute
 a raw reviewer CLI or silently fall back to a conversational auto loop.
 
+Reviewer model, effort, and engine order come from the user's review profile, a
+file outside every repository that the `review-setup` skill creates and edits.
+Before starting a run, read it with
+`python3 -I .codex/skills/critique/scripts/review-profile.py show --repo <owner/repo>`.
+When it reports `"configured": false`, run `review-setup` with the user first;
+never start a run on settings the user has not confirmed. Unless the user names a
+plan, read the tier's order from `review-profile.py order --tier <lean|deep> --repo <owner/repo>`.
+Use `--chain` for a one-engine order and `--cycle --until-converged` for two or
+three engines. A one-engine chain reports plan completion; it cannot establish
+independent convergence. The runner pins each engine's settings when the run
+starts, so a profile change applies to the next run, not the one in progress.
+
+In Claude Code, start the runner with the Bash tool's `run_in_background` and
+wait for its completion notification instead of polling: a chain outlasts any
+foreground command timeout. When it returns, read the exit status and final JSON
+line and act on the outcome table in the runner usage.
+
 Each worker owns one pass only. The runner owns launch order, result verification,
 attestation, and bounded progression. Existing handoff sessions and the separate
 issue-implementation `agent-loop` keep their own contracts. An active legacy run
@@ -31,13 +48,12 @@ head.
 
 Load [the local review ledger](references/local-review-ledger.md) before running
 `refactorpass`, `critique`, `deepcritique`, `codex-review`, or local review hooks.
-That file is the engine-neutral protocol published by the
-[`@loomantix/review-ledger`](https://www.npmjs.com/package/@loomantix/review-ledger)
-project and vendored verbatim into every engine repository, so all engines read
-the same contract. The helper bundle beside it is vendored from that package's
-published tarball and pinned by `review-ledger.version` and
-`review-ledger.integrity`; CI byte-compares the bundle, not this document, so a
-protocol edit must land upstream rather than here. Where the protocol writes
+That file is the engine-neutral protocol from ActiveLoom's
+`packages/review-ledger` package, vendored verbatim into every harness root so
+all engines read the same contract. The helper bundle beside it is built from
+that package and pinned by `review-ledger.version` and `review-ledger.integrity`;
+ActiveLoom CI rebuilds the bundle and fails when a vendored copy differs, so a
+helper change belongs in the package source rather than here. Where the protocol writes
 `<ledger-helper>`, this engine's path is:
 
 ```text
@@ -227,6 +243,18 @@ reviewer budget is spent. Prepare signed replacement commits in an isolated
 worktree, prove their trees match, and obtain explicit approval for a
 lease-protected force-push before rewriting published history. Repositories
 whose effective target-branch rules accept unsigned commits are unchanged.
+
+Before creating a new run, `start-run` also counts the PR's behaviour commits
+(non-merge commits whose headline starts `feat`, `fix`, or `perf`) and its
+changed files that GitHub returns without a patch. At six or more behaviour
+commits, or any patchless file, it refuses until the caller records
+`--scope-decision keep` or `--scope-decision split`. Decide whether the PR
+bundles independent changes before round 1 is spent: an over-scoped change
+spends its round budget on fixes whose interactions each new reviewer finds
+again. The decision and both counts are bound into the run content as a
+`local-review-scope:v1` marker. The checkpoint never changes the tier, a
+reviewer's instructions, or which findings are reported, and replaying an
+existing run is unaffected.
 
 If that path does not exist in the checkout under review, say so and stop rather
 than proceeding unauthorized — an absent controller is a missing gate, not a
@@ -428,12 +456,15 @@ top-level request for auto mode makes the current session the controller; a
 launcher's request for exactly one pass takes precedence inside its child.
 The child returns its result, and the parent schedules remaining reviewers.
 
-This Claude surface ships the `gemini` launcher below. It does not ship a
-mutating Codex review launcher: `codex-review` is a read-only second opinion,
-not a substitute for a declared Codex relay pass. When a requested roster
-includes an engine without a tested launcher, report that capability gap at
-preflight and offer the exact session handoff. Preserve the roster and mode;
-do not silently substitute Gemini, use a raw CLI, or claim full auto support.
+A top-level auto request starts the deterministic runner under
+[Automatic chain execution](#automatic-chain-execution). The runner launches
+Claude, Codex, and Gemini passes through their tested launchers, so a roster
+naming any of them is supported wherever the Codex control surface is
+installed. `codex-review` stays a read-only second opinion and never stands in
+for a declared Codex relay pass. When the control surface, the review profile,
+or a roster engine's CLI is missing, report that gap at preflight and offer the
+exact session handoff or `review-setup`. Preserve the roster and mode; do not
+silently substitute an engine or use a raw CLI.
 
 The fresh-context gate applies to a session performing review, not merely
 coordinating it. An authoring session may prepare the run and invoke a supported
@@ -444,8 +475,9 @@ in-process override under the context rule.
 
 Auto mode is available for the `gemini` reviewer, launched through
 [`skills/critique/scripts/run-agy-review.sh`](skills/critique/scripts/run-agy-review.sh).
-The launcher pins `gemini-3.7-flash-high`, literal `--effort high`, accept-edits
-mode, unattended permissions, and structured JSON output. A pass defaults to a
+The launcher takes its model and effort from the review profile (recommended:
+`gemini-3.7-flash-high` at `high`) and pins accept-edits mode, unattended
+permissions, and structured JSON output. A pass defaults to a
 30-minute bound through `LOCAL_REVIEW_PASS_TIMEOUT_SECONDS`; values above the
 hard 3600-second ceiling are rejected. Under agent-loop the wrapper sets that
 variable itself, to the smallest of what remains of the run's
