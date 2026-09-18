@@ -7,13 +7,31 @@ will be overwritten on the next sync.
 
 For an explicitly requested automatic review chain, use the deterministic
 `.codex/skills/critique/scripts/review-chain-runner.py` controller. Resolve the
-tier and its triggers first, then supply either an exact `--chain` or a repeating
+tier and its triggers first — after the [human-glance gate](#human-glance),
+which starts no run for a docs/config-only range — then supply either an exact `--chain` or a repeating
 `--cycle --until-converged`. Do not implement the outer loop in conversation.
 Read [runner usage](../.codex/references/review-chain-runner.md) before starting;
 it defines required validation commands, durable checkpoints, and recovery.
 The Codex control surface must be installed even when another engine starts
 the command. If it is absent, report the missing installation; do not substitute
 a raw reviewer CLI or silently fall back to a conversational auto loop.
+
+Reviewer model, effort, and engine order come from the user's review profile, a
+file outside every repository that the `review-setup` skill creates and edits.
+Before starting a run, read it with
+`python3 -I .codex/skills/critique/scripts/review-profile.py show --repo <owner/repo>`.
+When it reports `"configured": false`, run `review-setup` with the user first;
+never start a run on settings the user has not confirmed. Unless the user names a
+plan, read the tier's order from `review-profile.py order --tier <lean|deep> --repo <owner/repo>`.
+Use `--chain` for a one-engine order and `--cycle --until-converged` for two or
+three engines. A one-engine chain reports plan completion; it cannot establish
+independent convergence. The runner pins each engine's settings when the run
+starts, so a profile change applies to the next run, not the one in progress.
+
+In Claude Code, start the runner with the Bash tool's `run_in_background` and
+wait for its completion notification instead of polling: a chain outlasts any
+foreground command timeout. When it returns, read the exit status and final JSON
+line and act on the outcome table in the runner usage.
 
 Each worker owns one pass only. The runner owns launch order, result verification,
 attestation, and bounded progression. Existing handoff sessions and the separate
@@ -31,13 +49,12 @@ head.
 
 Load [the local review ledger](references/local-review-ledger.md) before running
 `refactorpass`, `critique`, `deepcritique`, `codex-review`, or local review hooks.
-That file is the engine-neutral protocol published by the
-[`@loomantix/review-ledger`](https://www.npmjs.com/package/@loomantix/review-ledger)
-project and vendored verbatim into every engine repository, so all engines read
-the same contract. The helper bundle beside it is vendored from that package's
-published tarball and pinned by `review-ledger.version` and
-`review-ledger.integrity`; CI byte-compares the bundle, not this document, so a
-protocol edit must land upstream rather than here. Where the protocol writes
+That file is the engine-neutral protocol from ActiveLoom's
+`packages/review-ledger` package, vendored verbatim into every harness root so
+all engines read the same contract. The helper bundle beside it is built from
+that package and pinned by `review-ledger.version` and `review-ledger.integrity`;
+ActiveLoom CI rebuilds the bundle and fails when a vendored copy differs, so a
+helper change belongs in the package source rather than here. Where the protocol writes
 `<ledger-helper>`, this engine's path is:
 
 ```text
@@ -63,7 +80,8 @@ does not determine severity or classification.
 
 ## Review Tier
 
-Resolve the tier **before the first reviewer runs**, on every path. An
+Resolve the tier **before the first reviewer runs**, on every path that passes
+the [human-glance gate](#human-glance). An
 unresolved tier is not a neutral state — it is how the expensive path becomes
 the default. **Lean is the default; Deep is the exception you justify.**
 
@@ -72,6 +90,50 @@ the pass output, and post the ledger's `local-review-tier:v1` marker once per
 PR. Later rounds resolve the effective marker under the ledger's authenticated,
 forward-only transition rule instead of reclassifying the unchanged range; a
 tier re-derived from scratch each round drifts back to Deep.
+
+### Human glance
+
+A changeset with no review-significant file needs a human to read the diff and
+merge, not a review chain. This outcome sits below Lean and is decided first:
+classification is the first step of `critique`, `deepcritique`, `refactorpass`, `reviewit`, `codex-review`,
+and the review phase of `agent-loop`. It runs before a draft PR is
+required or opened, before the context-window check, round, stance, and
+telemetry snapshot, and before any ledger result, attestation, tier or refactor
+marker, or telemetry record.
+
+Classify the committed range against the open PR's base branch, or the
+repository's default branch when the branch has no open PR:
+
+```bash
+git fetch origin <base-branch>
+base_sha=$(git merge-base "origin/<base-branch>" HEAD)
+node .claude/skills/critique/scripts/review-ledger.js classify-changeset \
+  --base "$base_sha" --head "$(git rev-parse HEAD)"
+```
+
+When the output has `"skip": true` and a non-empty `classifications` array,
+print this line with N as that array's length, and stop:
+
+```text
+Human glance: N docs/config files, no review-significant changes — read the diff and merge. No review chain run.
+```
+
+Otherwise continue the entry point unchanged. An empty range or a classifier
+that cannot run is not human glance; the entry point's own pre-flight handles it.
+
+- **Explicit request.** A human who directly asks for this change to be reviewed
+  anyway overrides the gate. That request is trigger 6: the chain runs and the
+  tier marker records it. Typing a review skill's name is not that request.
+- **Controller-scheduled passes.** When `$AGENT_LOOP_REVIEW_RESULT_FILE` is set,
+  the controller that scheduled the pass owns the gate, and the pass reviews the
+  range it was given. `agent-loop` classifies before its first review round, and
+  an automatic chain classifies before it starts the runner.
+- **Later pushes.** Every invocation classifies the whole range again. A push
+  that adds a review-significant file takes the PR out of human glance, and tier
+  resolution applies to the whole range.
+- **The label.** Where the synced `review-glance-label.yml` workflow runs, the
+  `review: human-glance` label marks a PR whose latest push classified the same
+  way. It is a hint; the gate's own classification decides.
 
 ### What sets the tier
 
@@ -228,6 +290,18 @@ worktree, prove their trees match, and obtain explicit approval for a
 lease-protected force-push before rewriting published history. Repositories
 whose effective target-branch rules accept unsigned commits are unchanged.
 
+Before creating a new run, `start-run` also counts the PR's behaviour commits
+(non-merge commits whose headline starts `feat`, `fix`, or `perf`) and its
+changed files that GitHub returns without a patch. At six or more behaviour
+commits, or any patchless file, it refuses until the caller records
+`--scope-decision keep` or `--scope-decision split`. Decide whether the PR
+bundles independent changes before round 1 is spent: an over-scoped change
+spends its round budget on fixes whose interactions each new reviewer finds
+again. The decision and both counts are bound into the run content as a
+`local-review-scope:v1` marker. The checkpoint never changes the tier, a
+reviewer's instructions, or which findings are reported, and replaying an
+existing run is unaffected.
+
 If that path does not exist in the checkout under review, say so and stop rather
 than proceeding unauthorized — an absent controller is a missing gate, not a
 licence to skip one.
@@ -381,8 +455,7 @@ review is permitted but must be declared with a reason; see step 2.
    - **The refactor pass runs once per engine per PR.** A second cleanup pass over
      an already-simplified diff returns naming and shape churn, which moves the
      head and invalidates the other engines' attestations for nothing that ships.
-     Each engine's cleanup lane latches on a `local-review-refactor:v1` marker;
-     a docs/config-only skip does not consume it.
+     Each engine's cleanup lane latches on a `local-review-refactor:v1` marker.
    - **A fix invalidates by head, not by position.** An attestation is evidence
      for the exact commit it names. A material fix does not restart the round at
      some first engine; it moves the head, which invalidates precisely those
@@ -428,12 +501,15 @@ top-level request for auto mode makes the current session the controller; a
 launcher's request for exactly one pass takes precedence inside its child.
 The child returns its result, and the parent schedules remaining reviewers.
 
-This Claude surface ships the `gemini` launcher below. It does not ship a
-mutating Codex review launcher: `codex-review` is a read-only second opinion,
-not a substitute for a declared Codex relay pass. When a requested roster
-includes an engine without a tested launcher, report that capability gap at
-preflight and offer the exact session handoff. Preserve the roster and mode;
-do not silently substitute Gemini, use a raw CLI, or claim full auto support.
+A top-level auto request starts the deterministic runner under
+[Automatic chain execution](#automatic-chain-execution). The runner launches
+Claude, Codex, and Gemini passes through their tested launchers, so a roster
+naming any of them is supported wherever the Codex control surface is
+installed. `codex-review` stays a read-only second opinion and never stands in
+for a declared Codex relay pass. When the control surface, the review profile,
+or a roster engine's CLI is missing, report that gap at preflight and offer the
+exact session handoff or `review-setup`. Preserve the roster and mode; do not
+silently substitute an engine or use a raw CLI.
 
 The fresh-context gate applies to a session performing review, not merely
 coordinating it. An authoring session may prepare the run and invoke a supported
@@ -444,8 +520,9 @@ in-process override under the context rule.
 
 Auto mode is available for the `gemini` reviewer, launched through
 [`skills/critique/scripts/run-agy-review.sh`](skills/critique/scripts/run-agy-review.sh).
-The launcher pins `gemini-3.7-flash-high`, literal `--effort high`, accept-edits
-mode, unattended permissions, and structured JSON output. A pass defaults to a
+The launcher takes its model and effort from the review profile (recommended:
+`gemini-3.7-flash-high` at `high`) and pins accept-edits mode, unattended
+permissions, and structured JSON output. A pass defaults to a
 30-minute bound through `LOCAL_REVIEW_PASS_TIMEOUT_SECONDS`; values above the
 hard 3600-second ceiling are rejected. Under agent-loop the wrapper sets that
 variable itself, to the smallest of what remains of the run's
@@ -833,8 +910,8 @@ times are running different prompts and the tag carries no content identity.
 
 ### Count the findings
 
-Before every emission attempt, including `clean`, `changed`, `skipped`, and
-`blocked` exits, write this pass's complete findings object to an owner-only
+Before every emission attempt, including `clean`, `changed`, and `blocked`
+exits, write this pass's complete findings object to an owner-only
 regular file and pass its path as `--findings-file`. This step also applies to
 early returns before the normal end-of-pass sequence and to a spent cleanup
 latch. Never omit the file or reuse a previous pass's measurements.
@@ -897,7 +974,7 @@ node <ledger-helper> emit-telemetry \
   --base <full-base-sha> --head <full-head-sha> \
   --pass-type <review|refactor> --review-tier <lean|deep> \
   --trigger <autonomous|interactive> --round <n> \
-  --stance <adversarial|convergence> --status <clean|changed|blocked|skipped> \
+  --stance <adversarial|convergence> --status <clean|changed|blocked> \
   --token-source <from delta> --engine-version <from delta> \
   --duration-seconds <from delta> \
   --tokens-file <from delta> --lanes-file <from delta> \
@@ -909,15 +986,15 @@ node <ledger-helper> emit-telemetry \
 
 Omit `--review-tier`, `--engine-version`, `--duration-seconds`, `--tokens-file`,
 `--lanes-file`, `--prompt-stack-sha256`, `--prompt-stack-version`, and
-`--repo-instructions-sha256` whenever the corresponding value is null. A docs/config-only
-skip can legitimately have no resolved review tier, and unavailable usage can
+`--repo-instructions-sha256` whenever the corresponding value is null. A cleanup lane
+can legitimately have no resolved review tier, and unavailable usage can
 legitimately have no engine version or duration; the omitted options serialize
 as null without inventing a value or failing the emission.
 
 `--stance` is the one value on this list's other side: it is mandatory and
 cannot be omitted, yet it follows the tier's schedule, and the two schedules
 diverge from round 2. A branch that emits before a tier is resolved — a
-docs/config skip, or a cleanup lane that resolves no tier at all — must
+cleanup lane that resolves no tier at all — must
 therefore derive it rather than reaching for the tier it does not have. Read the
 effective tier marker already on the PR, without classifying or posting one, and
 fall back to `adversarial` when none exists: a PR carrying no tier marker has
@@ -938,19 +1015,16 @@ the exact pattern that otherwise reads as efficiency.
 | Adversarial pass, nothing to fix      | `review`      | `clean`    |
 | Adversarial pass that committed a fix | `review`      | `changed`  |
 | Pass that could not complete          | `review`      | `blocked`  |
-| Docs/config-only skip                 | `review`      | `skipped`  |
 | Cleanup pass that committed           | `refactor`    | `changed`  |
 | Cleanup pass that found nothing       | `refactor`    | `clean`    |
 | Cleanup skipped on a spent latch      | `refactor`    | `clean`    |
-| Cleanup on a docs/config-only skip    | `refactor`    | `skipped`  |
 | Cleanup that could not complete       | `refactor`    | `blocked`  |
 
-A skip still burns tokens reading and classifying the PR, and "we spent eight
-thousand tokens deciding not to review" is exactly the machinery overhead worth
-seeing. `skipped` is reserved for the changeset that had nothing reviewable in
-it — the record rejects a `skipped` pass carrying review-significant files, so a
-cleanup pass that stopped on a spent latch reports `clean` instead. Its
-changeset was reviewable; this engine had simply already spent its one pass.
+A human-glance range emits no record: it stops before the telemetry snapshot.
+A cleanup pass that stopped on a spent latch reports `clean`. Its changeset was
+reviewable; this engine had simply already spent its one pass. The record writer
+still accepts `skipped`, and rejects it for a changeset carrying
+review-significant files, so existing records stay valid; no pass emits it.
 
 ### Emission failure is never fatal
 
@@ -998,8 +1072,8 @@ telemetry defect must not fail a review that found real defects.
 - [`MODEL_NOTES.md`](MODEL_NOTES.md) — prompt-authoring deltas for the current
   default model; read before editing any skill or agent.
 - [`references/local-review-ledger.md`](references/local-review-ledger.md) — the
-  PR-thread ledger contract, including the shared docs/config-only changeset
-  classification every skill skips on.
+  PR-thread ledger contract, including the shared changeset classification
+  behind the human-glance gate.
 - `skills/critique/scripts/usage-snapshot.js` — this engine's pass-scoped usage
   extractor. It reads the session log, which the vendored ledger helper never
   does; see "Pass Telemetry" above.

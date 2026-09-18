@@ -38,10 +38,13 @@ CONTROL_FILES = [
     "review-ledger.version",
     "review-ledger.integrity",
     "review-launch-state.py",
+    "review-profile.py",
+    "review-profile.defaults.json",
     *LAUNCHERS.values(),
 ]
-# This v1 pair has exactly one dirty-surface diagnostic, followed by exit 1
-# before the mutating Agy invocation. No other legacy log is recovery evidence.
+# Only this inspected v1 pair supports legacy reconciliation. Git diagnostics
+# also need the controller's terminal log to distinguish exit 128 from review
+# stderr followed by an interrupted or failed invocation.
 LEGACY_PREFLIGHT_HASHES = {
     "review-chain-runner.py": "708b421366df3d04e59dabccbf1e6a9e8358b8f5b7c281f72e39b1d834d370cf",
     "run-agy-review.sh": "114657daa10c196915d351c7ebc4e8df767bf4fa92b3edbe0a577b095667cd5a",
@@ -56,6 +59,40 @@ class ProcessFailure(Blocked):
     def __init__(self, message: str, exit_status: int):
         super().__init__(message)
         self.exit_status = exit_status
+
+
+class CleanupBlocked(Blocked):
+    def __init__(
+        self, message: str, group: int, exit_status: int | None, completed: bool
+    ):
+        super().__init__(message)
+        self.group = group
+        self.exit_status = exit_status
+        self.completed = completed
+
+
+def capacity_rejected(log: Path) -> bool:
+    """Read terminal Codex JSON events, never command output or plain diagnostics."""
+    if log.is_symlink() or not log.is_file():
+        return False
+    rejected = False
+    with log.open(errors="replace") as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("type")
+            if kind in ("error", "turn.failed"):
+                error = event.get("error") if kind == "turn.failed" else event
+                rejected = isinstance(error, dict) and error.get("message") == (
+                    "Selected model is at capacity. Please try a different model."
+                )
+            else:
+                rejected = False
+    return rejected
 
 
 def digest(path: Path) -> str:
@@ -141,10 +178,13 @@ def managed(
                         cause = f"; worker failure: {type(pending).__name__}"
                     else:
                         cause = ""
-                    raise Blocked(
+                    raise CleanupBlocked(
                         f"{Path(argv[0]).name} {exit_state}; process-group cleanup "
                         f"denied for {child.pid}; reconcile surviving processes "
-                        f"before resuming{cause}"
+                        f"before resuming{cause}",
+                        child.pid,
+                        child.returncode,
+                        pending is None and child.returncode == 0,
                     ) from error
 
             try:
@@ -299,6 +339,28 @@ class Runner:
         save(path, pages)
         return ids
 
+    def comments(self, path: Path) -> None:
+        pages = json.loads(
+            command(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{self.args.repo}/issues/{self.args.pr}/comments",
+                    "--paginate",
+                    "--slurp",
+                ]
+            )
+        )
+        save(
+            path,
+            [
+                {"id": c["id"], "body": c["body"], "author": c["user"]["login"]}
+                for page in pages
+                for c in page
+                if not c["body"].lstrip().startswith("<!-- local-review-telemetry:")
+            ],
+        )
+
     def dco(self, head: str) -> None:
         if not self.state["config"]["require_dco"]:
             return
@@ -330,10 +392,26 @@ class Runner:
             "require_dco": self.args.require_dco
             or Path(".github/workflows/dco.yml").is_file(),
         }
+        # Added only when set, so a checkpoint written before the flag existed
+        # still resumes with the same arguments.
+        scope_decision = getattr(self.args, "scope_decision", None)
+        if scope_decision:
+            config["scope_decision"] = scope_decision
         if self.state:
             if self.state.get("version") not in (1, 2):
                 raise Blocked("unsupported checkpoint version")
-            if not self.args.resume or self.state["config"] != config:
+            adopt_scope = bool(
+                self.args.resume
+                and self.state.get("run_id") is None
+                and scope_decision
+                and "scope_decision" not in self.state["config"]
+            )
+            # Compare in memory: a resume this method goes on to reject must
+            # not leave an adopted decision behind in the checkpoint.
+            recorded = dict(self.state["config"])
+            if adopt_scope:
+                recorded["scope_decision"] = scope_decision
+            if not self.args.resume or recorded != config:
                 raise Blocked(
                     "checkpoint exists; use --resume with the same plan, tier, and gates"
                 )
@@ -351,6 +429,9 @@ class Runner:
                     "with the original arguments plus --resume --migrate-controller "
                     "<that checkout's HEAD sha>"
                 )
+            if adopt_scope:
+                self.state["config"]["scope_decision"] = scope_decision
+                self.persist()
             return
         if self.args.resume:
             raise Blocked("no checkpoint to resume")
@@ -568,6 +649,11 @@ class Runner:
             ],
             GH_REPO=self.args.repo,
         )
+        settings = self.selected_settings(engine)
+        env.update(
+            ACTIVELOOM_REVIEW_MODEL=settings["model"],
+            ACTIVELOOM_REVIEW_EFFORT=settings["effort"],
+        )
         if engine == "gemini":
             checkout = installation / "agy"
             match = re.search(
@@ -622,6 +708,50 @@ class Runner:
             )
         return env
 
+    def review_settings(self, engine: str) -> dict[str, Any]:
+        """Pin an engine's profile settings once; profile edits apply to the next run."""
+        pinned = self.state.setdefault("review_settings", {})
+        if engine not in pinned:
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("ACTIVELOOM_REVIEW_MODEL", "ACTIVELOOM_REVIEW_EFFORT")
+            }
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(self.control / "review-profile.py"),
+                    "resolve",
+                    "--engine",
+                    engine,
+                    "--repo",
+                    self.args.repo,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env,
+            )
+            if result.returncode:
+                # The helper's own diagnostics name only the profile path and
+                # the invalid setting, and the unconfigured case points at setup.
+                raise Blocked(
+                    result.stderr.strip() or f"review profile cannot resolve {engine}"
+                )
+            pinned[engine] = json.loads(result.stdout)
+            self.persist()
+        return dict(pinned[engine])
+
+    def selected_settings(self, engine: str) -> dict[str, Any]:
+        settings = self.review_settings(engine)
+        if engine in self.state.get("fallback_engines", []):
+            fallback = settings.get("fallback")
+            if not isinstance(fallback, dict):
+                raise Blocked("pinned fallback settings are missing")
+            return {**fallback, "engine": engine, "source": "capacity fallback"}
+        return settings
+
     def launcher_command(self, engine: str, head: str, number: int) -> list[str]:
         return [
             sys.executable if engine == "codex" else "bash",
@@ -675,6 +805,14 @@ class Runner:
         # Build the environment first: a failure here launched nothing and must
         # leave the owed pass resumable, not an unknown "launching" attempt.
         env = self.environment(pending["engine"])
+        if origin := pending.get("capacity_origin"):
+            attempts = [
+                item for item in self.state["attempts"]
+                if item["attempt_id"] == origin
+            ]
+            if len(attempts) != 1:
+                raise Blocked("capacity fallback origin changed")
+            self.verify_capacity_evidence(pending, attempts[0])
         attempt = {
             "attempt_id": uuid.uuid4().hex,
             "engine": pending["engine"],
@@ -684,6 +822,10 @@ class Runner:
             "exit_status": None,
             "failure_reason": None,
             "phase": "launching",
+            "settings": {
+                "model": env.get("ACTIVELOOM_REVIEW_MODEL"),
+                "effort": env.get("ACTIVELOOM_REVIEW_EFFORT"),
+            },
         }
         self.state.setdefault("attempts", []).append(attempt)
         pending.update(phase="launching", attempt_id=attempt["attempt_id"])
@@ -719,6 +861,13 @@ class Runner:
             )
             attempt.update(exit_status=0, review_started=True, phase="returned")
             pending["phase"] = "returned"
+            # Bind completed-result recovery to the observed worker return.
+            # A sidecar introduced later, or an unknown exit, is not proof of a
+            # completed pass and must not authorize automatic finalization.
+            recovery = folder / "result.json.recovery.json"
+            pending["result_recovery_sha256"] = (
+                digest(recovery) if recovery.exists() else None
+            )
         except (
             Blocked,
             OSError,
@@ -753,10 +902,206 @@ class Runner:
                         pending["phase"] = "preflight_failed"
                     elif evidence.get("phase") == "execution":
                         attempt["phase"] = pending["phase"] = "execution_failed"
+                        if (
+                            pending["engine"] == "codex"
+                            and isinstance(caught, ProcessFailure)
+                            and caught.exit_status == 1
+                            and capacity_rejected(folder / "worker.log")
+                        ):
+                            attempt.update(
+                                review_started=True,
+                                phase="capacity_failed",
+                                failure_reason="model_capacity",
+                                log_sha256=digest(folder / "worker.log"),
+                            )
+                            pending["phase"] = "capacity_failed"
+            if isinstance(caught, CleanupBlocked):
+                attempt.update(
+                    failure_reason="cleanup_denied",
+                    process_group=caught.group,
+                )
+                # Seal the completed output before allowing a later resume
+                # to separate a successful exit from unfinished cleanup.
+                # Digest everything first: a half-sealed attempt would disagree
+                # with its pending phase, and raising here would replace the
+                # cleanup denial the operator has to act on.
+                seal = self.seal_completed(folder) if caught.completed else None
+                if seal is not None:
+                    attempt.update(review_started=True, phase="cleanup_blocked")
+                    pending.update(phase="cleanup_blocked", **seal)
         finally:
             self.persist()
-        if error:
+        if error and pending["phase"] != "capacity_failed":
             raise error
+
+    def seal_completed(self, folder: Path) -> dict[str, Any] | None:
+        """Digest a completed worker's output, or None when it cannot be sealed."""
+        recovery = folder / "result.json.recovery.json"
+        try:
+            return {
+                "cleanup_result_sha256": digest(folder / "result.json"),
+                "cleanup_log_sha256": digest(folder / "worker.log"),
+                "result_recovery_sha256": (
+                    digest(recovery) if recovery.exists() else None
+                ),
+            }
+        except (Blocked, OSError):
+            return None
+
+    def recover_cleanup(self, pending: dict[str, Any]) -> None:
+        attempts = [
+            item for item in self.state["attempts"]
+            if item["attempt_id"] == pending["attempt_id"]
+        ]
+        if len(attempts) != 1:
+            raise Blocked("cleanup recovery attempt changed")
+        attempt = attempts[0]
+        if (
+            attempt.get("phase") != "cleanup_blocked"
+            or type(attempt.get("exit_status")) is not int
+            or attempt["exit_status"] != 0
+            or attempt.get("review_started") is not True
+            or attempt.get("failure_reason") != "cleanup_denied"
+            or (attempt["engine"], attempt["round"], attempt["folder"])
+            != (pending["engine"], pending["round"], pending["folder"])
+        ):
+            raise Blocked("cleanup recovery requires a recorded successful worker exit")
+        group = attempt.get("process_group")
+        if type(group) is not int or group <= 0:
+            raise Blocked("cleanup recovery process group is unavailable")
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            raise Blocked("cleanup recovery cannot inspect the process group") from error
+        else:
+            raise Blocked("cleanup recovery process group still exists")
+        folder = self.directory / pending["folder"]
+        recovery = folder / "result.json.recovery.json"
+        if (
+            digest(folder / "result.json") != pending.get("cleanup_result_sha256")
+            or digest(folder / "worker.log") != pending.get("cleanup_log_sha256")
+            or (digest(recovery) if recovery.exists() else None)
+            != pending.get("result_recovery_sha256")
+        ):
+            raise Blocked("completed worker evidence changed after cleanup failure")
+        # Ordinary completion still verifies head, result, ledger and gates.
+        # No worker is relaunched and no pass or budget is added here.
+        attempt["phase"] = pending["phase"] = "returned"
+        attempt["cleanup_reconciled"] = True
+        self.persist()
+
+    def verify_capacity_evidence(
+        self, pending: dict[str, Any], attempt: dict[str, Any]
+    ) -> None:
+        """Verify the original failure both during recovery and at the retry launch."""
+        if (
+            self.boundary() != pending["before"]
+            or self.state["head"] != pending["before"]
+        ):
+            raise Blocked("capacity fallback requires the unchanged review head")
+        decision = self.decision(pending["before"])
+        if (
+            decision.get("passes") != self.state["completed"]
+            or decision.get("status") != "next"
+            or (decision.get("engine"), decision.get("round"))
+            != (pending["engine"], pending["round"])
+        ):
+            raise Blocked("capacity fallback cannot change the owed pass or budget")
+        folder = self.directory / attempt["folder"]
+        if (
+            attempt.get("engine") != pending["engine"]
+            or attempt.get("round") != pending["round"]
+            or attempt.get("phase") != "capacity_failed"
+            or type(attempt.get("exit_status")) is not int
+            or attempt["exit_status"] != 1
+            or attempt.get("review_started") is not True
+            or digest(folder / "launch.json") != attempt.get("launch_sha256")
+            or digest(folder / "worker.log") != attempt.get("log_sha256")
+            or not capacity_rejected(folder / "worker.log")
+            or (folder / "result.json").exists()
+            or (folder / "result.json").is_symlink()
+            or digest(folder / "historical.json") != pending["historical_sha256"]
+        ):
+            raise Blocked(
+                "capacity failure evidence changed or a reviewer result exists"
+            )
+        for name, capture in (("threads", self.threads), ("comments", self.comments)):
+            before = folder / f"before-{name}.json"
+            if digest(before) != pending.get(f"before_{name}_sha256"):
+                raise Blocked("pre-pass review evidence changed")
+            current = folder / f"capacity-{name}.json"
+            capture(current)
+            if digest(current) != digest(before):
+                raise Blocked(
+                    "review evidence changed; capacity fallback requires reconciliation"
+                )
+
+    def copy_recovery_snapshot(
+        self, source: Path, target: Path, attempt_id: str
+    ) -> None:
+        # A killed save can leave a temporary file. Keep it outside the evidence
+        # directory so that the recorded recovery transaction remains resumable.
+        staged = self.directory / f"recovery-{attempt_id}-{target.name}"
+        save(staged, read(source))
+        os.replace(staged, target)
+
+    def recover_capacity(self, pending: dict[str, Any]) -> None:
+        """Switch once to a pinned fallback without changing run, round or history."""
+        self.verify_control()
+        engine = pending["engine"]
+        settings = self.review_settings(engine)
+        if engine != "codex" or not settings.get("fallback"):
+            raise Blocked(
+                "model is at capacity; no Codex fallback was pinned for this run"
+            )
+        recovery = pending.get("capacity_recovery")
+        if engine in self.state.get("fallback_engines", []) and not recovery:
+            raise Blocked("configured fallback is also at capacity; no further retry")
+        folder = self.directory / pending["folder"]
+        attempt = self.state["attempts"][-1]
+        if attempt.get("attempt_id") != pending.get("attempt_id"):
+            raise Blocked("capacity fallback transaction changed")
+        self.verify_capacity_evidence(pending, attempt)
+        retry = folder / "fallback"
+        if recovery is None:
+            if retry.exists() or retry.is_symlink():
+                raise Blocked("unexpected capacity fallback directory")
+            pending["capacity_recovery"] = {"attempt_id": attempt["attempt_id"]}
+            self.persist()
+        elif recovery.get("attempt_id") != attempt["attempt_id"]:
+            raise Blocked("capacity fallback transaction changed")
+        if retry.is_symlink():
+            raise Blocked("capacity fallback directory cannot be a symlink")
+        retry.mkdir(mode=0o700, exist_ok=True)
+        names = {"historical.json", "before-threads.json", "before-comments.json"}
+        if any(
+            p.name not in names or p.is_symlink() or not p.is_file()
+            for p in retry.iterdir()
+        ):
+            raise Blocked("unexpected capacity fallback evidence")
+        for name in names:
+            target = retry / name
+            if target.exists():
+                if digest(target) != digest(folder / name):
+                    raise Blocked("capacity fallback snapshot changed")
+            else:
+                self.copy_recovery_snapshot(
+                    folder / name, target, attempt["attempt_id"]
+                )
+        self.state.setdefault("fallback_engines", []).append(engine)
+        pending.update(
+            folder=str(retry.relative_to(self.directory)), phase="prepared",
+            capacity_origin=attempt["attempt_id"],
+        )
+        pending.pop("capacity_recovery")
+        self.persist()
+        fallback = settings["fallback"]
+        print(
+            f"Capacity fallback: {engine} model {fallback['model']}, effort {fallback['effort']}",
+            flush=True,
+        )
 
     def recover_preflight(self, pending: dict[str, Any]) -> None:
         if not getattr(self.args, "recover_preflight", False):
@@ -807,7 +1152,7 @@ class Runner:
             raise Blocked("recovery transaction identity changed")
         retry.mkdir(mode=0o700, exist_ok=True)
         if any(
-            p.name not in ("historical.json", "history.pending")
+            p.name not in ("historical.json", "history.pending", "before-threads.json", "before-comments.json")
             or p.is_symlink()
             or not p.is_file()
             for p in retry.iterdir()
@@ -825,11 +1170,61 @@ class Runner:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, history)
+        for name in ("threads", "comments"):
+            source = folder / f"before-{name}.json"
+            if f"before_{name}_sha256" in pending:
+                if digest(source) != pending[f"before_{name}_sha256"]:
+                    raise Blocked("pre-pass review snapshot changed")
+                target = retry / source.name
+                if target.exists():
+                    if digest(target) != digest(source):
+                        raise Blocked("retry review snapshot changed")
+                else:
+                    self.copy_recovery_snapshot(source, target, attempt["attempt_id"])
         pending["folder"] = str(retry.relative_to(self.directory))
         pending["phase"] = "prepared"
         pending.pop("recovery")
         self.persist()
         self.launch(pending)
+
+    def legacy_failure(self, pending: dict[str, Any], log: Path) -> dict[str, Any]:
+        """Recognize only pre-execution failures proved by the pinned v1 pair."""
+        diagnostic = log.read_bytes()
+        if diagnostic == b"agy relay surface checkout must be clean\n":
+            return {"exit_status": 1, "failure_reason": "dirty_surface"}
+        if not re.fullmatch(
+            rb"fatal: not a git repository: (/[^\x00-\x1f\x7f]+/\.git/worktrees/[^/\x00-\x1f\x7f]+|\(null\))\n",
+            diagnostic,
+        ):
+            raise Blocked("legacy log does not prove a preflight-only failure")
+        proof = getattr(self.args, "legacy_controller_log", None)
+        if not proof:
+            raise Blocked(
+                "legacy Git failure requires --legacy-controller-log PATH SHA256"
+            )
+        controller_log = Path(proof[0]).absolute()
+        if digest(controller_log) != proof[1]:
+            raise Blocked("legacy controller log changed")
+        terminal = (
+            f"Starting gemini pass {pending['round']} at {pending['before']}\n"
+            "review-chain blocked: bash exited 128; inspect worker.log; "
+            f"checkpoint: {self.directory}\n"
+        ).encode()
+        if not controller_log.read_bytes().endswith(terminal):
+            raise Blocked(
+                "legacy controller log does not prove the matching exit and cleanup"
+            )
+        # In the recognized launcher the mutating invocation is followed by a
+        # Python parser, which exits 1 and adds its own diagnostic on failure.
+        # This sole Git diagnostic plus bash exit 128 therefore precedes review.
+        # The recognized runner emits its terminal message only after cleanup;
+        # denied cleanup or interruption produces a different terminal message.
+        return {
+            "exit_status": 128,
+            "failure_reason": "surface_provenance",
+            "legacy_controller_log": str(controller_log),
+            "legacy_controller_log_sha256": proof[1],
+        }
 
     def reconcile_legacy_preflight(
         self, pending: dict[str, Any], expected_log: str
@@ -867,39 +1262,49 @@ class Runner:
         present = {p.name for p in folder.iterdir()}
         if (
             digest(log) != expected_log
-            or log.read_bytes() != b"agy relay surface checkout must be clean\n"
             or not allowed <= present
             or present - allowed - ({"launch.json"} if intent else set())
         ):
             raise Blocked("legacy log does not prove a preflight-only failure")
+        failure = self.legacy_failure(pending, log)
         if self.boundary() != pending["before"]:
             raise Blocked("legacy review head changed; reconcile it")
         if not intent:
-            intent = {"attempt_id": uuid.uuid4().hex, "log_sha256": expected_log}
+            intent = {
+                "attempt_id": uuid.uuid4().hex,
+                "log_sha256": expected_log,
+                "failure": failure,
+            }
             pending["legacy_reconciliation"] = intent
             self.persist()
         if intent["log_sha256"] != expected_log:
             raise Blocked("legacy reconciliation proof changed")
+        if (
+            intent.get("failure", {"exit_status": 1, "failure_reason": "dirty_surface"})
+            != failure
+        ):
+            raise Blocked("legacy reconciliation failure proof changed")
         attempt = {
             "attempt_id": intent["attempt_id"],
             "engine": pending["engine"],
             "round": pending["round"],
             "folder": pending["folder"],
             "review_started": False,
-            "exit_status": 1,
             "phase": "preflight_failed",
-            "failure_reason": "dirty_surface",
             "legacy_log_sha256": expected_log,
+            **failure,
         }
         evidence = {
             "version": 1,
             "attempt_id": attempt["attempt_id"],
             "phase": "preflight",
             "review_started": False,
-            "failure_reason": "dirty_surface",
+            "failure_reason": failure["failure_reason"],
             "proof": "explicit legacy reconciliation against pinned pre-execution exit",
             "legacy_log_sha256": expected_log,
         }
+        if "legacy_controller_log" in failure:
+            evidence.update(failure)
         marker = folder / "launch.json"
         if marker.exists() or marker.is_symlink():
             if read(marker) != evidence:
@@ -947,6 +1352,8 @@ class Runner:
             argv.append("--require-dco")
         for check in config["checks"]:
             argv.extend(["--check", check])
+        if config.get("scope_decision"):
+            argv.extend(["--scope-decision", config["scope_decision"]])
         if (self.state.get("pending") or {}).get("phase") == "preflight_failed":
             argv.append("--recover-preflight")
         intent = (self.state.get("pending") or {}).get("legacy_reconciliation")
@@ -958,6 +1365,15 @@ class Runner:
                     intent["log_sha256"],
                 ]
             )
+            failure = intent.get("failure", {})
+            if "legacy_controller_log" in failure:
+                argv.extend(
+                    [
+                        "--legacy-controller-log",
+                        failure["legacy_controller_log"],
+                        failure["legacy_controller_log_sha256"],
+                    ]
+                )
         return shlex.join(argv)
 
     def decision(self, head: str) -> dict[str, Any]:
@@ -992,14 +1408,34 @@ class Runner:
             str(result_path),
         ]
         result = self.helper("ledger", "validate-result", *fields)
-        if result["status"] == "blocked":
-            raise Blocked(
-                "reviewer reported blocked; inspect saved result and recover the owed pass"
-            )
         # A late failure after result creation must not be silently accepted.
         if pending["phase"] != "returned":
             raise Blocked(
                 "worker exit is unknown; reconcile before accepting its saved result"
+            )
+        recovery_sha256 = pending.get("result_recovery_sha256")
+        if recovery_sha256:
+            recovery = folder / "result.json.recovery.json"
+            if digest(recovery) != recovery_sha256:
+                raise Blocked("completed result recovery evidence changed")
+            self.helper(
+                "ledger",
+                "recover-result",
+                "--repo",
+                self.args.repo,
+                "--pr",
+                str(self.args.pr),
+                *fields,
+                "--expected-recovery-sha256",
+                recovery_sha256,
+                "--historical-comment-ids-file",
+                str(folder / "historical.json"),
+            )
+            result = self.helper("ledger", "validate-result", *fields)
+        if result["status"] == "blocked":
+            raise Blocked(
+                "reviewer reported blocked without recoverable completed evidence; "
+                "inspect saved result and recover the owed pass"
             )
         self.dco(head)
         if not (folder / "validated.json").exists():
@@ -1037,7 +1473,8 @@ class Runner:
         summary.write_text(
             f"Runner-verified {pending['engine']} pass {pending['round']} at {head}.\n"
             f"Base: {self.state['base']}. Result: {result['status']}.\n"
-            "Required unfiltered validation commands passed at this exact head:\n"
+            + self.settings_line(pending["engine"])
+            + "Required unfiltered validation commands passed at this exact head:\n"
             + "\n".join(self.state["config"]["checks"])
             + "\n"
         )
@@ -1075,6 +1512,17 @@ class Runner:
             raise Blocked("ledger did not advance by exactly the authorized pass")
         self.state.update(head=head, completed=passes, pending=None, status="running")
         self.persist()
+
+    def settings_line(self, engine: str) -> str:
+        settings = self.state.get("review_settings", {}).get(engine)
+        if not settings:
+            return "Reviewer settings: not recorded by this run.\n"
+        if engine in self.state.get("fallback_engines", []):
+            settings = {**settings["fallback"], "source": "capacity fallback"}
+        return (
+            f"Reviewer settings: model {settings['model']}, "
+            f"effort {settings['effort']} ({settings['source']}).\n"
+        )
 
     def run(self) -> str:
         self.initialize()
@@ -1114,6 +1562,11 @@ class Runner:
                 config["plan"],
                 "--authorization-file",
                 str(self.directory / "authorization.txt"),
+                *(
+                    ["--scope-decision", config["scope_decision"]]
+                    if config.get("scope_decision")
+                    else []
+                ),
             )
             self.state["run_id"] = started["run_id"]
             self.persist()
@@ -1183,6 +1636,10 @@ class Runner:
                     self.reconcile_legacy_preflight(pending, legacy_proof)
                 if pending["phase"] == "preflight_failed":
                     self.recover_preflight(pending)
+                elif pending["phase"] == "capacity_failed":
+                    self.recover_capacity(pending)
+                elif pending["phase"] == "cleanup_blocked":
+                    self.recover_cleanup(pending)
                 elif pending["phase"] == "prepared":
                     self.launch(pending)
                 else:
@@ -1234,7 +1691,12 @@ class Runner:
                 raise Blocked("pass directory cannot be a symlink")
             folder.mkdir(mode=0o700, exist_ok=True)
             if any(
-                p.name not in ("before-threads.json", "historical.json")
+                p.name
+                not in (
+                    "before-threads.json",
+                    "before-comments.json",
+                    "historical.json",
+                )
                 or p.is_symlink()
                 or not p.is_file()
                 for p in folder.iterdir()
@@ -1243,6 +1705,7 @@ class Runner:
                     "unexpected uncheckpointed pass evidence; reconcile before launch"
                 )
             ids = self.threads(folder / "before-threads.json")
+            self.comments(folder / "before-comments.json")
             save(folder / "historical.json", ids)
             pending = {
                 "engine": engine,
@@ -1254,6 +1717,8 @@ class Runner:
                 # relaunch it.
                 "phase": "prepared",
                 "historical_sha256": digest(folder / "historical.json"),
+                "before_threads_sha256": digest(folder / "before-threads.json"),
+                "before_comments_sha256": digest(folder / "before-comments.json"),
             }
             self.state["pending"] = pending
             self.persist()
@@ -1288,6 +1753,11 @@ def main(argv: list[str] | None = None) -> int:
         help="public-safe scope and tier rationale",
     )
     parser.add_argument("--require-dco", action="store_true")
+    parser.add_argument(
+        "--scope-decision",
+        choices=("keep", "split"),
+        help="scope decision forwarded to start-run when its scope checkpoint fires",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--recover-preflight",
@@ -1305,6 +1775,12 @@ def main(argv: list[str] | None = None) -> int:
         help="explicitly verify a supported v1 pre-execution rejection log",
     )
     parser.add_argument(
+        "--legacy-controller-log",
+        nargs=2,
+        metavar=("PATH", "SHA256"),
+        help="original v1 controller output and reviewed hash proving Git exit 128",
+    )
+    parser.add_argument(
         "--repair-installation",
         action="store_true",
         help="preserve and replace the managed installation at its existing pins",
@@ -1320,6 +1796,13 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error(
             "legacy proof requires --recover-preflight and the reviewed log SHA256"
+        )
+    if args.legacy_controller_log and (
+        not args.reconcile_legacy_preflight
+        or not re.fullmatch(r"[0-9a-f]{64}", args.legacy_controller_log[1])
+    ):
+        parser.error(
+            "legacy controller log requires legacy reconciliation and its SHA256"
         )
     if not re.fullmatch(r"[0-9a-f]{40}", args.base):
         parser.error("--base must be a pinned full commit SHA")
