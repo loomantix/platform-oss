@@ -161,6 +161,8 @@ allowed_destinations:
   - .agents/references/roles/security-reviewer.md
   - .agents/references/local-review-ledger.md
   - .agents/REVIEW_WORKFLOW.md
+  - .github/workflows/review-glance-label.yml
 
 allow_sensitive_writes:
   - .github/workflows/dco.yml
+  - .github/workflows/review-glance-label.yml
