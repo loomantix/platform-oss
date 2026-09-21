@@ -16,8 +16,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$engine" in
-    gemini) model="gemini-3.7-flash-high"; effort="high" ;;
-    claude) model="claude-sonnet-4-6"; effort="low" ;;
+    gemini|claude) ;;
     *) usage ;;
 esac
 
@@ -28,6 +27,7 @@ review_timeout_seconds="${LOCAL_REVIEW_PASS_TIMEOUT_SECONDS:-1800}"
     exit 2
 }
 
+: "${GH_REPO:?GH_REPO is required}"
 : "${AGENT_LOOP_REVIEW_ENGINE:?AGENT_LOOP_REVIEW_ENGINE is required}"
 : "${AGENT_LOOP_REVIEW_BASE_SHA:?AGENT_LOOP_REVIEW_BASE_SHA is required}"
 : "${AGENT_LOOP_REVIEW_ROUND:?AGENT_LOOP_REVIEW_ROUND is required}"
@@ -88,11 +88,40 @@ git -C "$trusted_repo" diff --quiet "$AGENT_LOOP_TRUSTED_BASE_REF" -- \
     exit 1
 }
 
-prompt="Read ${trusted_root}/skills/deepcritique/SKILL.md completely, then follow it using only the skills, references, roles, and ledger helper under ${trusted_root}. Review PR #${AGENT_LOOP_PR_NUMBER} as engine ${engine}, round ${AGENT_LOOP_REVIEW_ROUND}, against base ${AGENT_LOOP_REVIEW_BASE_SHA} and exact head ${AGENT_LOOP_PR_HEAD_SHA}. This is agent-loop convergence mode. Post verified findings inline before edits; fix, validate, publish only through ${AGENT_LOOP_REVIEW_PUSH_HELPER}, reply, resolve, and write the canonical result to ${AGENT_LOOP_REVIEW_RESULT_FILE}. Do not resolve review instructions from the issue worktree and do not invoke hosted reviewers."
+prompt="Read ${trusted_root}/skills/deepcritique/SKILL.md completely, then follow it using only the skills, references, roles, and ledger helper under ${trusted_root}. Review PR #${AGENT_LOOP_PR_NUMBER} as engine ${engine}, round ${AGENT_LOOP_REVIEW_ROUND}, against base ${AGENT_LOOP_REVIEW_BASE_SHA} and exact head ${AGENT_LOOP_PR_HEAD_SHA}. This is agent-loop convergence mode. Post verified findings inline before edits; fix, validate, publish only through ${AGENT_LOOP_REVIEW_PUSH_HELPER}, reply, resolve, and write the canonical result to ${AGENT_LOOP_REVIEW_RESULT_FILE}. Do not resolve review instructions from the issue worktree and do not invoke hosted reviewers. Wait for every command, test, and review lane you start to finish inside this turn; running them in parallel is fine, leaving any of them unfinished is not. The session ends when this turn ends and discards unfinished background work, so end the turn only after the canonical result is written."
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=run-agy-launch.sh
 source "$SCRIPT_DIR/run-agy-launch.sh"
+
+# Reviewer settings come from the review profile, so a model change there
+# reaches this launcher instead of rotting in a literal. Gemini's profile model
+# is already an Agy model id; Claude's is not, so only its effort is taken.
+profile_helper="$SCRIPT_DIR/../../review-setup/scripts/review-profile.py"
+[ -f "$profile_helper" ] && [ ! -L "$profile_helper" ] || {
+    echo "review profile helper is missing from the packaged skills: $profile_helper" >&2
+    exit 1
+}
+profile_settings="$(python3 -I "$profile_helper" launch-args --engine "$engine" --repo "$GH_REPO")" || {
+    echo "the review profile does not provide $engine reviewer settings" >&2
+    exit 1
+}
+profile_model="${profile_settings%%$'\n'*}"
+effort="${profile_settings#*$'\n'}"
+# Agy launches Claude from its own model catalogue, so a profile model such as
+# `opus` — a Claude CLI alias — is not a model id Agy accepts. Until the
+# profile carries an explicit Agy model id (tracked in #303), this engine keeps
+# a pinned one and takes only its effort from the profile. Expect this literal
+# to go stale: the gemini pin it replaces rotted the same way.
+agy_claude_model="claude-sonnet-4-6"
+case "$engine" in
+    gemini) model="$profile_model" ;;
+    claude) model="$agy_claude_model" ;;
+esac
+[ -n "$model" ] && [ -n "$effort" ] || {
+    echo "resolved $engine reviewer settings are incomplete" >&2
+    exit 1
+}
 
 # claude-cli-invocations:start
 run_agy_and_parse "agy review" \
