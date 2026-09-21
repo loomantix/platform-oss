@@ -13,6 +13,20 @@ creation, local review convergence, and final readiness. A worker only implement
 commits locally — by default it is the Claude CLI, but any command can be
 substituted via `worker_hook`.
 
+## Review profile preflight
+
+Run this before launching any reviewer, worker, or runner. When
+`AGENT_LOOP_NONINTERACTIVE=1` or `AGENT_LOOP_REVIEW_ENGINE` is set (a launcher or
+runner started this pass), skip it: the run uses its pinned values,
+and a launcher that reports missing settings is the blocker to report. Otherwise
+run `python3 -I .claude/skills/review-setup/scripts/review-profile.py check`.
+Exit 0 means continue. Exit 3 with `"configured": true` and only `ENGINE.worker.*`
+keys in `missing` also means continue: no review run reads worker settings, and
+storing them rewrites the shared profile in a schema older helper copies refuse.
+Any other exit 3 means settings are missing: follow
+`/review-setup` "Inline setup" in this conversation, then continue this request
+from where it paused. Report any other exit verbatim and stop.
+
 ## Usage
 
 ```bash
@@ -60,15 +74,15 @@ with the issue worktree as the current directory.
 | `setup_hook`                                     | Isolated bootstrap, such as `pnpm install --frozen-lockfile`. Never symlink mutable dependency directories.                                                                                                  |
 | `validation_hook`                                | Bounded validation after the worker, after each review, and after fresh-base integration.                                                                                                                    |
 | `review_contract_version`                        | New and migrated consumers use `3`; version `2` remains temporarily accepted for staged sync compatibility.                                                                                                  |
-| `config_doctor`                                  | Run the non-mutating compatibility preflight before issue selection or claim, including that each review hook's CLI resolves on `PATH`.                                                                      |
-| `claude_effort_policy`                           | Optional literal Claude effort policy enforced by the doctor.                                                                                                                                                |
+| `config_doctor`                                  | Run the compatibility preflight after settings are pinned and before issue selection or claim, including that each review hook's CLI resolves on `PATH`.                                                     |
+| `claude_effort_policy`                           | Retired. The doctor refuses a non-empty value; `config-doctor.py --migrate` removes it.                                                                                                                      |
 | `review_max_rounds`                              | Codex→Claude round cap from `1` through the hard ceiling `4`. Default `4`; exhaustion preserves the draft PR.                                                                                                |
 | `review_timeout_seconds`                         | Positive wall-clock budget for one issue's review, persisted across resume. Default `7200`; each review pass and its validation is capped at the smaller of the remaining budget and `hook_timeout_seconds`. |
 | `claude_review_hook`                             | Required local Claude PR review. Reads the ledger, comments before fixes, publishes through `$AGENT_LOOP_REVIEW_PUSH_HELPER`, replies, and resolves.                                                         |
 | `codex_review_hook`                              | Required local Codex PR review with the same ledger contract.                                                                                                                                                |
 | `worker_hook`                                    | Optional worker command override. Default is the Claude CLI in headless, auto-approving mode.                                                                                                                |
-| `worker_model`, `worker_fallback_model`          | Primary and capacity-fallback models for the default worker.                                                                                                                                                 |
-| `worker_effort`                                  | `--effort` for the default worker. Empty means the CLI or environment default (the doctor warns); when `claude_effort_policy` is set the two must match.                                                     |
+| `worker_model`, `worker_fallback_model`          | Retired. The default worker's model and fallback come from the review profile; the doctor refuses a non-empty value and `--migrate` removes the keys.                                                        |
+| `worker_effort`                                  | Retired, like `worker_model`. The default worker's effort comes from the review profile.                                                                                                                     |
 | `worker_retries`                                 | Retries after clean capacity/timeout failures. Default `1`.                                                                                                                                                  |
 | `worker_timeout_seconds`, `hook_timeout_seconds` | Bounded execution time.                                                                                                                                                                                      |
 | `retry_on_timeout`, `retry_delay_seconds`        | Timeout retry policy.                                                                                                                                                                                        |
@@ -84,7 +98,9 @@ fresh fetch plus `AGENT_LOOP_PR_NUMBER`, `AGENT_LOOP_PR_URL`,
 `AGENT_LOOP_PR_HEAD_SHA`, `AGENT_LOOP_REVIEW_ENGINE`, and
 `AGENT_LOOP_REVIEW_ROUND`, `AGENT_LOOP_REVIEW_BASE_SHA`, and under contract v3
 `AGENT_LOOP_REVIEW_ACTOR`, `AGENT_LOOP_REVIEW_RESULT_FILE`, and
-`AGENT_LOOP_REVIEW_PUSH_HELPER`. Every successfully completed clean or changed
+`AGENT_LOOP_REVIEW_PUSH_HELPER`. Every hook and the default worker also receive
+`AGENT_LOOP_NONINTERACTIVE=1` and the pinned settings described under Review
+Settings. Every successfully completed clean or changed
 hook calls `review-ledger.js write-result`, which derives the complete
 same-engine/same-round fixed, deferred, and dismissed fingerprint set and writes
 the canonical result. A changed result requires at least one fixed finding. A
@@ -114,6 +130,42 @@ that override for a mutating run; execute the consumer's synced script instead.
 Do not put secrets, credentials, PHI, customer identifiers, or user data in
 config values or hook output. The wrapper deliberately uses a generic PR body
 and never copies issue bodies, model logs, or findings into GitHub.
+
+## Review Settings
+
+Reviewer and worker model and effort come from the per-user review profile,
+never from this config. At startup, before any issue is selected or claimed,
+the wrapper resolves the Codex and Claude reviewer settings and the Claude
+worker settings through `.claude/skills/critique/scripts/review-settings.py`,
+logs each pinned pair once, and exports them to every hook and the default
+worker:
+
+- `AGENT_LOOP_CODEX_MODEL`, `AGENT_LOOP_CODEX_EFFORT`
+- `AGENT_LOOP_CLAUDE_MODEL`, `AGENT_LOOP_CLAUDE_EFFORT`
+- `AGENT_LOOP_CLAUDE_WORKER_MODEL`, `AGENT_LOOP_CLAUDE_WORKER_EFFORT`
+
+Each also has a `_SOURCE` variable naming where it came from. Inherited values
+of these variables are discarded. The pins are recorded in each issue's run
+state, and `--resume-run` launches with the recorded pins even after the
+profile changes or is removed; a profile edit applies to the next run.
+
+With no profile, a missing key, or a required engine marked `unavailable`, the
+wrapper exits `4` before any issue mutation and prints one line naming the
+missing keys and the next step: run the review-setup skill, then rerun
+agent-loop.
+
+A capacity rejection switches that engine to its pinned fallback once per
+issue and reports the model and effort now in use:
+
+- Worker: a failed attempt whose log matches the capacity patterns and left the
+  worktree unchanged retries on the fallback, within `worker_retries`.
+- Reviewer (contract v3, Codex only; the profile pins no Claude reviewer
+  fallback): a hook that exits `1` without a result, whose log's last terminal
+  JSON event is Codex's `Selected model is at capacity` error, and that left no
+  commit, push, ledger thread, or PR comment reruns in the same round on the
+  same budget (`retry: model-capacity`). The hook must run `codex exec --json`
+  so that event reaches its log; plain output never matches. Without a pinned
+  fallback, or on a second rejection, the pass stops with `hook-failed`.
 
 ## Review Budget
 
@@ -186,8 +238,7 @@ Consumers wanting a structured result on timeout must have the hook honor
 
 When `worker_hook` is unset, the wrapper runs the Claude CLI in
 `--permission-mode bypassPermissions --print` mode against the issue prompt,
-adding `--model` from `worker_model` and `--effort` from `worker_effort` when
-they are set.
+adding `--model` and `--effort` from the pinned Claude worker settings.
 That is the only `claude` invocation in the script, and it is bracketed by
 `# claude-cli-invocations:start` / `:end` markers. The upstream CI gate
 `.claude/lint-claude-cli-invocations.py` hashes the locked region and refuses
@@ -200,26 +251,34 @@ is not required on `PATH`.
 
 ## Model Selection
 
-The loop runs three model-backed aspects, and they are configured in two
-different places. This is the most common onboarding question, so it is spelled
-out here.
+The loop runs three model-backed aspects, and all three take their model and
+effort from the review profile. This is the most common onboarding question, so
+it is spelled out here.
 
-| Aspect         | Where the model is chosen                | Effort control                                                          |
-| -------------- | ---------------------------------------- | ----------------------------------------------------------------------- |
-| Default worker | `worker_model` / `worker_fallback_model` | `worker_effort`, validated against `claude_effort_policy` when both set |
-| Codex review   | inside `codex_review_hook`               | inside the same command                                                 |
-| Claude review  | inside `claude_review_hook`              | inside the same command, and validated against `claude_effort_policy`   |
+| Aspect         | Where the model is chosen                              | Effort control |
+| -------------- | ------------------------------------------------------ | -------------- |
+| Default worker | review profile `claude.worker`, applied by the wrapper | same           |
+| Codex review   | review profile `codex`, read by `codex_review_hook`    | same           |
+| Claude review  | review profile `claude`, read by `claude_review_hook`  | same           |
 
-A review hook is a literal shell command, so reviewer model and effort are
-ordinary flags on that command rather than dedicated config keys. These
-fragments show flag placement only; a working hook must also carry
-`AGENT_LOOP_REVIEW_PUSH_HELPER`, `AGENT_LOOP_REVIEW_RESULT_FILE`, and
-`write-result`, or contract-v3 preflight rejects it:
+A review hook is a literal shell command, so it passes the pinned reviewer
+settings as ordinary flags, reading them from the variables above. A hook that
+hard-codes a model or effort ignores the profile, and a capacity fallback
+switch cannot reach it. These fragments show flag placement only; a working
+hook must also carry `AGENT_LOOP_REVIEW_PUSH_HELPER`,
+`AGENT_LOOP_REVIEW_RESULT_FILE`, and `write-result`, or contract-v3 preflight
+rejects it:
 
 ```
-claude_review_hook = claude --print --effort low --model <model-id> /deepcritique ... </dev/null
-codex_review_hook  = codex exec -c model_reasoning_effort=medium ... /deepcritique ... </dev/null
+claude_review_hook = claude --print $([ "$AGENT_LOOP_CLAUDE_MODEL" = inherit ] || printf -- '--model %s' "$AGENT_LOOP_CLAUDE_MODEL") --effort "$AGENT_LOOP_CLAUDE_EFFORT" /deepcritique ... </dev/null
+codex_review_hook  = codex exec --json $([ "$AGENT_LOOP_CODEX_MODEL" = inherit ] || printf -- '-m %s' "$AGENT_LOOP_CODEX_MODEL") -c model_reasoning_effort="$AGENT_LOOP_CODEX_EFFORT" ... /deepcritique ... </dev/null
 ```
+
+A pinned model of `inherit` means "pass no model flag" so the CLI's own
+configured default applies; the default profile sets `codex.model` to
+`inherit`. A hook must drop its model flag for that value, for example with
+`$([ "$AGENT_LOOP_CODEX_MODEL" = inherit ] || printf -- '-m %s' "$AGENT_LOOP_CODEX_MODEL")`.
+The default worker does this itself.
 
 Every hook and the default worker run with stdin redirected from `/dev/null`;
 the wrapper does this itself, so the trailing `</dev/null` above is belt and
@@ -235,17 +294,21 @@ that moves a long command, such as a test suite, to the background can end its
 turn with that command still running: it exits 0 and writes no result. The
 doctor warns when a hook sets the variable to anything else or unsets it.
 
-`claude_effort_policy` constrains `claude_review_hook` and, when the default
-worker is in use, `worker_effort` — both only when `config_doctor = true`, since
-the doctor is what enforces it and the key is inert without it. An empty
-`worker_effort` is not neutral either: the worker then runs at whatever the CLI
-or the launching environment defaults to, and nothing records which.
+With `config_doctor = true`, the doctor refuses a review hook whose model or
+effort flag (`--model`, `--effort`, `-m`, `-c model=`,
+`-c model_reasoning_effort=`) names a literal that differs from the run's
+pinned settings, and warns when the literal matches. Flag-like text inside a
+quoted argument, such as the prompt, is not a flag. Run it standalone to check
+against the resolved review profile. `config-doctor.py --project-dir <repo>
+--migrate` rewrites those literals in `claude_review_hook` and
+`codex_review_hook` to the variables above, turning a model flag into the
+`inherit`-safe form shown earlier, and removes the retired keys; every other
+line is kept, and a second run changes nothing.
 
-`worker_model` and `worker_fallback_model` configure the **default** worker
-only. When `worker_hook` is set the wrapper runs that hook verbatim and both
-keys are ignored, so a hook pins its own model, in the hook. For the default
-worker, `worker_fallback_model` is used only after a clean capacity failure that
-left the worktree unchanged; a timeout retries on the primary model.
+The default worker always runs on the pinned Claude worker settings. When
+`worker_hook` is set the wrapper runs that hook verbatim, and the hook reads
+the same settings from `AGENT_LOOP_CLAUDE_WORKER_MODEL` and
+`AGENT_LOOP_CLAUDE_WORKER_EFFORT`. A timeout retries on the settings in use.
 
 ### Choosing per aspect
 
@@ -259,10 +322,6 @@ So reviewer choice dominates _cost_, while worker choice dominates _how many
 rounds are needed_ — round one consistently produces the most findings, and a
 cleaner first draft is what removes a round. A round costs far more than a
 worker pass, so the cheapest slot is usually the one worth upgrading.
-
-Leaving `worker_model` empty is not a neutral default: the default worker then
-runs on whatever the CLI currently defaults to, which moves with CLI releases.
-Pin it.
 
 ### Current limitation: the engine roster is fixed
 
