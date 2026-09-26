@@ -38,7 +38,7 @@ done
 script_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launch_state() { python3 -I "$script_dir/review-launch-state.py" "$@"; }
 launch_state preflight missing_tool
-review_timeout_seconds="${LOCAL_REVIEW_PASS_TIMEOUT_SECONDS:-1800}"
+review_timeout_seconds="${LOCAL_REVIEW_PASS_TIMEOUT_SECONDS:-3600}"
 [[ "$review_timeout_seconds" =~ ^[1-9][0-9]*$ ]] && \
     [ "$review_timeout_seconds" -le 3600 ] || {
     echo "LOCAL_REVIEW_PASS_TIMEOUT_SECONDS must be an integer from 1 through 3600" >&2
@@ -326,7 +326,7 @@ edits, then validate, push, reply, resolve, and publish the normal review result
 This invocation owns exactly one Gemini pass: do not invoke Codex, Claude,
 another reviewer, or any review launcher. Return control to the calling
 session when the Gemini pass is complete.
-Wait for every command, test, and review lane you start to finish inside this turn; running them in parallel is fine, leaving any of them unfinished is not. The session ends when this turn ends and discards unfinished background work, so end the turn only after the canonical result is written."
+Do not spawn subagents or background review lanes in this Agy print-mode pass. Run each review lane sequentially in series within the primary session. In each lane pass, post verified findings inline, apply fixes, and validate before proceeding to the next lane so subsequent lanes review the updated code and prior findings. Run all commands and tests synchronously in the foreground; never leave background tasks running. Write the canonical result and end the turn only after all lanes and validation are complete."
 if [ -n "${ACTIVELOOM_REVIEW_SURFACE:-}" ]; then
     prompt="Read ${agy_surface_root}/skills/deepcritique/SKILL.md and follow it for this pass.
 ${prompt#*$'\n'}"

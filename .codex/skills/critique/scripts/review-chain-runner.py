@@ -27,6 +27,28 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+VALIDATION_CONTRACT = ".activeloom-review.json"
+VALIDATION_BASE_ENVIRONMENT = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+)
+VALIDATION_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+VALIDATION_GATE_NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
+SENSITIVE_ENVIRONMENT_NAME = re.compile(
+    r"(?:^|_)(?:AUTH|CREDENTIALS?|KEY|PASSWORD|PASS|SECRETS?|TOKENS?)(?:_|$)",
+    re.IGNORECASE,
+)
+RESERVED_VALIDATION_ENVIRONMENT = re.compile(
+    r"(?:ACTIVELOOM|AGENT_LOOP|GITHUB|GIT|SSH)_", re.IGNORECASE
+)
+
 LAUNCHERS = {
     "codex": "run-codex-review.py",
     "claude": "run-claude-review.sh",
@@ -102,6 +124,21 @@ def capacity_rejected(log: Path) -> bool:
     return rejected
 
 
+def claude_provider_500(log: Path) -> bool:
+    """Recognize Claude's sole provider diagnostic, never reviewer output."""
+    if log.is_symlink() or not log.is_file():
+        return False
+    if log.stat().st_size > 4096:
+        return False
+    lines = log.read_text(errors="replace").splitlines()
+    # bash emits one setlocale warning per LC_* variable it cannot honour.
+    while lines and lines[0].startswith("bash: warning: setlocale:"):
+        lines = lines[1:]
+    return len(lines) == 1 and lines[0].startswith(
+        "API Error: 500 Internal server error."
+    )
+
+
 # Codex emits thread.started within about a second of launch; a worker still
 # silent after this bound stalled before contacting the model.
 CODEX_STARTUP_SECONDS = 180
@@ -134,6 +171,9 @@ AGY_IDLE = re.compile(
     r"root agent idle; waiting up to \d+s for [1-9]\d* background task\(s\)\s*$"
 )
 AGY_TERMINATE = re.compile(r"terminating [1-9]\d* background task\(s\) on exit\s*$")
+AGY_SUBAGENT_WAIT = re.compile(
+    r"^I will wait for .*\bsubagents?\b.*\bfinish\b.*\.\s*$"
+)
 
 
 def agy_idle_exit(log: Path) -> bool:
@@ -141,13 +181,53 @@ def agy_idle_exit(log: Path) -> bool:
     if log.is_symlink() or not log.is_file():
         return False
     idle = False
+    subagent_waits = 0
     with log.open(errors="replace") as stream:
         for line in stream:
             if AGY_IDLE.search(line):
                 idle = True
             elif idle and AGY_TERMINATE.search(line):
                 return True
-    return False
+            if AGY_SUBAGENT_WAIT.search(line):
+                subagent_waits += 1
+    # Some Agy builds omit their runtime idle diagnostics and expose only the
+    # root agent repeatedly yielding while delegated reviewers remain pending.
+    # Missing result, clean evidence, exit 0 and execution-phase admission are
+    # verified separately before this classification can authorize one retry.
+    return subagent_waits >= 2
+
+
+def agy_incomplete_exit(log: Path) -> bool:
+    """An Agy worker returned normally but left no canonical result."""
+    return log.is_file() and not log.is_symlink()
+
+
+AGY_NOOP_REFACTOR = re.compile(
+    r"^<!-- local-review-refactor:v1 engine=gemini "
+    r"head=(?P<head>[0-9a-f]{40}) outcome=no-op -->$"
+)
+
+
+def allowed_agy_incomplete_comments(
+    before: Any, current: Any, actor: str, head: str
+) -> bool:
+    """Allow only the idempotent Gemini cleanup marker from the incomplete pass."""
+    if (
+        not isinstance(before, list)
+        or not isinstance(current, list)
+        or current[: len(before)] != before
+        or len(current) != len(before) + 1
+    ):
+        return False
+    row = current[-1]
+    if not isinstance(row, dict) or row.get("author") != actor:
+        return False
+    body = row.get("body")
+    lines = body.strip().splitlines() if isinstance(body, str) else []
+    if not lines:
+        return False
+    match = AGY_NOOP_REFACTOR.fullmatch(lines[0].strip())
+    return bool(match and match.group("head") == head)
 
 
 def digest(path: Path) -> str:
@@ -182,6 +262,187 @@ def command(argv: list[str]) -> str:
             f"{Path(argv[0]).name} operation failed (exit {result.returncode})"
         )
     return result.stdout.strip()
+
+
+def json_digest(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting ambiguous duplicate keys."""
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise Blocked(f"duplicate validation contract key: {key}")
+        value[key] = item
+    return value
+
+
+def strict_keys(value: dict[str, Any], allowed: set[str], label: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        raise Blocked(f"unknown {label} field: {sorted(unknown)[0]}")
+
+
+def validation_environment_values(value: Any, gate: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise Blocked(f"validation gate {gate} environment must be an object")
+    result: dict[str, str] = {}
+    for name, item in value.items():
+        if (
+            not isinstance(name, str)
+            or not VALIDATION_ENVIRONMENT_NAME.fullmatch(name)
+            or name in VALIDATION_BASE_ENVIRONMENT
+            or SENSITIVE_ENVIRONMENT_NAME.search(name)
+            or RESERVED_VALIDATION_ENVIRONMENT.match(name)
+        ):
+            raise Blocked(f"validation gate {gate} has forbidden environment name")
+        if not isinstance(item, str) or "\0" in item or "\n" in item or "\r" in item:
+            raise Blocked(f"validation gate {gate} environment values must be one line")
+        result[name] = item
+    return result
+
+
+def validation_path(value: Any, gate: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith(("/", "!"))
+        or "\\" in value
+        or "\0" in value
+        or "\n" in value
+        or "\r" in value
+        or ".." in Path(value).parts
+    ):
+        raise Blocked(f"validation gate {gate} has an unsafe path pattern")
+    return value
+
+
+def validation_path_matches(path: str, pattern: str) -> bool:
+    """Match repository paths with slash-aware ``*`` and recursive ``**``."""
+    expression = ""
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                index += 2
+                if index < len(pattern) and pattern[index] == "/":
+                    expression += "(?:.*/)?"
+                    index += 1
+                else:
+                    expression += ".*"
+                continue
+            expression += "[^/]*"
+        elif character == "?":
+            expression += "[^/]"
+        else:
+            expression += re.escape(character)
+        index += 1
+    return re.fullmatch(expression, path) is not None
+
+
+def parse_validation_contract(raw: bytes) -> dict[str, Any]:
+    if len(raw) > 256 * 1024:
+        raise Blocked("validation contract exceeds 256 KiB")
+    try:
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Blocked("validation contract must be valid UTF-8 JSON") from error
+    if not isinstance(document, dict):
+        raise Blocked("validation contract must be a JSON object")
+    strict_keys(document, {"schema_version", "fallback_gate", "gates"}, "contract")
+    if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        raise Blocked("validation contract schema_version must be 1")
+    fallback = document.get("fallback_gate")
+    gates = document.get("gates")
+    if not isinstance(fallback, str) or not VALIDATION_GATE_NAME.fullmatch(fallback):
+        raise Blocked("validation contract fallback_gate is invalid")
+    if not isinstance(gates, dict) or not gates:
+        raise Blocked("validation contract gates must be a nonempty object")
+    parsed: dict[str, Any] = {}
+    for name, gate in gates.items():
+        if not isinstance(name, str) or not VALIDATION_GATE_NAME.fullmatch(name):
+            raise Blocked("validation contract gate name is invalid")
+        if not isinstance(gate, dict):
+            raise Blocked(f"validation gate {name} must be an object")
+        strict_keys(
+            gate, {"paths", "always", "commands", "environment"}, f"gate {name}"
+        )
+        paths = gate.get("paths", [])
+        always = gate.get("always", False)
+        commands = gate.get("commands")
+        if not isinstance(paths, list) or any(
+            not isinstance(path, str) for path in paths
+        ):
+            raise Blocked(f"validation gate {name} paths must be a list")
+        if type(always) is not bool:
+            raise Blocked(f"validation gate {name} always must be boolean")
+        if name != fallback and (bool(paths) == always):
+            raise Blocked(
+                f"validation gate {name} must declare paths or always true, not both"
+            )
+        if name == fallback and (paths or always):
+            raise Blocked("the fallback validation gate must not declare paths or always")
+        if not isinstance(commands, list) or not commands:
+            raise Blocked(f"validation gate {name} commands must be nonempty")
+        parsed_commands: list[list[str]] = []
+        for item in commands:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"argv"}
+                or not isinstance(item["argv"], list)
+                or not item["argv"]
+                or any(
+                    not isinstance(argument, str)
+                    or not argument
+                    or "\0" in argument
+                    or "\n" in argument
+                    or "\r" in argument
+                    for argument in item["argv"]
+                )
+            ):
+                raise Blocked(
+                    f"validation gate {name} commands require nonempty argv arrays"
+                )
+            parsed_commands.append(item["argv"])
+        parsed[name] = {
+            "paths": [validation_path(path, name) for path in paths],
+            "always": always,
+            "commands": parsed_commands,
+            "environment": validation_environment_values(
+                gate.get("environment", {}), name
+            ),
+        }
+    if fallback not in parsed:
+        raise Blocked("validation contract fallback_gate does not exist")
+    return {
+        "schema_version": 1,
+        "fallback_gate": fallback,
+        "gates": parsed,
+    }
+
+
+def validate_contract_command() -> int:
+    root = Path(command(["git", "rev-parse", "--show-toplevel"])).resolve()
+    if Path.cwd().resolve() != root:
+        raise Blocked("validate the contract from the repository worktree root")
+    path = Path(VALIDATION_CONTRACT)
+    checksum = digest(path)
+    contract = parse_validation_contract(path.read_bytes())
+    print(
+        json.dumps(
+            {
+                "status": "valid",
+                "path": VALIDATION_CONTRACT,
+                "schema_version": contract["schema_version"],
+                "gates": list(contract["gates"]),
+                "sha256": checksum,
+            }
+        )
+    )
+    return 0
 
 
 def managed(
@@ -392,6 +653,40 @@ class Runner:
             raise Blocked("authenticated actor changed")
         return head
 
+    def repository_root(self) -> Path:
+        return Path(command(["git", "rev-parse", "--show-toplevel"])).resolve()
+
+    def target_revision(self) -> str:
+        """Pin the live tip of the PR's base branch as the policy revision.
+
+        GitHub's ``baseRefOid`` is refreshed lazily and can trail the base
+        branch by several merges, which hides a validation contract that has
+        already landed there. Resolve the branch tip from the remote instead
+        and fetch it so ``git ls-tree`` can read the contract locally.
+        """
+        branch = command(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(self.args.pr),
+                "--repo",
+                self.args.repo,
+                "--json",
+                "baseRefName",
+                "--jq",
+                ".baseRefName",
+            ]
+        )
+        revision = command(
+            ["git", "ls-remote", "--exit-code", "origin", "refs/heads/" + branch]
+        ).split()[0]
+        command(["git", "fetch", "--quiet", "--no-tags", "origin", revision])
+        return revision
+
+    def merge_base(self, target: str, head: str) -> str:
+        return command(["git", "merge-base", target, head])
+
     def threads(self, path: Path) -> list[int]:
         owner, name = self.args.repo.split("/")
         query = """query($owner:String!,$name:String!,$number:Int!,$endCursor:String){
@@ -469,9 +764,186 @@ class Runner:
                     f"DCO sign-off missing on {sha}; no history rewrite is authorized"
                 )
 
+    def validation_contract(self, revision: str) -> dict[str, Any] | None:
+        """Load the consumer contract from the trusted target revision."""
+        entry = subprocess.run(
+            [
+                "git",
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                revision,
+                "--",
+                VALIDATION_CONTRACT,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if entry.returncode:
+            raise Blocked("git operation failed while locating validation contract")
+        if not entry.stdout:
+            return None
+        try:
+            metadata, path = entry.stdout.removesuffix(b"\0").split(b"\t", 1)
+            mode, kind, object_id = metadata.split(b" ", 2)
+        except ValueError as error:
+            raise Blocked("git returned malformed validation contract metadata") from error
+        if (
+            path != VALIDATION_CONTRACT.encode()
+            or kind != b"blob"
+            or not mode.startswith(b"100")
+            or not re.fullmatch(rb"[0-9a-f]{40,64}", object_id)
+        ):
+            raise Blocked("validation contract must be a regular file in the base")
+        blob = subprocess.run(
+            ["git", "cat-file", "blob", object_id.decode()],
+            capture_output=True,
+            timeout=120,
+        )
+        if blob.returncode:
+            raise Blocked("git operation failed while reading validation contract")
+        parsed = parse_validation_contract(blob.stdout)
+        return {
+            "mode": "contract-v1",
+            "path": VALIDATION_CONTRACT,
+            "policy_revision": revision,
+            "manifest_sha256": hashlib.sha256(blob.stdout).hexdigest(),
+            "contract": parsed,
+            "base_environment": {
+                name: os.environ[name]
+                for name in VALIDATION_BASE_ENVIRONMENT
+                if name in os.environ
+            },
+        }
+
+    def changed_paths(self, base: str, head: str) -> list[str]:
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                f"{base}...{head}",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode:
+            raise Blocked("git operation failed while resolving validation gates")
+        try:
+            return [
+                item.decode("utf-8")
+                for item in result.stdout.split(b"\0")
+                if item
+            ]
+        except UnicodeDecodeError as error:
+            raise Blocked("validation gate paths must be UTF-8") from error
+
+    def resolved_validation(self, head: str) -> dict[str, Any]:
+        validation = self.state["config"].get("validation")
+        if not validation:
+            return {
+                "mode": "legacy",
+                "gates": [],
+                "commands": [
+                    {
+                        "argv": shlex.split(check),
+                        "environment": dict(os.environ),
+                    }
+                    for check in self.state["config"]["checks"]
+                ],
+            }
+        contract = validation["contract"]
+        fallback = contract["fallback_gate"]
+        paths = self.changed_paths(self.state["base"], head)
+        selected: list[str] = []
+        unmatched = not paths
+        for name, gate in contract["gates"].items():
+            if name == fallback:
+                continue
+            if gate["always"]:
+                selected.append(name)
+                continue
+            if any(
+                validation_path_matches(path, pattern)
+                for path in paths
+                for pattern in gate["paths"]
+            ):
+                selected.append(name)
+        for path in paths:
+            if not any(
+                validation_path_matches(path, pattern)
+                for name, gate in contract["gates"].items()
+                if name != fallback and not gate["always"]
+                for pattern in gate["paths"]
+            ):
+                unmatched = True
+                break
+        if unmatched:
+            selected.append(fallback)
+        commands: list[dict[str, Any]] = []
+        seen: dict[str, int] = {}
+        for name in selected:
+            gate = contract["gates"][name]
+            environment = {
+                **validation["base_environment"],
+                **gate["environment"],
+            }
+            for argv in gate["commands"]:
+                identity = json_digest([argv, environment])
+                if identity in seen:
+                    commands[seen[identity]]["gates"].append(name)
+                    continue
+                seen[identity] = len(commands)
+                commands.append(
+                    {
+                        "argv": argv,
+                        "environment": environment,
+                        "gates": [name],
+                    }
+                )
+        return {
+            "mode": validation["mode"],
+            "gates": selected,
+            "commands": commands,
+            "manifest_sha256": validation["manifest_sha256"],
+            "changed_paths_sha256": json_digest(paths),
+            "environment_sha256": json_digest(
+                [command["environment"] for command in commands]
+            ),
+        }
+
     def initialize(self) -> None:
+        if Path.cwd().resolve() != self.repository_root():
+            raise Blocked("run the review chain from the repository worktree root")
         head = self.boundary()
-        config = {
+        base = command(["git", "rev-parse", "--verify", self.args.base + "^{commit}"])
+        legacy_checkpoint = bool(
+            self.state
+            and "validation_policy_revision" not in self.state["config"]
+        )
+        if legacy_checkpoint:
+            policy_revision = None
+            validation = None
+        elif self.state:
+            policy_revision = self.state["config"]["validation_policy_revision"]
+            validation = self.validation_contract(policy_revision)
+        else:
+            policy_revision = self.target_revision()
+            if self.merge_base(policy_revision, head) != base:
+                raise Blocked("--base must equal the pull request merge base")
+            validation = self.validation_contract(policy_revision)
+        checks = self.args.check or []
+        if not legacy_checkpoint and validation and checks:
+            raise Blocked(
+                f"{VALIDATION_CONTRACT} exists in the pinned target policy; remove --check"
+            )
+        if not legacy_checkpoint and not validation and not checks:
+            raise Blocked(
+                f"no {VALIDATION_CONTRACT} exists in the pinned target policy; pass --check"
+            )
+        config: dict[str, Any] = {
             "repo": self.args.repo,
             "pr": self.args.pr,
             "worktree": str(Path.cwd()),
@@ -480,16 +952,22 @@ class Runner:
             "trigger": self.args.trigger,
             "mode": "chain" if self.args.chain else "cycle",
             "plan": self.args.chain or self.args.cycle,
-            "checks": self.args.check,
+            "checks": checks,
             "base_argument": self.args.base,
             "require_dco": self.args.require_dco
             or Path(".github/workflows/dco.yml").is_file(),
         }
+        if validation:
+            config["validation"] = validation
+        if policy_revision is not None:
+            config["validation_policy_revision"] = policy_revision
         # Added only when set, so a checkpoint written before the flag existed
         # still resumes with the same arguments.
         scope_decision = getattr(self.args, "scope_decision", None)
         if scope_decision:
             config["scope_decision"] = scope_decision
+        if getattr(self.args, "restart", False):
+            config["restart"] = True
         if self.state:
             if self.state.get("version") not in (1, 2):
                 raise Blocked("unsupported checkpoint version")
@@ -546,7 +1024,6 @@ class Runner:
             )
         (self.directory / "authorization.txt").write_text(auth)
         os.chmod(self.directory / "authorization.txt", 0o600)
-        base = command(["git", "rev-parse", "--verify", self.args.base + "^{commit}"])
         self.state = {
             "version": 2,
             "config": config,
@@ -915,6 +1392,14 @@ class Runner:
             if len(attempts) != 1:
                 raise Blocked("idle-exit retry origin changed")
             self.verify_retry_evidence(pending, attempts[0], "idle_exit")
+        if origin := pending.get("incomplete_exit_origin"):
+            attempts = [
+                item for item in self.state["attempts"]
+                if item["attempt_id"] == origin
+            ]
+            if len(attempts) != 1:
+                raise Blocked("incomplete-exit retry origin changed")
+            self.verify_retry_evidence(pending, attempts[0], "incomplete_exit")
         if origin := pending.get("startup_stall_origin"):
             attempts = [
                 item for item in self.state["attempts"]
@@ -923,6 +1408,14 @@ class Runner:
             if len(attempts) != 1:
                 raise Blocked("startup-stall retry origin changed")
             self.verify_retry_evidence(pending, attempts[0], "startup_stall")
+        if origin := pending.get("provider_500_origin"):
+            attempts = [
+                item for item in self.state["attempts"]
+                if item["attempt_id"] == origin
+            ]
+            if len(attempts) != 1:
+                raise Blocked("provider-error retry origin changed")
+            self.verify_retry_evidence(pending, attempts[0], "provider_500")
         attempt = {
             "attempt_id": uuid.uuid4().hex,
             "engine": pending["engine"],
@@ -982,7 +1475,7 @@ class Runner:
                 digest(recovery) if recovery.exists() else None
             )
             if pending["engine"] == "gemini":
-                self.classify_idle_exit(pending, attempt, folder)
+                self.classify_incomplete_exit(pending, attempt, folder)
         except (
             Blocked,
             OSError,
@@ -1045,6 +1538,19 @@ class Runner:
                                 log_sha256=digest(folder / "worker.log"),
                             )
                             pending["phase"] = "startup_stall_failed"
+                        elif (
+                            pending["engine"] == "claude"
+                            and isinstance(caught, ProcessFailure)
+                            and caught.exit_status == 1
+                            and claude_provider_500(folder / "worker.log")
+                        ):
+                            attempt.update(
+                                review_started=True,
+                                phase="provider_500_failed",
+                                failure_reason="claude_provider_500",
+                                log_sha256=digest(folder / "worker.log"),
+                            )
+                            pending["phase"] = "provider_500_failed"
             if isinstance(caught, CleanupBlocked):
                 attempt.update(
                     failure_reason="cleanup_denied",
@@ -1061,7 +1567,9 @@ class Runner:
                     pending.update(phase="cleanup_blocked", **seal)
         finally:
             self.persist()
-        if error and pending["phase"] not in ("capacity_failed", "startup_stall_failed"):
+        if error and pending["phase"] not in (
+            "capacity_failed", "startup_stall_failed", "provider_500_failed"
+        ):
             raise error
 
     def seal_completed(self, folder: Path) -> dict[str, Any] | None:
@@ -1122,10 +1630,10 @@ class Runner:
         attempt["cleanup_reconciled"] = True
         self.persist()
 
-    def classify_idle_exit(
+    def classify_incomplete_exit(
         self, pending: dict[str, Any], attempt: dict[str, Any], folder: Path
     ) -> None:
-        """Mark a returned Agy pass that wrote nothing because its turn ended early."""
+        """Mark a returned Agy pass that ended without its canonical result."""
         marker = folder / "launch.json"
         if (
             any(
@@ -1134,7 +1642,7 @@ class Runner:
             )
             or marker.is_symlink()
             or not marker.is_file()
-            or not agy_idle_exit(folder / "worker.log")
+            or not agy_incomplete_exit(folder / "worker.log")
         ):
             return
         try:
@@ -1148,19 +1656,22 @@ class Runner:
             or evidence.get("phase") != "execution"
         ):
             return
+        idle = agy_idle_exit(folder / "worker.log")
+        phase = "idle_exit_failed" if idle else "incomplete_exit_failed"
         attempt.update(
-            phase="idle_exit_failed",
-            failure_reason="agy_idle_exit",
+            phase=phase,
+            failure_reason="agy_idle_exit" if idle else "agy_incomplete_exit",
             launch_sha256=digest(marker),
             log_sha256=digest(folder / "worker.log"),
         )
-        pending["phase"] = "idle_exit_failed"
+        pending["phase"] = phase
 
     def verify_retry_evidence(
         self, pending: dict[str, Any], attempt: dict[str, Any], kind: str
     ) -> None:
         """Verify the original failure both during recovery and at the retry launch."""
         exit_status: int | None
+        outputs: tuple[str, ...]
         if kind == "capacity":
             label, failure, exit_status = "capacity fallback", "capacity failure", 1
             proven, outputs = capacity_rejected, ("result.json",)
@@ -1170,10 +1681,26 @@ class Runner:
             )
             proven = codex_startup_stalled
             outputs = ("result.json", "result.json.recovery.json")
-        else:
+        elif kind == "provider_500":
+            label, failure, exit_status = (
+                "provider-error retry", "Claude provider 500", 1
+            )
+            proven = claude_provider_500
+            outputs = ("result.json", "result.json.recovery.json")
+        elif kind == "idle_exit":
             label, failure, exit_status = "idle-exit retry", "Agy idle exit", 0
             proven = agy_idle_exit
             outputs = ("result.json", "result.json.recovery.json")
+        elif kind == "incomplete_exit":
+            label, failure, exit_status = (
+                "incomplete-exit retry",
+                "Agy incomplete exit",
+                0,
+            )
+            proven = agy_incomplete_exit
+            outputs = ("result.json", "result.json.recovery.json")
+        else:
+            raise Blocked(f"unknown retry evidence kind: {kind}")
         if (
             self.boundary() != pending["before"]
             or self.state["head"] != pending["before"]
@@ -1213,6 +1740,17 @@ class Runner:
             current = folder / f"{prefix}-{name}.json"
             capture(current)
             if digest(current) != digest(before):
+                if (
+                    kind in ("idle_exit", "incomplete_exit")
+                    and name == "comments"
+                    and allowed_agy_incomplete_comments(
+                        read(before),
+                        read(current),
+                        str(self.state["actor"]),
+                        pending["before"],
+                    )
+                ):
+                    continue
                 raise Blocked(
                     f"review evidence changed; {label} requires reconciliation"
                 )
@@ -1267,7 +1805,7 @@ class Runner:
         label: str,
     ) -> Path:
         """Copy the pre-pass snapshots into a fresh retry folder, resumably."""
-        folder = self.directory / pending["folder"]
+        folder = self.directory / str(pending["folder"])
         retry = folder / directory
         recovery = pending.get(key)
         if recovery is None:
@@ -1330,7 +1868,11 @@ class Runner:
     def recover_idle_exit(self, pending: dict[str, Any]) -> None:
         """Relaunch the same pinned Agy pass once without changing round or budget."""
         self.verify_control()
-        if pending["engine"] != "gemini" or pending.get("idle_exit_origin"):
+        if (
+            pending["engine"] != "gemini"
+            or pending.get("idle_exit_origin")
+            or pending.get("incomplete_exit_origin")
+        ):
             raise Blocked(
                 "Agy ended its turn again before writing a result; no further retry"
             )
@@ -1350,6 +1892,66 @@ class Runner:
         print(
             f"Agy idle exit: retrying {pending['engine']} pass {pending['round']} "
             f"once at {pending['before']}",
+            flush=True,
+        )
+
+    def recover_incomplete_exit(self, pending: dict[str, Any]) -> None:
+        """Relaunch one clean Agy exit that omitted its canonical result."""
+        self.verify_control()
+        if (
+            pending["engine"] != "gemini"
+            or pending.get("incomplete_exit_origin")
+            or pending.get("idle_exit_origin")
+        ):
+            raise Blocked(
+                "Agy ended its turn again before writing a result; no further retry"
+            )
+        attempt = self.state["attempts"][-1]
+        if attempt.get("attempt_id") != pending.get("attempt_id"):
+            raise Blocked("incomplete-exit retry transaction changed")
+        self.verify_retry_evidence(pending, attempt, "incomplete_exit")
+        retry = self.stage_retry(
+            pending,
+            attempt,
+            "incomplete_exit_recovery",
+            "incomplete-retry",
+            "incomplete-exit retry",
+        )
+        pending.update(
+            folder=str(retry.relative_to(self.directory)),
+            phase="prepared",
+            incomplete_exit_origin=attempt["attempt_id"],
+        )
+        pending.pop("incomplete_exit_recovery")
+        self.persist()
+        print(
+            f"Agy incomplete exit: retrying {pending['engine']} pass "
+            f"{pending['round']} once at {pending['before']}",
+            flush=True,
+        )
+
+    def recover_provider_500(self, pending: dict[str, Any]) -> None:
+        """Retry a clean Claude provider failure once at the same head and round."""
+        self.verify_control()
+        if pending["engine"] != "claude" or pending.get("provider_500_origin"):
+            raise Blocked("Claude provider 500 recurred; no further retry")
+        attempt = self.state["attempts"][-1]
+        if attempt.get("attempt_id") != pending.get("attempt_id"):
+            raise Blocked("provider-error retry transaction changed")
+        self.verify_retry_evidence(pending, attempt, "provider_500")
+        retry = self.stage_retry(
+            pending, attempt, "provider_500_recovery", "provider-retry",
+            "provider-error retry",
+        )
+        pending.update(
+            folder=str(retry.relative_to(self.directory)), phase="prepared",
+            provider_500_origin=attempt["attempt_id"],
+        )
+        pending.pop("provider_500_recovery")
+        self.persist()
+        print(
+            f"Claude provider 500: retrying pass {pending['round']} once "
+            f"at {pending['before']}",
             flush=True,
         )
 
@@ -1688,21 +2290,32 @@ class Runner:
                 "inspect saved result and recover the owed pass"
             )
         self.dco(head)
+        validation = self.resolved_validation(head)
+        expected_validation = {
+            "head": head,
+            "result": result["resultSha256"],
+        }
+        if validation["mode"] != "legacy":
+            expected_validation.update(
+                {
+                    "mode": validation["mode"],
+                    "gates": validation["gates"],
+                    "manifest_sha256": validation["manifest_sha256"],
+                    "changed_paths_sha256": validation["changed_paths_sha256"],
+                    "environment_sha256": validation["environment_sha256"],
+                }
+            )
         if not (folder / "validated.json").exists():
-            for index, check in enumerate(self.state["config"]["checks"]):
+            for index, check in enumerate(validation["commands"]):
                 managed(
-                    shlex.split(check), folder / f"check-{index}.log", dict(os.environ)
+                    check["argv"],
+                    folder / f"check-{index}.log",
+                    check["environment"],
                 )
             if self.boundary() != head:
                 raise Blocked("validation changed the reviewed head")
-            save(
-                folder / "validated.json",
-                {"head": head, "result": result["resultSha256"]},
-            )
-        if read(folder / "validated.json") != {
-            "head": head,
-            "result": result["resultSha256"],
-        }:
+            save(folder / "validated.json", expected_validation)
+        if read(folder / "validated.json") != expected_validation:
             raise Blocked("saved validation does not name this exact head and result")
         self.threads(folder / "threads.json")
         intermediate = (
@@ -1720,12 +2333,20 @@ class Runner:
         )
         save(folder / "heads.json", [pending["before"], *intermediate])
         summary = folder / "summary.txt"
+        validation_label = (
+            "Legacy caller-supplied validation commands"
+            if validation["mode"] == "legacy"
+            else "Repository-declared validation gates "
+            + ", ".join(validation["gates"])
+            + f" (manifest {validation['manifest_sha256']})"
+        )
         summary.write_text(
             f"Runner-verified {pending['engine']} pass {pending['round']} at {head}.\n"
             f"Base: {self.state['base']}. Result: {result['status']}.\n"
             + self.settings_line(pending["engine"])
-            + "Required unfiltered validation commands passed at this exact head:\n"
-            + "\n".join(self.state["config"]["checks"])
+            + validation_label
+            + " passed at this exact head:\n"
+            + "\n".join(shlex.join(check["argv"]) for check in validation["commands"])
             + "\n"
         )
         self.decision(head)
@@ -1807,6 +2428,7 @@ class Runner:
                 config["plan"],
                 "--authorization-file",
                 str(self.directory / "authorization.txt"),
+                *(["--restart"] if config.get("restart") else []),
                 *(
                     ["--scope-decision", config["scope_decision"]]
                     if config.get("scope_decision")
@@ -1885,8 +2507,12 @@ class Runner:
                     self.recover_capacity(pending)
                 elif pending["phase"] == "idle_exit_failed":
                     self.recover_idle_exit(pending)
+                elif pending["phase"] == "incomplete_exit_failed":
+                    self.recover_incomplete_exit(pending)
                 elif pending["phase"] == "startup_stall_failed":
                     self.recover_startup_stall(pending)
+                elif pending["phase"] == "provider_500_failed":
+                    self.recover_provider_500(pending)
                 elif pending["phase"] == "cleanup_blocked":
                     self.recover_cleanup(pending)
                 elif pending["phase"] == "prepared":
@@ -1975,6 +2601,13 @@ class Runner:
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--validate-contract"]:
+        try:
+            return validate_contract_command()
+        except (Blocked, OSError, ValueError, KeyError) as error:
+            print(f"validation contract invalid: {error}", file=sys.stderr)
+            return 2
     if os.environ.get("AGENT_LOOP_REVIEW_RESULT_FILE"):
         raise Blocked("a one-pass reviewer cannot start another chain runner")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1993,8 +2626,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="append",
-        required=True,
-        help="required full-suite command (argv syntax; no shell)",
+        help=(
+            "legacy required full-suite command (argv syntax; no shell); omit when "
+            f"the pinned target policy contains {VALIDATION_CONTRACT}"
+        ),
     )
     parser.add_argument(
         "--authorization-file",
@@ -2008,6 +2643,11 @@ def main(argv: list[str] | None = None) -> int:
         help="scope decision forwarded to start-run when its scope checkpoint fires",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="explicitly authorize a new run after the prior run has ended",
+    )
     parser.add_argument(
         "--recover-preflight",
         action="store_true",
@@ -2034,7 +2674,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="preserve and replace the managed installation at its existing pins",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     if (
         args.recover_preflight or args.migrate_controller or args.repair_installation
     ) and not args.resume:
@@ -2060,7 +2700,7 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.cycle) != args.until_converged:
         parser.error("--cycle requires --until-converged; --chain does not use it")
     if (args.tier == "deep") != (args.trigger is not None) or any(
-        not shlex.split(c) for c in args.check
+        not shlex.split(c) for c in (args.check or [])
     ):
         parser.error("Deep requires a trigger; Lean has none; checks must not be empty")
     if args.trigger is not None and not re.fullmatch(r"[1-6](?:,[1-6])*", args.trigger):
