@@ -73,7 +73,7 @@ to waive provenance for this public-source package.
 
 Checked 2026-09-08: [npm staged publishing](https://docs.npmjs.com/staged-publishing/)
 requires an existing package, Node >=22.14.0 and npm >=11.15.0.
-Node 24.18.0 includes npm 11.16.0; both build and stage assert that CLI version.
+Node 26.10.0 includes npm 11.19.1; both build and stage assert that CLI version.
 [Trusted publishing](https://docs.npmjs.com/trusted-publishers/) supports
 GitHub-hosted runners and binds owner, repository, workflow filename and the
 `npm-publish` environment. Configure its allowed actions to stage only, with
