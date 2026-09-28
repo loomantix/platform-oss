@@ -50,7 +50,8 @@ finding and disposition in the PR.
 
 Follow "Pass Telemetry" in `.agents/REVIEW_WORKFLOW.md`. After resolving the
 mandatory pass identity and before diff classification, run the usage helper's
-`snapshot`. On every terminal path, including skip and blocked, finalize the
+`snapshot`, or reuse the runner's key and snapshot per "Runner-owned boundary"
+when it opened the boundary. On every terminal path, including skip and blocked, finalize the
 review result first, then run `delta` and attempt emission only when `emit` is
 true. Report publication failures and unavailable usage explicitly. A failure
 before identity resolution reports `telemetry not emitted: boundary unresolved`.
@@ -229,6 +230,17 @@ The orchestrator owns command execution. After all lanes finish, deduplicate and
 verify their hypotheses, apply any fixes, then run one consolidated validation
 pass against the final head. Do not multiply the same validation across parallel
 lanes.
+
+In an Agy print-mode pass or automated review pass, do not spawn subagents or
+background review lanes. Execute the review lanes sequentially in series within
+the primary session. In each lane pass, inspect the assigned scope, post verified
+findings inline to the PR ledger, apply justified fixes, and validate before
+proceeding to the next lane. Subsequent lanes review the updated code along with
+prior lane findings and fixes, avoiding redundant analysis of resolved defects.
+Run all shell commands and test suites synchronously in the foreground; never leave
+background tasks running. Write the canonical result and end the turn only after all
+lanes and validation are complete. Report review depth using the appropriate local
+multi-pass fallback label.
 
 Read the repo-local review addendum first. Check for
 `.review/addendum.local.md` in the repository under review; if it exists, read it

@@ -15,13 +15,75 @@ that exceeds the selected cap is rejected, never silently promoted.
 
 Place the user's authorization, scope and tier rationale in a public-safe text
 file outside the worktree. Its contents are posted to the PR. Do not include
-credentials or confidential context. Pass each required unfiltered test/build
-command with `--check`; these run without a shell, in the review worktree, after
-each worker and before attestation. Include coverage thresholds and other
-repository-required gates explicitly. Commands are published in pass summaries,
-so do not embed credentials in them. Scoped tests are not a substitute.
+credentials or confidential context. Prefer the repository-declared validation
+contract below. Its selected commands run without a shell, in the review
+worktree, after each worker and before attestation. Commands are published in
+pass summaries, so they must not contain credentials. Scoped tests are not a
+substitute for the declared gate.
 
-Example for a repository whose required baseline is `pnpm check`:
+### Repository-declared validation
+
+An opted-in consumer owns `.activeloom-review.json` at its repository root. For
+a new run, the runner pins that policy from the pull request's current target
+commit and separately verifies that `--base` is the merge base of the target and
+head. A stale feature branch therefore receives policy newly adopted on its
+target, while the pull request cannot supply or weaken its own contract. After
+each reviewer the runner matches every path changed between the merge base and
+the exact reviewed head. All matching gates are additive. If any path is
+unmatched, or the diff is empty, the mandatory fallback gate is added.
+
+```json
+{
+  "schema_version": 1,
+  "fallback_gate": "full",
+  "gates": {
+    "baseline": {
+      "always": true,
+      "commands": [{ "argv": ["just", "typecheck"] }]
+    },
+    "backend": {
+      "paths": ["apps/backend/**", "packages/shared/**"],
+      "environment": { "NODE_ENV": "development" },
+      "commands": [{ "argv": ["just", "test", "backend"] }]
+    },
+    "full": { "commands": [{ "argv": ["just", "test"] }] }
+  }
+}
+```
+
+The fallback gate has neither `paths` nor `always`. Every other gate declares
+either at least one path or `"always": true`, never both. Always gates run
+alongside selected path gates but do not claim ownership of paths, so an
+unmatched file still selects the fallback. Commands are nonempty argv arrays,
+never shell strings. Gate environments accept only explicit, one-line values.
+Common credential-like names and controller variables are refused as defense in
+depth, but name filtering cannot prove a value is safe: this committed public
+file must never contain a secret. The runner starts from a small allowlist of
+local process values (`PATH`, home/user/shell, locale and timezone), pins those
+values in the checkpoint, and adds the gate's declared environment. Other
+ambient values do not reach validation commands. A resume with different
+allowlisted values blocks instead of silently changing the gate.
+
+The contract is consumer-owned and is not created or rewritten by ActiveLoom
+sync. A pull request that first adds or changes it continues to use the pinned
+target policy; the new contract takes effect after it reaches the target branch.
+Validate the proposed worktree copy in that pull request before merging it:
+
+```bash
+python3 .codex/skills/critique/scripts/review-chain-runner.py --validate-contract
+```
+
+Repositories without this file retain the legacy interface: pass every required
+unfiltered command with repeatable `--check`. Legacy commands retain their
+historical ambient environment and should be migrated to the contract. Once the
+pinned target policy contains the contract, the runner rejects `--check` instead of
+allowing an ad hoc gate to bypass repository policy.
+
+Start the runner from the repository worktree root. It refuses a package or
+subdirectory working directory so a repository command cannot silently acquire
+narrower package-manager semantics.
+
+Legacy example for a repository that has not adopted the contract:
 
 ```bash
 python3 .codex/skills/critique/scripts/review-chain-runner.py \\
@@ -54,6 +116,9 @@ These are alternative plans, not consecutive commands for the same active run.
 - `--scope-decision keep|split` records the decision `start-run` requires when
   its scope checkpoint fires (see REVIEW_WORKFLOW.md). It becomes part of the
   saved plan, so pass the same value with `--resume`.
+- `--restart` explicitly authorizes a fresh run after the prior authenticated
+  run has ended. It is recorded in the checkpoint and forwarded to `start-run`;
+  it does not revive or erase the earlier run.
 
 ## Reviewer settings
 
@@ -86,7 +151,21 @@ pinned fallback for the remainder of the run. The failed attempt and snapshots
 remain in the checkpoint; the retry uses the same round and remaining budget.
 Attestations name the fallback model and effort. A second capacity rejection,
 changed evidence, unknown failure, authentication error, or timeout blocks.
-Standalone launchers and other engines do not retry.
+Standalone launchers do not perform this model fallback.
+
+A Claude reviewer that reached execution and then exits 1 with only the CLI's
+`API Error: 500 Internal server error.` diagnostic may retry once in
+`<pass>/provider-retry`. A 500 taken while the launch marker still reads
+`preflight` is a preflight failure and takes that path instead, and a 500 whose
+launch marker is missing or does not match this attempt blocks rather than
+retrying. The runner first
+confirms process cleanup, the unchanged local/remote/PR head, clean worktree,
+unchanged comments and review threads, no result or recovery sidecar, and the
+same owed pass. It keeps the run, round, model, and original attempt evidence.
+The retry rechecks that evidence immediately before launch and survives an
+interrupted preparation via `--resume`. A second 500, other output, any partial
+review evidence, a timeout, or an unknown exit blocks for reconciliation.
+Standalone launchers do not retry.
 
 The Codex one-pass launcher uses ephemeral noninteractive execution; its provider
 remains the Codex CLI configuration. Its unattended
@@ -143,8 +222,59 @@ State, private logs and result files live under the Git common directory's
 `activeloom-review/<owner>-<repo>-<pr>/`. A per-PR lock prevents concurrent
 runners in linked worktrees. Keep this directory for recovery; do not delete
 it to obtain another budget. Plans, actor, tier, base and control hashes are
-checked on resume. Changes to the pinned runner require deliberate migration,
-not execution from an unverified replacement.
+checked on resume. Repository-declared validation also pins the target policy
+revision, resolved schema, and allowlisted execution environment. Changes to the
+pinned runner require deliberate migration, not execution from an unverified
+replacement.
+
+### Pass telemetry
+
+The runner owns each launched pass's telemetry boundary. Before the launcher
+starts, it mints the `review` pass key and takes the start snapshot with the
+worker engine's own usage helper into `<pass>/telemetry-boundary/`, records the
+key and snapshot digest in the checkpoint, and hands the directory to the worker
+as `$AGENT_LOOP_TELEMETRY_DIR`. Workers run in ephemeral sessions with no usage
+log, so the snapshot deliberately names a log that never exists. Every delta
+that passes that log as `--session-log` then reports `unavailable` rather than
+measuring another session.
+
+For a worker observed returning successfully, the checkpoint also records its
+elapsed launcher time using a monotonic clock. Fallback telemetry uses that
+interval when extraction is enabled and no usage-derived duration exists. It
+includes launcher setup and cleanup, excludes later controller validation and
+operator waiting, and does not imply measured tokens or model identity. Older
+checkpoints and attempts without an observed successful return keep duration
+unavailable.
+
+For managed Gemini passes, the Agy launcher retains a numeric-only receipt from
+its successful single-turn JSON result. The runner binds the receipt to the
+attempt and its observed return hash, aggregates every invocation in an
+automatic retry of the same pass, then publishes after the worker exits.
+Worker emission is disabled for that managed boundary to avoid an earlier
+unavailable record consuming the same idempotency key. Extraction and emission
+opt-outs still apply independently. Missing, changed, resumed-session, or invalid
+receipts remain unavailable; no transcript or response text is retained.
+
+Agy's aggregate counts have no observed model or per-lens identity. They use a
+v3 telemetry record with one `model: null`, `effort: null` bucket. Input, output,
+cache reads and thinking remain separate; thinking is not added to output.
+The CLI total is preserved as `providerBuckets.total_tokens`; cache writes stay
+unknown. Its token source is `terminal-json`, not `session-log-delta`. Existing
+known-model records remain v1; v2 remains reserved for the assurance contract.
+Analytics readers must support v3 before enabling this producer; older pinned chains keep their old behavior.
+Standalone Gemini helpers without a managed receipt still report unavailable.
+
+When the pass settles, the runner publishes the record itself if no marker
+carries that key yet. A counted pass reports its result's status. A pass whose
+worker returned without a result or with a blocked one, or failed mid-review,
+reports `blocked`. Launches that the runner retries automatically, and workers
+whose exit is unknown, are not settled and emit nothing: the worker may still
+publish under the key. The runner derives finding counts from this pass's own threads.
+It emits nothing when a count is unknowable: cleanup findings sharing the pass,
+or a new fingerprint on a PR that already has a `fixed` disposition, which
+needs the reviewer's blame trace. Telemetry failures are logged and never
+block or fail a pass. A checkpoint written before this boundary existed has no
+key, so its pending pass leaves telemetry to the reviewer.
 
 Exit outcomes:
 
@@ -160,19 +290,32 @@ fixed plan records `exhausted` as its terminal marker; checkpoint/output retain
 the more precise `plan-complete` reason. Neither grants extra passes.
 
 Agy's print mode ends the session when the root agent ends its turn, and
-discards background lanes or tests that are still running. The Agy launchers
-therefore tell Gemini to finish every command, test and review lane inside the
-turn. When a Gemini worker still exits 0 without a result and its log shows
-Agy's idle-termination lines, the runner verifies the same unchanged evidence as
-the capacity fallback and relaunches that pass once, with the same round, budget
-and pinned settings. A second idle exit, any partial result, changed evidence, or
-a failed exit blocks.
+terminates background shell commands after a short drain timeout (5 seconds).
+The Agy launchers therefore prohibit subagents and background review lanes during
+print-mode passes. Each review lane runs sequentially in series within the primary
+session. In each lane pass, the worker posts verified findings inline, applies
+justified fixes, and validates before proceeding to the next lane, ensuring subsequent
+lanes evaluate the updated code and prior findings without wasted repetition. Every
+shell command and test suite executes synchronously in the foreground. The worker
+writes the canonical result and ends the turn only after all lanes and validation
+finish. When a Gemini worker still exits 0 without a result, the runner verifies
+the execution-phase launch marker, unchanged head and owed pass, absent result
+and recovery sidecar, unchanged review threads, and unchanged issue comments.
+It then relaunches that pass once with the same round, budget and pinned
+settings. A single exact-head Gemini no-op cleanup marker is the only permitted
+comment delta because cleanup precedes the review lanes and that marker is
+idempotent. A second incomplete exit, any other changed evidence, a partial
+result, or a failed exit blocks.
 
-Recognizing that log is plain text matching, not the structured-event parse the
-Codex capacity check uses, and it is not the whole gate: an idle exit whose
-launch marker is missing or is not in the execution phase blocks rather than
-retrying, and what authorizes the relaunch is the unchanged-evidence
-re-verification rather than the strength of the log match.
+Agy's idle-termination lines remain useful for classifying the incomplete exit,
+but recovery no longer depends on model or CLI prose. Recognizing those lines is
+plain text matching, not the structured-event parse the Codex capacity check
+uses. Some Agy builds omit the runtime diagnostics and instead leave only
+repeated root-agent messages that they will wait for unfinished subagents. The
+runner recognizes two or more of those anchored messages as the same idle-exit
+class; a single mention is insufficient. In every case, the structured launch
+boundary and live evidence re-verification authorize the one retry; a missing
+or preflight-only launch marker never does.
 
 Workers never inherit the runner's stdin: the runner starts them on `/dev/null`,
 and the Codex launcher detaches its own stdin as well. `codex exec` reads a
@@ -213,11 +356,11 @@ process-group cleanup; a preflight marker alone cannot authorize a retry.
 Recovery rechecks the live head and ledger, preserves the run ID,
 round, completed passes, original comment snapshots and attempt history, and
 launches only the owed pass. The retry has its own directory. It consumes the
-same remaining run budget. Outside the Codex capacity fallback, the Codex
-startup-stall retry and the Agy idle-exit retry above,
-a missing result, a blocked result without a sealed completed candidate, unknown
-exit, interrupted reviewer, changed head or changed evidence still requires
-reconciliation; none is silently retried or converted into passing evidence.
+same remaining run budget. Outside the Codex capacity fallback, Claude provider-500
+retry, Codex startup-stall retry, and Agy idle-exit or incomplete-exit retry above, a missing result,
+a blocked result without a sealed completed candidate, unknown exit, interrupted
+reviewer, changed head, or changed evidence still requires reconciliation; none
+is silently retried or converted into passing evidence.
 
 Recovery preparation records its intent before staging files so an interruption
 can resume the same transaction. Each launch rechecks the saved run and owed

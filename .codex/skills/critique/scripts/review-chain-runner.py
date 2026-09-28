@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -26,6 +27,28 @@ import uuid
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+VALIDATION_CONTRACT = ".activeloom-review.json"
+VALIDATION_BASE_ENVIRONMENT = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+)
+VALIDATION_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+VALIDATION_GATE_NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
+SENSITIVE_ENVIRONMENT_NAME = re.compile(
+    r"(?:^|_)(?:AUTH|CREDENTIALS?|KEY|PASSWORD|PASS|SECRETS?|TOKENS?)(?:_|$)",
+    re.IGNORECASE,
+)
+RESERVED_VALIDATION_ENVIRONMENT = re.compile(
+    r"(?:ACTIVELOOM|AGENT_LOOP|GITHUB|GIT|SSH)_", re.IGNORECASE
+)
 
 LAUNCHERS = {
     "codex": "run-codex-review.py",
@@ -43,8 +66,38 @@ CONTROL_FILES = [
     "review-profile.py",
     "review-profile.defaults.json",
     "review-settings.py",
+    "telemetry-pass-key.js",
     *LAUNCHERS.values(),
 ]
+TELEMETRY_MARKER = "<!-- local-review-telemetry:v1 -->"
+# Launched workers run without session persistence, so no usage log exists for
+# them. The boundary snapshot names this never-created log, which makes every
+# delta read from it report unavailable usage instead of measuring whichever
+# other session discovery would find.
+EPHEMERAL_SESSION_LOG = "ephemeral-session.jsonl"
+FINDING_MARKER = re.compile(
+    r"<!-- local-review:v3 engine=(?P<engine>codex|claude|gemini|antigravity) "
+    r"round=(?P<round>[1-9][0-9]*) head=[0-9a-f]{40} "
+    r"fingerprint=(?P<fingerprint>[A-Za-z0-9._:/-]+) "
+    r"occurrence=(?P<occurrence>[1-9][0-9]*) "
+    r"severity=(?P<severity>blocking|major|minor|nit) lens=[A-Za-z0-9._:/-]+ "
+    r"content-sha256=[0-9a-f]{64} -->\Z"
+)
+DISPOSITION_MARKER = re.compile(
+    r"<!-- local-review-disposition:v3 engine=(?P<engine>codex|claude|gemini|antigravity) "
+    r"round=(?P<round>[1-9][0-9]*) head=[0-9a-f]{40} "
+    r"fingerprint=(?P<fingerprint>[A-Za-z0-9._:/-]+) "
+    r"occurrence=(?P<occurrence>[1-9][0-9]*) "
+    r"outcome=(?P<outcome>fixed|dismissed|deferred) content-sha256=[0-9a-f]{64} -->\Z"
+)
+REFACTOR_MARKER = re.compile(
+    r"^<!-- local-review-refactor:v1 engine=(?P<engine>[a-z]+) ", re.M
+)
+OUTCOME_BUCKETS = {
+    "fixed": "validFixed",
+    "deferred": "validDeferred",
+    "dismissed": "invalidDismissed",
+}
 # Only this inspected v1 pair supports legacy reconciliation. Git diagnostics
 # also need the controller's terminal log to distinguish exit 128 from review
 # stderr followed by an interrupted or failed invocation.
@@ -102,6 +155,21 @@ def capacity_rejected(log: Path) -> bool:
     return rejected
 
 
+def claude_provider_500(log: Path) -> bool:
+    """Recognize Claude's sole provider diagnostic, never reviewer output."""
+    if log.is_symlink() or not log.is_file():
+        return False
+    if log.stat().st_size > 4096:
+        return False
+    lines = log.read_text(errors="replace").splitlines()
+    # bash emits one setlocale warning per LC_* variable it cannot honour.
+    while lines and lines[0].startswith("bash: warning: setlocale:"):
+        lines = lines[1:]
+    return len(lines) == 1 and lines[0].startswith(
+        "API Error: 500 Internal server error."
+    )
+
+
 # Codex emits thread.started within about a second of launch; a worker still
 # silent after this bound stalled before contacting the model.
 CODEX_STARTUP_SECONDS = 180
@@ -134,6 +202,9 @@ AGY_IDLE = re.compile(
     r"root agent idle; waiting up to \d+s for [1-9]\d* background task\(s\)\s*$"
 )
 AGY_TERMINATE = re.compile(r"terminating [1-9]\d* background task\(s\) on exit\s*$")
+AGY_SUBAGENT_WAIT = re.compile(
+    r"^I will wait for .*\bsubagents?\b.*\bfinish\b.*\.\s*$"
+)
 
 
 def agy_idle_exit(log: Path) -> bool:
@@ -141,13 +212,53 @@ def agy_idle_exit(log: Path) -> bool:
     if log.is_symlink() or not log.is_file():
         return False
     idle = False
+    subagent_waits = 0
     with log.open(errors="replace") as stream:
         for line in stream:
             if AGY_IDLE.search(line):
                 idle = True
             elif idle and AGY_TERMINATE.search(line):
                 return True
-    return False
+            if AGY_SUBAGENT_WAIT.search(line):
+                subagent_waits += 1
+    # Some Agy builds omit their runtime idle diagnostics and expose only the
+    # root agent repeatedly yielding while delegated reviewers remain pending.
+    # Missing result, clean evidence, exit 0 and execution-phase admission are
+    # verified separately before this classification can authorize one retry.
+    return subagent_waits >= 2
+
+
+def agy_incomplete_exit(log: Path) -> bool:
+    """An Agy worker returned normally but left no canonical result."""
+    return log.is_file() and not log.is_symlink()
+
+
+AGY_NOOP_REFACTOR = re.compile(
+    r"^<!-- local-review-refactor:v1 engine=gemini "
+    r"head=(?P<head>[0-9a-f]{40}) outcome=no-op -->$"
+)
+
+
+def allowed_agy_incomplete_comments(
+    before: Any, current: Any, actor: str, head: str
+) -> bool:
+    """Allow only the idempotent Gemini cleanup marker from the incomplete pass."""
+    if (
+        not isinstance(before, list)
+        or not isinstance(current, list)
+        or current[: len(before)] != before
+        or len(current) != len(before) + 1
+    ):
+        return False
+    row = current[-1]
+    if not isinstance(row, dict) or row.get("author") != actor:
+        return False
+    body = row.get("body")
+    lines = body.strip().splitlines() if isinstance(body, str) else []
+    if not lines:
+        return False
+    match = AGY_NOOP_REFACTOR.fullmatch(lines[0].strip())
+    return bool(match and match.group("head") == head)
 
 
 def digest(path: Path) -> str:
@@ -182,6 +293,187 @@ def command(argv: list[str]) -> str:
             f"{Path(argv[0]).name} operation failed (exit {result.returncode})"
         )
     return result.stdout.strip()
+
+
+def json_digest(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting ambiguous duplicate keys."""
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise Blocked(f"duplicate validation contract key: {key}")
+        value[key] = item
+    return value
+
+
+def strict_keys(value: dict[str, Any], allowed: set[str], label: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        raise Blocked(f"unknown {label} field: {sorted(unknown)[0]}")
+
+
+def validation_environment_values(value: Any, gate: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise Blocked(f"validation gate {gate} environment must be an object")
+    result: dict[str, str] = {}
+    for name, item in value.items():
+        if (
+            not isinstance(name, str)
+            or not VALIDATION_ENVIRONMENT_NAME.fullmatch(name)
+            or name in VALIDATION_BASE_ENVIRONMENT
+            or SENSITIVE_ENVIRONMENT_NAME.search(name)
+            or RESERVED_VALIDATION_ENVIRONMENT.match(name)
+        ):
+            raise Blocked(f"validation gate {gate} has forbidden environment name")
+        if not isinstance(item, str) or "\0" in item or "\n" in item or "\r" in item:
+            raise Blocked(f"validation gate {gate} environment values must be one line")
+        result[name] = item
+    return result
+
+
+def validation_path(value: Any, gate: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith(("/", "!"))
+        or "\\" in value
+        or "\0" in value
+        or "\n" in value
+        or "\r" in value
+        or ".." in Path(value).parts
+    ):
+        raise Blocked(f"validation gate {gate} has an unsafe path pattern")
+    return value
+
+
+def validation_path_matches(path: str, pattern: str) -> bool:
+    """Match repository paths with slash-aware ``*`` and recursive ``**``."""
+    expression = ""
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                index += 2
+                if index < len(pattern) and pattern[index] == "/":
+                    expression += "(?:.*/)?"
+                    index += 1
+                else:
+                    expression += ".*"
+                continue
+            expression += "[^/]*"
+        elif character == "?":
+            expression += "[^/]"
+        else:
+            expression += re.escape(character)
+        index += 1
+    return re.fullmatch(expression, path) is not None
+
+
+def parse_validation_contract(raw: bytes) -> dict[str, Any]:
+    if len(raw) > 256 * 1024:
+        raise Blocked("validation contract exceeds 256 KiB")
+    try:
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Blocked("validation contract must be valid UTF-8 JSON") from error
+    if not isinstance(document, dict):
+        raise Blocked("validation contract must be a JSON object")
+    strict_keys(document, {"schema_version", "fallback_gate", "gates"}, "contract")
+    if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        raise Blocked("validation contract schema_version must be 1")
+    fallback = document.get("fallback_gate")
+    gates = document.get("gates")
+    if not isinstance(fallback, str) or not VALIDATION_GATE_NAME.fullmatch(fallback):
+        raise Blocked("validation contract fallback_gate is invalid")
+    if not isinstance(gates, dict) or not gates:
+        raise Blocked("validation contract gates must be a nonempty object")
+    parsed: dict[str, Any] = {}
+    for name, gate in gates.items():
+        if not isinstance(name, str) or not VALIDATION_GATE_NAME.fullmatch(name):
+            raise Blocked("validation contract gate name is invalid")
+        if not isinstance(gate, dict):
+            raise Blocked(f"validation gate {name} must be an object")
+        strict_keys(
+            gate, {"paths", "always", "commands", "environment"}, f"gate {name}"
+        )
+        paths = gate.get("paths", [])
+        always = gate.get("always", False)
+        commands = gate.get("commands")
+        if not isinstance(paths, list) or any(
+            not isinstance(path, str) for path in paths
+        ):
+            raise Blocked(f"validation gate {name} paths must be a list")
+        if type(always) is not bool:
+            raise Blocked(f"validation gate {name} always must be boolean")
+        if name != fallback and (bool(paths) == always):
+            raise Blocked(
+                f"validation gate {name} must declare paths or always true, not both"
+            )
+        if name == fallback and (paths or always):
+            raise Blocked("the fallback validation gate must not declare paths or always")
+        if not isinstance(commands, list) or not commands:
+            raise Blocked(f"validation gate {name} commands must be nonempty")
+        parsed_commands: list[list[str]] = []
+        for item in commands:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"argv"}
+                or not isinstance(item["argv"], list)
+                or not item["argv"]
+                or any(
+                    not isinstance(argument, str)
+                    or not argument
+                    or "\0" in argument
+                    or "\n" in argument
+                    or "\r" in argument
+                    for argument in item["argv"]
+                )
+            ):
+                raise Blocked(
+                    f"validation gate {name} commands require nonempty argv arrays"
+                )
+            parsed_commands.append(item["argv"])
+        parsed[name] = {
+            "paths": [validation_path(path, name) for path in paths],
+            "always": always,
+            "commands": parsed_commands,
+            "environment": validation_environment_values(
+                gate.get("environment", {}), name
+            ),
+        }
+    if fallback not in parsed:
+        raise Blocked("validation contract fallback_gate does not exist")
+    return {
+        "schema_version": 1,
+        "fallback_gate": fallback,
+        "gates": parsed,
+    }
+
+
+def validate_contract_command() -> int:
+    root = Path(command(["git", "rev-parse", "--show-toplevel"])).resolve()
+    if Path.cwd().resolve() != root:
+        raise Blocked("validate the contract from the repository worktree root")
+    path = Path(VALIDATION_CONTRACT)
+    checksum = digest(path)
+    contract = parse_validation_contract(path.read_bytes())
+    print(
+        json.dumps(
+            {
+                "status": "valid",
+                "path": VALIDATION_CONTRACT,
+                "schema_version": contract["schema_version"],
+                "gates": list(contract["gates"]),
+                "sha256": checksum,
+            }
+        )
+    )
+    return 0
 
 
 def managed(
@@ -392,6 +684,40 @@ class Runner:
             raise Blocked("authenticated actor changed")
         return head
 
+    def repository_root(self) -> Path:
+        return Path(command(["git", "rev-parse", "--show-toplevel"])).resolve()
+
+    def target_revision(self) -> str:
+        """Pin the live tip of the PR's base branch as the policy revision.
+
+        GitHub's ``baseRefOid`` is refreshed lazily and can trail the base
+        branch by several merges, which hides a validation contract that has
+        already landed there. Resolve the branch tip from the remote instead
+        and fetch it so ``git ls-tree`` can read the contract locally.
+        """
+        branch = command(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(self.args.pr),
+                "--repo",
+                self.args.repo,
+                "--json",
+                "baseRefName",
+                "--jq",
+                ".baseRefName",
+            ]
+        )
+        revision = command(
+            ["git", "ls-remote", "--exit-code", "origin", "refs/heads/" + branch]
+        ).split()[0]
+        command(["git", "fetch", "--quiet", "--no-tags", "origin", revision])
+        return revision
+
+    def merge_base(self, target: str, head: str) -> str:
+        return command(["git", "merge-base", target, head])
+
     def threads(self, path: Path) -> list[int]:
         owner, name = self.args.repo.split("/")
         query = """query($owner:String!,$name:String!,$number:Int!,$endCursor:String){
@@ -433,24 +759,12 @@ class Runner:
         return ids
 
     def comments(self, path: Path) -> None:
-        pages = json.loads(
-            command(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{self.args.repo}/issues/{self.args.pr}/comments",
-                    "--paginate",
-                    "--slurp",
-                ]
-            )
-        )
         save(
             path,
             [
-                {"id": c["id"], "body": c["body"], "author": c["user"]["login"]}
-                for page in pages
-                for c in page
-                if not c["body"].lstrip().startswith("<!-- local-review-telemetry:")
+                row
+                for row in self.issue_comments()
+                if not row["body"].lstrip().startswith("<!-- local-review-telemetry:")
             ],
         )
 
@@ -469,9 +783,186 @@ class Runner:
                     f"DCO sign-off missing on {sha}; no history rewrite is authorized"
                 )
 
+    def validation_contract(self, revision: str) -> dict[str, Any] | None:
+        """Load the consumer contract from the trusted target revision."""
+        entry = subprocess.run(
+            [
+                "git",
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                revision,
+                "--",
+                VALIDATION_CONTRACT,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if entry.returncode:
+            raise Blocked("git operation failed while locating validation contract")
+        if not entry.stdout:
+            return None
+        try:
+            metadata, path = entry.stdout.removesuffix(b"\0").split(b"\t", 1)
+            mode, kind, object_id = metadata.split(b" ", 2)
+        except ValueError as error:
+            raise Blocked("git returned malformed validation contract metadata") from error
+        if (
+            path != VALIDATION_CONTRACT.encode()
+            or kind != b"blob"
+            or not mode.startswith(b"100")
+            or not re.fullmatch(rb"[0-9a-f]{40,64}", object_id)
+        ):
+            raise Blocked("validation contract must be a regular file in the base")
+        blob = subprocess.run(
+            ["git", "cat-file", "blob", object_id.decode()],
+            capture_output=True,
+            timeout=120,
+        )
+        if blob.returncode:
+            raise Blocked("git operation failed while reading validation contract")
+        parsed = parse_validation_contract(blob.stdout)
+        return {
+            "mode": "contract-v1",
+            "path": VALIDATION_CONTRACT,
+            "policy_revision": revision,
+            "manifest_sha256": hashlib.sha256(blob.stdout).hexdigest(),
+            "contract": parsed,
+            "base_environment": {
+                name: os.environ[name]
+                for name in VALIDATION_BASE_ENVIRONMENT
+                if name in os.environ
+            },
+        }
+
+    def changed_paths(self, base: str, head: str) -> list[str]:
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                f"{base}...{head}",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode:
+            raise Blocked("git operation failed while resolving validation gates")
+        try:
+            return [
+                item.decode("utf-8")
+                for item in result.stdout.split(b"\0")
+                if item
+            ]
+        except UnicodeDecodeError as error:
+            raise Blocked("validation gate paths must be UTF-8") from error
+
+    def resolved_validation(self, head: str) -> dict[str, Any]:
+        validation = self.state["config"].get("validation")
+        if not validation:
+            return {
+                "mode": "legacy",
+                "gates": [],
+                "commands": [
+                    {
+                        "argv": shlex.split(check),
+                        "environment": dict(os.environ),
+                    }
+                    for check in self.state["config"]["checks"]
+                ],
+            }
+        contract = validation["contract"]
+        fallback = contract["fallback_gate"]
+        paths = self.changed_paths(self.state["base"], head)
+        selected: list[str] = []
+        unmatched = not paths
+        for name, gate in contract["gates"].items():
+            if name == fallback:
+                continue
+            if gate["always"]:
+                selected.append(name)
+                continue
+            if any(
+                validation_path_matches(path, pattern)
+                for path in paths
+                for pattern in gate["paths"]
+            ):
+                selected.append(name)
+        for path in paths:
+            if not any(
+                validation_path_matches(path, pattern)
+                for name, gate in contract["gates"].items()
+                if name != fallback and not gate["always"]
+                for pattern in gate["paths"]
+            ):
+                unmatched = True
+                break
+        if unmatched:
+            selected.append(fallback)
+        commands: list[dict[str, Any]] = []
+        seen: dict[str, int] = {}
+        for name in selected:
+            gate = contract["gates"][name]
+            environment = {
+                **validation["base_environment"],
+                **gate["environment"],
+            }
+            for argv in gate["commands"]:
+                identity = json_digest([argv, environment])
+                if identity in seen:
+                    commands[seen[identity]]["gates"].append(name)
+                    continue
+                seen[identity] = len(commands)
+                commands.append(
+                    {
+                        "argv": argv,
+                        "environment": environment,
+                        "gates": [name],
+                    }
+                )
+        return {
+            "mode": validation["mode"],
+            "gates": selected,
+            "commands": commands,
+            "manifest_sha256": validation["manifest_sha256"],
+            "changed_paths_sha256": json_digest(paths),
+            "environment_sha256": json_digest(
+                [command["environment"] for command in commands]
+            ),
+        }
+
     def initialize(self) -> None:
+        if Path.cwd().resolve() != self.repository_root():
+            raise Blocked("run the review chain from the repository worktree root")
         head = self.boundary()
-        config = {
+        base = command(["git", "rev-parse", "--verify", self.args.base + "^{commit}"])
+        legacy_checkpoint = bool(
+            self.state
+            and "validation_policy_revision" not in self.state["config"]
+        )
+        if legacy_checkpoint:
+            policy_revision = None
+            validation = None
+        elif self.state:
+            policy_revision = self.state["config"]["validation_policy_revision"]
+            validation = self.validation_contract(policy_revision)
+        else:
+            policy_revision = self.target_revision()
+            if self.merge_base(policy_revision, head) != base:
+                raise Blocked("--base must equal the pull request merge base")
+            validation = self.validation_contract(policy_revision)
+        checks = self.args.check or []
+        if not legacy_checkpoint and validation and checks:
+            raise Blocked(
+                f"{VALIDATION_CONTRACT} exists in the pinned target policy; remove --check"
+            )
+        if not legacy_checkpoint and not validation and not checks:
+            raise Blocked(
+                f"no {VALIDATION_CONTRACT} exists in the pinned target policy; pass --check"
+            )
+        config: dict[str, Any] = {
             "repo": self.args.repo,
             "pr": self.args.pr,
             "worktree": str(Path.cwd()),
@@ -480,16 +971,22 @@ class Runner:
             "trigger": self.args.trigger,
             "mode": "chain" if self.args.chain else "cycle",
             "plan": self.args.chain or self.args.cycle,
-            "checks": self.args.check,
+            "checks": checks,
             "base_argument": self.args.base,
             "require_dco": self.args.require_dco
             or Path(".github/workflows/dco.yml").is_file(),
         }
+        if validation:
+            config["validation"] = validation
+        if policy_revision is not None:
+            config["validation_policy_revision"] = policy_revision
         # Added only when set, so a checkpoint written before the flag existed
         # still resumes with the same arguments.
         scope_decision = getattr(self.args, "scope_decision", None)
         if scope_decision:
             config["scope_decision"] = scope_decision
+        if getattr(self.args, "restart", False):
+            config["restart"] = True
         if self.state:
             if self.state.get("version") not in (1, 2):
                 raise Blocked("unsupported checkpoint version")
@@ -546,7 +1043,6 @@ class Runner:
             )
         (self.directory / "authorization.txt").write_text(auth)
         os.chmod(self.directory / "authorization.txt", 0o600)
-        base = command(["git", "rev-parse", "--verify", self.args.base + "^{commit}"])
         self.state = {
             "version": 2,
             "config": config,
@@ -915,6 +1411,14 @@ class Runner:
             if len(attempts) != 1:
                 raise Blocked("idle-exit retry origin changed")
             self.verify_retry_evidence(pending, attempts[0], "idle_exit")
+        if origin := pending.get("incomplete_exit_origin"):
+            attempts = [
+                item for item in self.state["attempts"]
+                if item["attempt_id"] == origin
+            ]
+            if len(attempts) != 1:
+                raise Blocked("incomplete-exit retry origin changed")
+            self.verify_retry_evidence(pending, attempts[0], "incomplete_exit")
         if origin := pending.get("startup_stall_origin"):
             attempts = [
                 item for item in self.state["attempts"]
@@ -923,6 +1427,14 @@ class Runner:
             if len(attempts) != 1:
                 raise Blocked("startup-stall retry origin changed")
             self.verify_retry_evidence(pending, attempts[0], "startup_stall")
+        if origin := pending.get("provider_500_origin"):
+            attempts = [
+                item for item in self.state["attempts"]
+                if item["attempt_id"] == origin
+            ]
+            if len(attempts) != 1:
+                raise Blocked("provider-error retry origin changed")
+            self.verify_retry_evidence(pending, attempts[0], "provider_500")
         attempt = {
             "attempt_id": uuid.uuid4().hex,
             "engine": pending["engine"],
@@ -955,12 +1467,23 @@ class Runner:
             AGENT_LOOP_REVIEW_ENGINE=pending["engine"],
             AGENT_LOOP_LOG_DIR=str(folder),
         )
+        if telemetry := self.telemetry_directory(pending):
+            env["AGENT_LOOP_TELEMETRY_DIR"] = str(telemetry)
+            if pending["engine"] == "gemini":
+                # Agy exposes totals only after the worker exits. Let the runner
+                # publish once, rather than accepting an earlier empty record.
+                env["LOOM_REVIEW_TELEMETRY"] = "off"
+                enabled = pending["telemetry"].get("extraction_enabled") is True
+                env["LOOM_REVIEW_TELEMETRY_EXTRACT"] = "on" if enabled else "off"
+                if enabled:
+                    env["ACTIVELOOM_AGY_USAGE_FILE"] = str(folder / "agy-usage.json")
         error: BaseException | None = None
         try:
             print(
                 f"Starting {pending['engine']} pass {pending['round']} at {pending['before']}",
                 flush=True,
             )
+            worker_started = time.monotonic()
             managed(
                 self.launcher_command(
                     pending["engine"], pending["before"], pending["round"]
@@ -972,7 +1495,16 @@ class Runner:
                     "thread.started" if pending["engine"] == "codex" else None
                 ),
             )
-            attempt.update(exit_status=0, review_started=True, phase="returned")
+            attempt.update(
+                exit_status=0,
+                review_started=True,
+                phase="returned",
+                duration_seconds=(
+                    round(time.monotonic() - worker_started, 3)
+                    if (pending.get("telemetry") or {}).get("extraction_enabled") is True
+                    else None
+                ),
+            )
             pending["phase"] = "returned"
             # Bind completed-result recovery to the observed worker return.
             # A sidecar introduced later, or an unknown exit, is not proof of a
@@ -982,7 +1514,14 @@ class Runner:
                 digest(recovery) if recovery.exists() else None
             )
             if pending["engine"] == "gemini":
-                self.classify_idle_exit(pending, attempt, folder)
+                receipt = folder / "agy-usage.json"
+                try:
+                    if receipt.is_file() and not receipt.is_symlink():
+                        attempt["usage_sha256"] = digest(receipt)
+                except (OSError, Blocked):
+                    # A missing measurement must not change the review verdict.
+                    attempt["usage_sha256"] = None
+                self.classify_incomplete_exit(pending, attempt, folder)
         except (
             Blocked,
             OSError,
@@ -1045,6 +1584,19 @@ class Runner:
                                 log_sha256=digest(folder / "worker.log"),
                             )
                             pending["phase"] = "startup_stall_failed"
+                        elif (
+                            pending["engine"] == "claude"
+                            and isinstance(caught, ProcessFailure)
+                            and caught.exit_status == 1
+                            and claude_provider_500(folder / "worker.log")
+                        ):
+                            attempt.update(
+                                review_started=True,
+                                phase="provider_500_failed",
+                                failure_reason="claude_provider_500",
+                                log_sha256=digest(folder / "worker.log"),
+                            )
+                            pending["phase"] = "provider_500_failed"
             if isinstance(caught, CleanupBlocked):
                 attempt.update(
                     failure_reason="cleanup_denied",
@@ -1061,7 +1613,16 @@ class Runner:
                     pending.update(phase="cleanup_blocked", **seal)
         finally:
             self.persist()
-        if error and pending["phase"] not in ("capacity_failed", "startup_stall_failed"):
+        if error and pending["phase"] not in (
+            "capacity_failed", "startup_stall_failed", "provider_500_failed"
+        ):
+            # Retryable and preflight failures relaunch under the same key, and
+            # a denied cleanup may leave the worker alive, so only a worker that
+            # failed mid-review and was cleaned up settles as blocked here.
+            if pending["phase"] == "execution_failed" and not isinstance(
+                error, CleanupBlocked
+            ):
+                self.emit_fallback_telemetry(pending, "blocked")
             raise error
 
     def seal_completed(self, folder: Path) -> dict[str, Any] | None:
@@ -1122,10 +1683,10 @@ class Runner:
         attempt["cleanup_reconciled"] = True
         self.persist()
 
-    def classify_idle_exit(
+    def classify_incomplete_exit(
         self, pending: dict[str, Any], attempt: dict[str, Any], folder: Path
     ) -> None:
-        """Mark a returned Agy pass that wrote nothing because its turn ended early."""
+        """Mark a returned Agy pass that ended without its canonical result."""
         marker = folder / "launch.json"
         if (
             any(
@@ -1134,7 +1695,7 @@ class Runner:
             )
             or marker.is_symlink()
             or not marker.is_file()
-            or not agy_idle_exit(folder / "worker.log")
+            or not agy_incomplete_exit(folder / "worker.log")
         ):
             return
         try:
@@ -1148,19 +1709,22 @@ class Runner:
             or evidence.get("phase") != "execution"
         ):
             return
+        idle = agy_idle_exit(folder / "worker.log")
+        phase = "idle_exit_failed" if idle else "incomplete_exit_failed"
         attempt.update(
-            phase="idle_exit_failed",
-            failure_reason="agy_idle_exit",
+            phase=phase,
+            failure_reason="agy_idle_exit" if idle else "agy_incomplete_exit",
             launch_sha256=digest(marker),
             log_sha256=digest(folder / "worker.log"),
         )
-        pending["phase"] = "idle_exit_failed"
+        pending["phase"] = phase
 
     def verify_retry_evidence(
         self, pending: dict[str, Any], attempt: dict[str, Any], kind: str
     ) -> None:
         """Verify the original failure both during recovery and at the retry launch."""
         exit_status: int | None
+        outputs: tuple[str, ...]
         if kind == "capacity":
             label, failure, exit_status = "capacity fallback", "capacity failure", 1
             proven, outputs = capacity_rejected, ("result.json",)
@@ -1170,10 +1734,26 @@ class Runner:
             )
             proven = codex_startup_stalled
             outputs = ("result.json", "result.json.recovery.json")
-        else:
+        elif kind == "provider_500":
+            label, failure, exit_status = (
+                "provider-error retry", "Claude provider 500", 1
+            )
+            proven = claude_provider_500
+            outputs = ("result.json", "result.json.recovery.json")
+        elif kind == "idle_exit":
             label, failure, exit_status = "idle-exit retry", "Agy idle exit", 0
             proven = agy_idle_exit
             outputs = ("result.json", "result.json.recovery.json")
+        elif kind == "incomplete_exit":
+            label, failure, exit_status = (
+                "incomplete-exit retry",
+                "Agy incomplete exit",
+                0,
+            )
+            proven = agy_incomplete_exit
+            outputs = ("result.json", "result.json.recovery.json")
+        else:
+            raise Blocked(f"unknown retry evidence kind: {kind}")
         if (
             self.boundary() != pending["before"]
             or self.state["head"] != pending["before"]
@@ -1213,6 +1793,17 @@ class Runner:
             current = folder / f"{prefix}-{name}.json"
             capture(current)
             if digest(current) != digest(before):
+                if (
+                    kind in ("idle_exit", "incomplete_exit")
+                    and name == "comments"
+                    and allowed_agy_incomplete_comments(
+                        read(before),
+                        read(current),
+                        str(self.state["actor"]),
+                        pending["before"],
+                    )
+                ):
+                    continue
                 raise Blocked(
                     f"review evidence changed; {label} requires reconciliation"
                 )
@@ -1267,7 +1858,7 @@ class Runner:
         label: str,
     ) -> Path:
         """Copy the pre-pass snapshots into a fresh retry folder, resumably."""
-        folder = self.directory / pending["folder"]
+        folder = self.directory / str(pending["folder"])
         retry = folder / directory
         recovery = pending.get(key)
         if recovery is None:
@@ -1330,7 +1921,11 @@ class Runner:
     def recover_idle_exit(self, pending: dict[str, Any]) -> None:
         """Relaunch the same pinned Agy pass once without changing round or budget."""
         self.verify_control()
-        if pending["engine"] != "gemini" or pending.get("idle_exit_origin"):
+        if (
+            pending["engine"] != "gemini"
+            or pending.get("idle_exit_origin")
+            or pending.get("incomplete_exit_origin")
+        ):
             raise Blocked(
                 "Agy ended its turn again before writing a result; no further retry"
             )
@@ -1350,6 +1945,66 @@ class Runner:
         print(
             f"Agy idle exit: retrying {pending['engine']} pass {pending['round']} "
             f"once at {pending['before']}",
+            flush=True,
+        )
+
+    def recover_incomplete_exit(self, pending: dict[str, Any]) -> None:
+        """Relaunch one clean Agy exit that omitted its canonical result."""
+        self.verify_control()
+        if (
+            pending["engine"] != "gemini"
+            or pending.get("incomplete_exit_origin")
+            or pending.get("idle_exit_origin")
+        ):
+            raise Blocked(
+                "Agy ended its turn again before writing a result; no further retry"
+            )
+        attempt = self.state["attempts"][-1]
+        if attempt.get("attempt_id") != pending.get("attempt_id"):
+            raise Blocked("incomplete-exit retry transaction changed")
+        self.verify_retry_evidence(pending, attempt, "incomplete_exit")
+        retry = self.stage_retry(
+            pending,
+            attempt,
+            "incomplete_exit_recovery",
+            "incomplete-retry",
+            "incomplete-exit retry",
+        )
+        pending.update(
+            folder=str(retry.relative_to(self.directory)),
+            phase="prepared",
+            incomplete_exit_origin=attempt["attempt_id"],
+        )
+        pending.pop("incomplete_exit_recovery")
+        self.persist()
+        print(
+            f"Agy incomplete exit: retrying {pending['engine']} pass "
+            f"{pending['round']} once at {pending['before']}",
+            flush=True,
+        )
+
+    def recover_provider_500(self, pending: dict[str, Any]) -> None:
+        """Retry a clean Claude provider failure once at the same head and round."""
+        self.verify_control()
+        if pending["engine"] != "claude" or pending.get("provider_500_origin"):
+            raise Blocked("Claude provider 500 recurred; no further retry")
+        attempt = self.state["attempts"][-1]
+        if attempt.get("attempt_id") != pending.get("attempt_id"):
+            raise Blocked("provider-error retry transaction changed")
+        self.verify_retry_evidence(pending, attempt, "provider_500")
+        retry = self.stage_retry(
+            pending, attempt, "provider_500_recovery", "provider-retry",
+            "provider-error retry",
+        )
+        pending.update(
+            folder=str(retry.relative_to(self.directory)), phase="prepared",
+            provider_500_origin=attempt["attempt_id"],
+        )
+        pending.pop("provider_500_recovery")
+        self.persist()
+        print(
+            f"Claude provider 500: retrying pass {pending['round']} once "
+            f"at {pending['before']}",
             flush=True,
         )
 
@@ -1513,7 +2168,10 @@ class Runner:
         if (
             digest(log) != expected_log
             or not allowed <= present
-            or present - allowed - ({"launch.json"} if intent else set())
+            or present
+            - allowed
+            - ({"launch.json"} if intent else set())
+            - ({"telemetry-boundary"} if pending.get("telemetry") else set())
         ):
             raise Blocked("legacy log does not prove a preflight-only failure")
         failure = self.legacy_failure(pending, log)
@@ -1640,6 +2298,10 @@ class Runner:
             raise Blocked("pre-pass comment snapshot changed")
         result_path = folder / "result.json"
         if not result_path.exists():
+            # An unknown exit may still belong to a live worker that publishes
+            # under this key, so only an observed return settles as blocked.
+            if pending["phase"] == "returned":
+                self.emit_fallback_telemetry(pending, "blocked")
             raise Blocked(
                 "reviewer returned no result; pass not counted, explicit recovery required"
             )
@@ -1683,26 +2345,38 @@ class Runner:
             )
             result = self.helper("ledger", "validate-result", *fields)
         if result["status"] == "blocked":
+            self.emit_fallback_telemetry(pending, "blocked")
             raise Blocked(
                 "reviewer reported blocked without recoverable completed evidence; "
                 "inspect saved result and recover the owed pass"
             )
         self.dco(head)
+        validation = self.resolved_validation(head)
+        expected_validation = {
+            "head": head,
+            "result": result["resultSha256"],
+        }
+        if validation["mode"] != "legacy":
+            expected_validation.update(
+                {
+                    "mode": validation["mode"],
+                    "gates": validation["gates"],
+                    "manifest_sha256": validation["manifest_sha256"],
+                    "changed_paths_sha256": validation["changed_paths_sha256"],
+                    "environment_sha256": validation["environment_sha256"],
+                }
+            )
         if not (folder / "validated.json").exists():
-            for index, check in enumerate(self.state["config"]["checks"]):
+            for index, check in enumerate(validation["commands"]):
                 managed(
-                    shlex.split(check), folder / f"check-{index}.log", dict(os.environ)
+                    check["argv"],
+                    folder / f"check-{index}.log",
+                    check["environment"],
                 )
             if self.boundary() != head:
                 raise Blocked("validation changed the reviewed head")
-            save(
-                folder / "validated.json",
-                {"head": head, "result": result["resultSha256"]},
-            )
-        if read(folder / "validated.json") != {
-            "head": head,
-            "result": result["resultSha256"],
-        }:
+            save(folder / "validated.json", expected_validation)
+        if read(folder / "validated.json") != expected_validation:
             raise Blocked("saved validation does not name this exact head and result")
         self.threads(folder / "threads.json")
         intermediate = (
@@ -1720,12 +2394,20 @@ class Runner:
         )
         save(folder / "heads.json", [pending["before"], *intermediate])
         summary = folder / "summary.txt"
+        validation_label = (
+            "Legacy caller-supplied validation commands"
+            if validation["mode"] == "legacy"
+            else "Repository-declared validation gates "
+            + ", ".join(validation["gates"])
+            + f" (manifest {validation['manifest_sha256']})"
+        )
         summary.write_text(
             f"Runner-verified {pending['engine']} pass {pending['round']} at {head}.\n"
             f"Base: {self.state['base']}. Result: {result['status']}.\n"
             + self.settings_line(pending["engine"])
-            + "Required unfiltered validation commands passed at this exact head:\n"
-            + "\n".join(self.state["config"]["checks"])
+            + validation_label
+            + " passed at this exact head:\n"
+            + "\n".join(shlex.join(check["argv"]) for check in validation["commands"])
             + "\n"
         )
         self.decision(head)
@@ -1760,8 +2442,465 @@ class Runner:
             passes[-1]["head"],
         ) != (pending["engine"], pending["round"], head):
             raise Blocked("ledger did not advance by exactly the authorized pass")
+        self.emit_fallback_telemetry(pending, result["status"], head)
         self.state.update(head=head, completed=passes, pending=None, status="running")
         self.persist()
+
+    def telemetry_script(self, engine: str, name: str) -> Path | None:
+        """Locate the worker engine's own telemetry helper in the pinned installation."""
+        installation = self.directory / "installation"
+        if engine == "gemini":
+            path = installation / "agy/.agents/skills/critique/scripts" / name
+            return path if path.is_file() and not path.is_symlink() else None
+        relative = (
+            f"{'.codex' if engine == 'codex' else '.claude'}"
+            f"/skills/critique/scripts/{name}"
+        )
+        manifest = installation / "manifest.json"
+        recorded = (self.state.get("installation") or {}).get("manifest_sha256")
+        path = installation / "native" / relative
+        if (
+            not recorded
+            or not manifest.is_file()
+            or digest(manifest) != recorded
+            or path.is_symlink()
+            or not path.is_file()
+            or read(manifest)["files"].get(relative) != digest(path)
+        ):
+            return None
+        return path
+
+    def telemetry_json(self, argv: list[str]) -> dict[str, Any] | None:
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("AGENT_LOOP_", "ACTIVELOOM_"))
+        }
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode:
+            return None
+        try:
+            value = json.loads(result.stdout)
+        except ValueError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    def telemetry_boundary(
+        self, engine: str, number: int, head: str, folder: Path
+    ) -> dict[str, Any]:
+        """Mint the pass key and take the start snapshot before any worker runs.
+
+        Telemetry never blocks a pass: a failure leaves the boundary without a
+        key or snapshot, and the reviewer falls back to opening its own.
+        """
+        directory = folder / "telemetry-boundary"
+        boundary: dict[str, Any] = {
+            "directory": str(directory.relative_to(self.directory)),
+            "key": None,
+            "snapshot_sha256": None,
+            "extraction_enabled": False,
+        }
+        try:
+            self.verify_control()
+            if directory.is_symlink():
+                raise Blocked("telemetry directory cannot be a symlink")
+            # Only an interrupted preparation, which launched nothing, leaves one.
+            if directory.exists():
+                shutil.rmtree(directory)
+            directory.mkdir(mode=0o700)
+            minted = self.telemetry_json(
+                [
+                    "node",
+                    str(self.control / "telemetry-pass-key.js"),
+                    self.args.repo,
+                    str(self.args.pr),
+                    str(self.state["run_id"]),
+                    str(self.state["actor"]),
+                    engine,
+                    "review",
+                    str(number),
+                    head,
+                ]
+            )
+            key = (minted or {}).get("idempotencyKey")
+            if not isinstance(key, str):
+                raise Blocked("pass key unavailable")
+            save(directory / "pass-key.json", {"idempotencyKey": key})
+            boundary["key"] = key
+            start = directory / "usage-start.json"
+            usage = self.telemetry_script(engine, "usage-snapshot.js")
+            if usage is not None:
+                measurement = self.telemetry_json(
+                    [
+                        "node",
+                        str(usage),
+                        "snapshot",
+                        "--out",
+                        str(start),
+                        "--session-log",
+                        str(directory / EPHEMERAL_SESSION_LOG),
+                    ]
+                )
+                boundary["extraction_enabled"] = (
+                    (measurement or {}).get("enabled") is True
+                )
+            # Agy's helper and a disabled extraction gate write no snapshot.
+            if start.is_file() and not start.is_symlink():
+                boundary["snapshot_sha256"] = digest(start)
+        except (Blocked, OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"Telemetry boundary incomplete: {error}", file=sys.stderr, flush=True)
+        return boundary
+
+    def telemetry_intact(self, boundary: dict[str, Any]) -> bool:
+        directory = self.directory / boundary["directory"]
+        start = directory / "usage-start.json"
+        recorded = boundary.get("snapshot_sha256")
+        try:
+            return read(directory / "pass-key.json") == {
+                "idempotencyKey": boundary["key"]
+            } and (
+                digest(start) == recorded
+                if recorded
+                else not (start.exists() or start.is_symlink())
+            )
+        except (Blocked, OSError, ValueError):
+            return False
+
+    def telemetry_directory(self, pending: dict[str, Any]) -> Path | None:
+        """The boundary a worker may reuse, or None when it must open its own."""
+        boundary = pending.get("telemetry")
+        # A checkpoint written before the runner owned this boundary has none.
+        if not boundary or not boundary.get("key"):
+            return None
+        if not self.telemetry_intact(boundary):
+            print(
+                "Telemetry boundary changed before launch; the reviewer opens its own",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        return self.directory / boundary["directory"]
+
+    def issue_comments(self) -> list[dict[str, Any]]:
+        pages = json.loads(
+            command(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{self.args.repo}/issues/{self.args.pr}/comments",
+                    "--paginate",
+                    "--slurp",
+                ]
+            )
+        )
+        return [
+            {"id": c["id"], "body": c["body"] or "", "author": c["user"]["login"]}
+            for page in pages
+            for c in page
+        ]
+
+    def telemetry_recorded(self, key: str, rows: list[dict[str, Any]]) -> bool:
+        """Whether a record already carries this key. Only the key is read."""
+        for row in rows:
+            marker = re.search(r"<!-- local-review-telemetry:v[13] -->", row["body"])
+            if row["author"] != self.state["actor"] or not marker:
+                continue
+            payload = row["body"][marker.end():].strip()
+            payload = payload.removeprefix("```json").removesuffix("```")
+            try:
+                record = json.loads(payload)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("idempotencyKey") == key:
+                return True
+        return False
+
+    def telemetry_stance(self, pending: dict[str, Any]) -> str:
+        adversarial = 2 if self.state["config"]["tier"] == "deep" else 1
+        first_read = not any(
+            item.get("engine") == pending["engine"] for item in self.state["completed"]
+        )
+        if pending["round"] <= adversarial or first_read:
+            return "adversarial"
+        return "convergence"
+
+    def telemetry_findings(
+        self, pending: dict[str, Any], rows: list[dict[str, Any]], output: Path
+    ) -> dict[str, Any] | str:
+        """Derive this pass's finding counts from the ledger, or say why not.
+
+        Unknown counts are never zero, so any gap returns a reason instead.
+        """
+        folder = self.directory / pending["folder"]
+        if digest(folder / "historical.json") != pending["historical_sha256"]:
+            return "pre-pass comment snapshot changed"
+        historical = set(read(folder / "historical.json"))
+        engines = {pending["engine"]} | (
+            {"antigravity"} if pending["engine"] == "gemini" else set()
+        )
+        actor = self.state["actor"]
+
+        # A cleanup lane in the same pass posts findings the ledger cannot
+        # attribute to either lane, so its presence must be known.
+        before = folder / "before-comments.json"
+        recorded = pending.get("before_comments_sha256")
+        if not recorded or not before.is_file() or digest(before) != recorded:
+            return "pre-pass issue comments unavailable"
+        earlier = {row["id"] for row in read(before)}
+        cleanup = False
+        for row in rows:
+            marker = REFACTOR_MARKER.search(row["body"])
+            if marker and row["id"] not in earlier and row["author"] == actor:
+                cleanup |= marker["engine"] in engines
+
+        self.threads(output / "threads.json")
+        severity: dict[tuple[str, int], str] = {}
+        prior_fingerprints: set[str] = set()
+        prior_fix = False
+        posted_findings: set[tuple[str, int]] = set()
+        outcomes: dict[tuple[str, int], str] = {}
+        for page in read(output / "threads.json"):
+            threads = page["data"]["repository"]["pullRequest"]["reviewThreads"]
+            for thread in threads["nodes"]:
+                for comment in thread["comments"]["nodes"]:
+                    if (comment.get("author") or {}).get("login") != actor:
+                        continue
+                    line = str(comment.get("body") or "").split("\n", 1)[0]
+                    prior = comment["databaseId"] in historical
+                    match = FINDING_MARKER.fullmatch(line) or DISPOSITION_MARKER.fullmatch(
+                        line
+                    )
+                    if not match:
+                        continue
+                    ident = (match["fingerprint"], int(match["occurrence"]))
+                    own = (
+                        not prior
+                        and match["engine"] in engines
+                        and int(match["round"]) == pending["round"]
+                    )
+                    if "severity" in match.groupdict():
+                        severity[ident] = match["severity"]
+                        if prior:
+                            prior_fingerprints.add(match["fingerprint"])
+                        elif own:
+                            posted_findings.add(ident)
+                    elif prior:
+                        prior_fix |= match["outcome"] == "fixed"
+                    elif own:
+                        outcomes[ident] = match["outcome"]
+        posted = posted_findings | set(outcomes)
+        if cleanup and posted:
+            return "cleanup and review findings share this pass"
+        if prior_fix and {f for f, _ in posted_findings} - prior_fingerprints:
+            return "chain-induced regressions need a blame trace"
+        ladder = {
+            name: {bucket: 0 for bucket in OUTCOME_BUCKETS.values()}
+            for name in ("blocking", "major", "minor", "nit")
+        }
+        for ident, outcome in outcomes.items():
+            if ident not in severity:
+                return "a disposition has no finding severity"
+            ladder[severity[ident]][OUTCOME_BUCKETS[outcome]] += 1
+        return {
+            "posted": len(posted),
+            "bySeverityAndOutcome": ladder,
+            "chainInducedRegressions": 0,
+        }
+
+    def pass_attempts(self, pending: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return the current pass's automatic-retry attempts in launch order."""
+        identities = [pending.get("idle_exit_origin"),
+                      pending.get("incomplete_exit_origin"),
+                      pending.get("attempt_id")]
+        expected = [identity for identity in identities if identity is not None]
+        if len(expected) != len(set(expected)):
+            return []
+        by_id = {attempt.get("attempt_id"): attempt
+                 for attempt in self.state.get("attempts", [])
+                 if attempt.get("attempt_id") in expected}
+        return [by_id[identity] for identity in expected if identity in by_id]
+
+    def agy_usage(self, pending: dict[str, Any], output: Path) -> Path | None:
+        """Aggregate unchanged receipts bound to every invocation in this pass."""
+        if pending["engine"] != "gemini" or not self.telemetry_intact(pending["telemetry"]):
+            return None
+        attempts = self.pass_attempts(pending)
+        expected = 1 + int(bool(pending.get("idle_exit_origin")
+                                or pending.get("incomplete_exit_origin")))
+        if len(attempts) != expected:
+            return None
+        fields = {"input_tokens", "output_tokens", "thinking_tokens",
+                  "cache_read_tokens", "total_tokens"}
+        measurements: list[dict[str, int]] = []
+        for attempt in attempts:
+            receipt = self.directory / attempt["folder"] / "agy-usage.json"
+            if (attempt.get("exit_status") != 0 or attempt.get("review_started") is not True
+                    or not attempt.get("usage_sha256") or receipt.is_symlink()
+                    or not receipt.is_file() or digest(receipt) != attempt["usage_sha256"]):
+                return None
+            value = read(receipt)
+            if (not isinstance(value, dict) or value.get("version") != 1
+                    or value.get("attempt_id") != attempt["attempt_id"]):
+                return None
+            raw = value.get("usage")
+            if (not isinstance(raw, dict) or not raw or not set(raw) <= fields
+                    or any(type(v) is not int or not 0 <= v <= 2**53 - 1
+                           for v in raw.values())):
+                return None
+            measurements.append(raw)
+        aggregate: dict[str, int] = {}
+        for field in fields:
+            if all(field in measurement for measurement in measurements):
+                total = sum(measurement[field] for measurement in measurements)
+                if total > 2**53 - 1:
+                    return None
+                aggregate[field] = total
+        # The CLI does not provide an observed model or per-lens attribution.
+        tokens = [{"model": None, "effort": None,
+                   "input": aggregate.get("input_tokens"),
+                   "output": aggregate.get("output_tokens"),
+                   "cacheRead": aggregate.get("cache_read_tokens"), "cacheWrite": None,
+                   "reasoning": aggregate.get("thinking_tokens"),
+                   "providerBuckets": {"total_tokens": aggregate["total_tokens"]}
+                   if "total_tokens" in aggregate else {}}]
+        target = output / "telemetry-tokens.json"
+        save(target, tokens)
+        return target
+
+    def fallback_telemetry(
+        self, pending: dict[str, Any], status: str, head: str
+    ) -> str:
+        boundary = pending.get("telemetry")
+        if not boundary or not boundary.get("key"):
+            return "not emitted: this pass has no runner-owned boundary"
+        engine = pending["engine"]
+        usage = self.telemetry_script(engine, "usage-snapshot.js")
+        if usage is None:
+            return "not emitted: the engine's usage helper is unavailable"
+        rows = self.issue_comments()
+        if self.telemetry_recorded(boundary["key"], rows):
+            return "the reviewer already emitted this pass's record"
+        directory = self.directory / boundary["directory"]
+        output = directory / ("runner-" + uuid.uuid4().hex)
+        output.mkdir(mode=0o700)
+        start = (
+            directory / "usage-start.json"
+            if self.telemetry_intact(boundary)
+            else output / "no-start.json"
+        )
+        delta = self.telemetry_json(
+            [
+                "node",
+                str(usage),
+                "delta",
+                "--start",
+                str(start),
+                "--out-dir",
+                str(output),
+                "--session-log",
+                str(directory / EPHEMERAL_SESSION_LOG),
+            ]
+        )
+        if delta is None or not isinstance(delta.get("tokenSource"), str):
+            return "not emitted: the usage helper failed"
+        if delta.get("emit") is not True:
+            return "not emitted: emission is disabled"
+        if delta.get("enabled") is True:
+            if tokens := self.agy_usage(pending, output):
+                delta.update(tokenSource="terminal-json", tokensFile=str(tokens))
+        # The launcher interval is measured even when an ephemeral worker has
+        # no token log. Use only a settled, matching attempt; resumption must
+        # never include time spent waiting for an operator or invent a duration.
+        if delta.get("enabled") is True and delta.get("durationSeconds") is None:
+            attempts = self.pass_attempts(pending)
+            durations = [attempt.get("duration_seconds") for attempt in attempts]
+            if attempts and all(
+                attempt.get("exit_status") == 0
+                and attempt.get("review_started") is True
+                and type(duration) in (int, float)
+                and math.isfinite(duration)
+                and duration >= 0
+                for attempt, duration in zip(attempts, durations, strict=True)
+            ):
+                delta["durationSeconds"] = round(sum(durations), 3)
+        findings = self.telemetry_findings(pending, rows, output)
+        if isinstance(findings, str):
+            return f"not emitted: findings measurement unavailable ({findings})"
+        save(output / "findings.json", findings)
+        arguments = [
+            "--repo",
+            self.args.repo,
+            "--pr",
+            str(self.args.pr),
+            "--engine",
+            engine,
+            "--base",
+            self.state["base"],
+            "--head",
+            head,
+            "--pass-type",
+            "review",
+            "--review-tier",
+            self.state["config"]["tier"],
+            "--trigger",
+            "autonomous",
+            "--round",
+            str(pending["round"]),
+            "--stance",
+            self.telemetry_stance(pending),
+            "--status",
+            status,
+            "--token-source",
+            delta["tokenSource"],
+            "--idempotency-key",
+            boundary["key"],
+            "--telemetry-run-id",
+            str(self.state["run_id"]),
+            "--findings-file",
+            str(output / "findings.json"),
+        ]
+        stack_helper = self.telemetry_script(engine, "prompt-stack-hash.js")
+        stack = (
+            self.telemetry_json(
+                ["node", str(stack_helper), "--repo-root", str(self.repository_root())]
+            )
+            if stack_helper
+            else None
+        ) or {}
+        for flag, source, field in (
+            ("--engine-version", delta, "engineVersion"),
+            ("--duration-seconds", delta, "durationSeconds"),
+            ("--tokens-file", delta, "tokensFile"),
+            ("--lanes-file", delta, "lanesFile"),
+            ("--prompt-stack-sha256", stack, "promptStackSha256"),
+            ("--prompt-stack-version", stack, "promptStackVersion"),
+            ("--repo-instructions-sha256", stack, "repoInstructionsSha256"),
+        ):
+            if source.get(field) is not None:
+                arguments += [flag, str(source[field])]
+        outcome = self.helper("ledger", "emit-telemetry", *arguments)
+        if outcome.get("emitted") is True:
+            return f"emitted {status} record"
+        return "not emitted: the ledger declined the record"
+
+    def emit_fallback_telemetry(
+        self, pending: dict[str, Any], status: str, head: str | None = None
+    ) -> None:
+        """Publish the pass's record when its reviewer did not. Never raises."""
+        try:
+            outcome = self.fallback_telemetry(pending, status, head or pending["before"])
+        except Blocked as error:
+            outcome = f"not emitted: {error}"
+        except Exception as error:  # A telemetry defect must never fail the pass.
+            outcome = f"not emitted: {type(error).__name__}"
+        print(f"Runner telemetry: {outcome}", file=sys.stderr, flush=True)
 
     def settings_line(self, engine: str) -> str:
         settings = self.settings_call("selected", self.state, engine, "reviewer")
@@ -1807,6 +2946,7 @@ class Runner:
                 config["plan"],
                 "--authorization-file",
                 str(self.directory / "authorization.txt"),
+                *(["--restart"] if config.get("restart") else []),
                 *(
                     ["--scope-decision", config["scope_decision"]]
                     if config.get("scope_decision")
@@ -1885,8 +3025,12 @@ class Runner:
                     self.recover_capacity(pending)
                 elif pending["phase"] == "idle_exit_failed":
                     self.recover_idle_exit(pending)
+                elif pending["phase"] == "incomplete_exit_failed":
+                    self.recover_incomplete_exit(pending)
                 elif pending["phase"] == "startup_stall_failed":
                     self.recover_startup_stall(pending)
+                elif pending["phase"] == "provider_500_failed":
+                    self.recover_provider_500(pending)
                 elif pending["phase"] == "cleanup_blocked":
                     self.recover_cleanup(pending)
                 elif pending["phase"] == "prepared":
@@ -1940,14 +3084,18 @@ class Runner:
                 raise Blocked("pass directory cannot be a symlink")
             folder.mkdir(mode=0o700, exist_ok=True)
             if any(
-                p.name
-                not in (
-                    "before-threads.json",
-                    "before-comments.json",
-                    "historical.json",
+                p.is_symlink()
+                or not (
+                    p.is_file()
+                    and p.name
+                    in (
+                        "before-threads.json",
+                        "before-comments.json",
+                        "historical.json",
+                    )
+                    or p.is_dir()
+                    and p.name == "telemetry-boundary"
                 )
-                or p.is_symlink()
-                or not p.is_file()
                 for p in folder.iterdir()
             ):
                 raise Blocked(
@@ -1968,6 +3116,7 @@ class Runner:
                 "historical_sha256": digest(folder / "historical.json"),
                 "before_threads_sha256": digest(folder / "before-threads.json"),
                 "before_comments_sha256": digest(folder / "before-comments.json"),
+                "telemetry": self.telemetry_boundary(engine, number, head, folder),
             }
             self.state["pending"] = pending
             self.persist()
@@ -1975,6 +3124,13 @@ class Runner:
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--validate-contract"]:
+        try:
+            return validate_contract_command()
+        except (Blocked, OSError, ValueError, KeyError) as error:
+            print(f"validation contract invalid: {error}", file=sys.stderr)
+            return 2
     if os.environ.get("AGENT_LOOP_REVIEW_RESULT_FILE"):
         raise Blocked("a one-pass reviewer cannot start another chain runner")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1993,8 +3149,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="append",
-        required=True,
-        help="required full-suite command (argv syntax; no shell)",
+        help=(
+            "legacy required full-suite command (argv syntax; no shell); omit when "
+            f"the pinned target policy contains {VALIDATION_CONTRACT}"
+        ),
     )
     parser.add_argument(
         "--authorization-file",
@@ -2008,6 +3166,11 @@ def main(argv: list[str] | None = None) -> int:
         help="scope decision forwarded to start-run when its scope checkpoint fires",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="explicitly authorize a new run after the prior run has ended",
+    )
     parser.add_argument(
         "--recover-preflight",
         action="store_true",
@@ -2034,7 +3197,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="preserve and replace the managed installation at its existing pins",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     if (
         args.recover_preflight or args.migrate_controller or args.repair_installation
     ) and not args.resume:
@@ -2060,7 +3223,7 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.cycle) != args.until_converged:
         parser.error("--cycle requires --until-converged; --chain does not use it")
     if (args.tier == "deep") != (args.trigger is not None) or any(
-        not shlex.split(c) for c in args.check
+        not shlex.split(c) for c in (args.check or [])
     ):
         parser.error("Deep requires a trigger; Lean has none; checks must not be empty")
     if args.trigger is not None and not re.fullmatch(r"[1-6](?:,[1-6])*", args.trigger):
