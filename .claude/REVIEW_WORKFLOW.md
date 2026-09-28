@@ -24,7 +24,9 @@ When it reports `"configured": false`, run `review-setup` with the user first;
 never start a run on settings the user has not confirmed. Unless the user names a
 plan, read the tier's order from `review-profile.py order --tier <lean|deep> --repo <owner/repo>`.
 Use `--chain` for a one-engine order and `--cycle --until-converged` for two or
-three engines. A one-engine chain reports plan completion; it cannot establish
+three engines. Run the order as returned: a request to run "the review chain"
+names the runner, not a plan, so it adds no engines, repeats no steps, and does
+not select the Deep order. A one-engine chain reports plan completion; it cannot establish
 independent convergence. The runner pins each engine's settings when the run
 starts, so a profile change applies to the next run, not the one in progress.
 
@@ -123,7 +125,9 @@ that cannot run is not human glance; the entry point's own pre-flight handles it
 
 - **Explicit request.** A human who directly asks for this change to be reviewed
   anyway overrides the gate. That request is trigger 6: the chain runs and the
-  tier marker records it. Typing a review skill's name is not that request.
+  tier marker records it. Typing a review skill's name, or asking to "review
+  this PR" or "run the review chain", is not that request: it invokes the entry
+  point, which applies this gate and resolves the tier as usual.
 - **Controller-scheduled passes.** When `$AGENT_LOOP_REVIEW_RESULT_FILE` is set,
   the controller that scheduled the pass owns the gate, and the pass reviews the
   range it was given. `agent-loop` classifies before its first review round, and
@@ -134,6 +138,11 @@ that cannot run is not human glance; the entry point's own pre-flight handles it
 - **The label.** Where the synced `review-glance-label.yml` workflow runs, the
   `review: human-glance` label marks a PR whose latest push classified the same
   way. It is a hint; the gate's own classification decides.
+- **Misclassification.** When the classifier marks a file review-significant
+  that has no runtime, contract, or security effect, the classifier rule is
+  what is wrong. Continue the entry point, and open an issue naming the path
+  and the rule that matched it. A session does not overrule `"skip": false` on
+  its own reading of the diff.
 
 ### What sets the tier
 
@@ -147,7 +156,9 @@ Resolve the changed-file list once with
 
 1. **Sensitive path** — authentication, authorization, cryptography, secret or
    credential handling, PHI/PII, tenant or customer isolation. Evaluate the
-   bounded-repair exception below before selecting this trigger.
+   bounded-repair exception below before selecting this trigger. Manifest or
+   lockfile-only dependency bumps do not select this trigger; see "What does not
+   set the tier".
 2. **Irreversible in production data or a published artifact** — migration,
    backfill, a published package's API or version: anything a revert cannot
    undo.
@@ -163,7 +174,8 @@ Resolve the changed-file list once with
    revert, or hotfix commit you can name; ordinary commit traffic on an actively
    developed path is not evidence, and neither is the path being important.
 6. **Explicitly requested** — a human directly asked for a deep review.
-   Novelty alone does not select this trigger; assess the actual risk under
+   Asking for a review, or for the automatic chain, without asking for Deep
+   is not this trigger. Novelty alone does not select this trigger; assess the actual risk under
    triggers 1–5. An internal
    `deep` argument passed between tier-aware skills only asserts the recorded
    tier; it is not a new request.
@@ -193,6 +205,18 @@ Subtlety does not: a change can be hard to reason about and still be Lean. Nor
 does diff size — a large mechanical refactor is Lean unless it also trips
 trigger 4. Nor does topic adjacency: code _about_ security that does not itself
 enforce a sensitive boundary is not trigger 1.
+
+**Dependency version updates (manifest and lockfile changes) do not select Deep.**
+Upgrading an external dependency (e.g. updating `package.json`, `pnpm-lock.yaml`,
+`pnpm-workspace.yaml`, `Cargo.lock`, `requirements.txt`, `go.sum`) does not trip
+Trigger 1 or Trigger 4 simply because the package itself handles authentication,
+cryptography, validation, networking, or concurrency. A multi-lane code review
+inspects code diffs in this repository; it cannot critique external package
+source from a version bump diff. Dependency risk is properly addressed through
+upfront research, release notes, security advisories, and running the consumer test
+suite—not through a multi-lane code review chain. Unless the dependency update is
+accompanied by material application code changes that touch sensitive boundaries
+or non-obvious runtime behaviour, dependency updates are Lean.
 
 **The dominant rule: when the worst outcome of a missed defect is a red CI run,
 a broken build, or a broken developer workflow, the change is Lean.** CI
@@ -523,7 +547,7 @@ Auto mode is available for the `gemini` reviewer, launched through
 The launcher takes its model and effort from the review profile (recommended:
 `gemini-3.7-flash-high` at `high`) and pins accept-edits mode, unattended
 permissions, and structured JSON output. A pass defaults to a
-30-minute bound through `LOCAL_REVIEW_PASS_TIMEOUT_SECONDS`; values above the
+60-minute bound through `LOCAL_REVIEW_PASS_TIMEOUT_SECONDS`; values above the
 hard 3600-second ceiling are rejected. Under agent-loop the wrapper sets that
 variable itself, to the smallest of what remains of the run's
 `review_timeout_seconds` budget, the configured `hook_timeout_seconds`, and that
@@ -622,6 +646,11 @@ later phase. Run one whenever it is useful: before the relay, between rounds,
 after convergence, or as the only review on a change that does not warrant a
 local relay.
 
+Start the hosted lane only when the user asks for it. When a review request does
+not say which style to run and the review profile leaves hosted review available,
+ask the user whether to run the local chain (`critique` / `deepcritique`) or
+`reviewit` rather than choosing one.
+
 **The local relay is the default path here.** Coverage is expected to come from
 declared roster engines reading the change cold, and that is what
 `verify-coverage` measures. The hosted lane is an extension on top of that.
@@ -689,6 +718,26 @@ Deep earns its cost. It carries no prose, no file paths, no finding titles, and
 no money: rates move and a subscription's marginal cost is zero, so a stored
 dollar figure is wrong when written and unverifiable later. Counts keep the
 whole series re-priceable.
+
+### Runner-owned boundary
+
+When `$AGENT_LOOP_TELEMETRY_DIR` is set, the review-chain runner that launched
+this pass has already opened the review pass's boundary there. Reuse it rather
+than opening another: take the idempotency key from the `idempotencyKey` field
+of `pass-key.json`, and when `usage-start.json` exists, pass it as `--start` to
+`delta`, with `--session-log` set to the `sessionLog` path it names, instead of
+taking a snapshot of your own. That log never exists, so the delta reports
+`unavailable` rather than discovering another session's log. Keep every other
+working file where Pass Telemetry puts it, and never write into that directory.
+When either file is absent, open that part of the boundary as Pass Telemetry
+describes.
+
+The boundary belongs to the `review` pass only. A cleanup lane in the same
+worker is a separate `refactor` pass and keeps its own key and snapshot.
+
+The runner's key is the one Pass Telemetry would mint, and the runner publishes
+the record itself when a pass it launched returns without one, so a pass that
+cannot emit reports that and moves on.
 
 ### Two gates: measuring and publishing
 

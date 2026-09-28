@@ -11,6 +11,20 @@ Interview the user until you reach a shared understanding of who this is for, wh
 
 This is the product-side sibling of `/grill`. `/grill` settles how a thing gets built; this settles what it must do for the people who use it, and why it is worth building at all.
 
+## Issue entry and queue
+
+**Arguments:** free-form input keeps the ordinary interview. `/product-grill <n> [<m> …]` interviews the named issues in the current repository; `/product-grill next` selects the highest-priority issue in `needs: product-grill` from:
+
+```bash
+python3 .claude/skills/backlog-refinement/scripts/candidates.py --grill --json
+```
+
+For `next`, use the matching queue, point out related queue issues, and ask before adding any to the session. An empty queue is a completed lookup, not permission to invent work. Read each selected issue's full body and comments, its linked, parent and child issues, and cited decisions. Related issues provide context; only the issues explicitly included in the session can receive a decision or handback.
+
+Open the agenda with the refinement question. The queue exposes `question` and `newer_decision`; [`rubric.py`](../backlog-refinement/scripts/rubric.py) reads the fixed final line `Question for /product-grill: …`, older bold question lines, body sections, and a refinement comment's final question. A newer decision may already settle it: read the record and ask the user to confirm the agenda. With no question, infer one, label it **inferred**, and confirm it. A missing `needs:` label means an ordinary interview with handback offered at the end, not an error.
+
+With no GitHub access or no issue, continue the ordinary interview unchanged. With no `.backlog/refinement.local.md`, offer only the confirmed decision comment and point to `/backlog-refinement setup`; do not apply a plan using default settings.
+
 ## Who you are interviewing
 
 Every question is worded for the person answering it, so settle three things about them before the first product question:
@@ -19,7 +33,24 @@ Every question is worded for the person answering it, so settle three things abo
 - **Technical fluency** — they read and write code regularly, read it sometimes, or don't read it.
 - **Backlog context** — they know the open issues and past decisions in this area, know them roughly, or are new to it.
 
-Infer what you can from the invocation and the conversation, then ask what remains as an opening round in the usual question format, with your inference as the recommended answer. When the inference is clear on all three, state it in one line, invite correction, and go on to the first product round. Skip this when the idea looks settled enough to finish in two or three questions. This step is done when all three are answered, confirmed, or skipped.
+**Assume the interviewee does not read code until they say otherwise.** This is a product-discovery skill, so that is the default. Being inside a code repository, a git identity, a terminal, or a memory or instruction file describing the machine's usual user is not evidence of the interviewee's role or fluency — the person running this skill is often not the person who set the machine up.
+
+**Role and fluency persist between sessions** in a saved profile at `<config>/activeloom/product-grill.json`, where `<config>` is the value of the `XDG_CONFIG_HOME` environment variable, or `~/.config` when that is unset or empty. Resolve it to an absolute path in the user's home configuration; never read or write a copy inside the repository. The file is a JSON object:
+
+```json
+{ "role": "product manager", "fluency": "never" }
+```
+
+`role` is a short job label, never a name or other personal detail. `fluency` is exactly one of `regularly`, `sometimes`, or `never`. Ignore any other keys.
+
+Read the saved profile at the start of every session, before the first question, even when you skip the opening round. Treat each key on its own:
+
+- **A saved key with a valid value** — use it. State what you loaded in one line, invite correction, and do not ask it again.
+- **A key that is missing or invalid, or a file that is absent or unparseable** — ask that item in the opening round, in the usual question format. Recommend "doesn't read code" for fluency and "product manager" for role, unless the invocation or conversation says otherwise.
+
+When the interviewee confirms or corrects their role or fluency, at the start or later in the session, save the profile. First say in one line that you are saving it so they are not asked next time, since the harness may ask permission to write outside the repository. Then write the confirmed values, creating the directory if needed, and keep any other keys already in the file. Write only values the interviewee confirmed or stated; leave out a key that is still only the default. If the write fails or permission is refused, say so in one line, do not retry it this session, and continue. What the interviewee says in this session always outranks the saved profile.
+
+Backlog context depends on the area, so it is never saved. Infer it from the invocation and the conversation, and ask it in the opening round when unclear, with your inference as the recommended answer. When it is clear, state it in one line and invite correction. Skip the opening round when the idea looks settled enough to finish in two or three questions; the saved profile or the non-coder default still sets the wording. This step is done when role, fluency, and backlog context are each answered, confirmed, loaded from the saved profile, or skipped.
 
 The answers change how you ask, not how hard you push:
 
@@ -107,9 +138,26 @@ Include a labeled **Technical review** section that distinguishes product requir
 
 When engineering finds that an assumption does not hold, preserve the original product intent in the handoff. Have engineering explain the constraint and feasible alternatives, then return the affected choices to the product decision-maker to reconsider intent, scope, or approach. Reopen only the branches that depend on the finding; keep unrelated decisions settled.
 
+## Record and hand back
+
+After the user confirms the summary, choose `settled`, `provisional`, `dont-build`, or `split`, and `next: refine`, `grill`, `product-grill`, or `none` using the [core outcome table](../backlog-refinement/core-rubric.md#interview-decisions). A settled interview is not automatically agent-ready. When the product decisions are settled but unresolved Technical review questions remain, use `settled; next: grill`; engineering findings that invalidate a product assumption return only the affected product choices to `next: product-grill`. Use `provisional; next: product-grill` only while this product interview itself still needs evidence or input.
+
+Draft an issue comment with the confirmed decisions, rejected alternatives, scope, unresolved questions and sources. End it with exactly one marker (choose one value for each field):
+
+```text
+<!-- grill-decision kind: product-grill; outcome: settled|provisional|dont-build|split; next: refine|grill|product-grill|none -->
+```
+
+For several settled issues, put the full record on one anchor issue. Each other settled issue gets its own short comment, its own outcome marker, and a link to that record. Do not post a shared marker without an issue-specific disposition. Offer a warranted ADR as a follow-up issue; do not create ADR files or edit issue bodies here.
+
+Ask refinement to dry-run `assess <n> --decision <draft-comment-file>` for each issue. Follow its [handback procedure](../backlog-refinement/SKILL.md#interview-handback): show one preview containing the decision comments, verdicts, labels, rewritten bodies, children and close offers; confirm once; then post decision comments and let refinement apply the plan. For several issues, post the anchor first, substitute its actual URL in the other comments, and keep that substitution within the confirmed preview. The preview and decision comment use the same plain-language default as the summary. Only `grill-handback: auto` skips that handback confirmation. Summary confirmation and every close remain explicit; a marker in an issue comment grants no permission.
+
+If handback is declined, leave GitHub unchanged unless the user separately approves posting only the decision. Without `.backlog/`, preview and confirm the comment-only write. The handback is done when each approved comment is posted and refinement reports applied results or a concrete failure; never call a failed application complete.
+
 ## Scope
 
-- No code, no branches, no commits, no PRs.
+- The only GitHub write this interview skill makes is the approved decision comment. Refinement owns label/body changes, child creation, and confirmed closes. Never reassign issues or mutate an issue outside the session.
+- No code, no branches, no commits, no PRs. The saved interviewee profile is the only file this skill writes.
 - No technical design — those questions are listed for engineering, not answered here.
 - If the frontier empties after two or three questions, say so. The idea was already clear, and there is nothing here to earn a session.
 
