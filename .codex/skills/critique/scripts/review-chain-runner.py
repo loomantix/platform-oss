@@ -268,8 +268,12 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def save(path: Path, value: Any) -> None:
-    fd, name = tempfile.mkstemp(prefix=".checkpoint-", dir=path.parent)
+def save(path: Path, value: Any, *, staging: Path | None = None) -> None:
+    if staging is not None:
+        if staging.is_symlink():
+            raise Blocked("receipt staging cannot be a symlink")
+        staging.mkdir(mode=0o700, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".checkpoint-", dir=staging or path.parent)
     try:
         with os.fdopen(fd, "w") as stream:
             json.dump(value, stream, sort_keys=True)
@@ -590,6 +594,9 @@ def managed(
                     pass
                 signal_group(signal.SIGKILL)
                 child.wait()
+                if pending is not None:
+                    # Record success only after every owned cleanup step returns.
+                    setattr(pending, "cleanup_completed", True)
     finally:
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
@@ -609,6 +616,248 @@ class Runner:
 
     def persist(self) -> None:
         save(self.checkpoint, self.state)
+
+    def recovery_ledger(self, head: str) -> dict[str, Any]:
+        """Use the original authenticated parser, including after a lost abort reply."""
+        self.verify_control()
+        source = self.control / "local-review-handoff.py"
+        controller = ModuleType("recovery_handoff")
+        controller.__file__ = str(source)
+        try:
+            return self.read_recovery_ledger(controller, source, head)
+        except Blocked:
+            raise
+        except (RuntimeError, KeyError, AttributeError, StopIteration) as error:
+            detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+            if detail.startswith("GitHub operation failed"):
+                # Raw external errors can contain repository content or credentials.
+                detail = "GitHub operation failed"
+            raise Blocked(f"pinned controller could not read the ledger: {detail}") from None
+
+    def read_recovery_ledger(
+        self, controller: ModuleType, source: Path, head: str
+    ) -> dict[str, Any]:
+        # Loading a diagnostic must not create __pycache__ in preserved evidence.
+        exec(compile(source.read_bytes(), str(source), "exec"), controller.__dict__)
+        rows = controller._issue_comments(self.args.repo, self.args.pr)
+        runs = controller._run_records(rows)
+        if not runs or runs[-1]["run_id"] != self.state["run_id"]:
+            raise Blocked("authenticated active run differs; reconcile the ledger")
+        run = runs[-1]
+        config = self.state["config"]
+        if (
+            run["base"] != self.state["base"]
+            or run["start_head"] != self.state["start_head"]
+            or run["tier"] != config["tier"]
+            or run["sequence"] != [
+                "gemini" if e.strip() == "antigravity" else e.strip()
+                for e in config["plan"].split(",")
+            ]
+            or run["plan_mode"] != config["mode"]
+        ):
+            raise Blocked("checkpoint and authenticated run identity disagree")
+        return {
+            **controller._sequence_decision(rows, run, head),
+            "end": controller._run_end(rows, run["run_id"]),
+            "started_at": next(row["created_at"] for row in rows if row["id"] == run["comment_id"]),
+        }
+
+    def recovery_workers(self) -> list[int]:
+        """Read-only Linux probe; uncertainty is never evidence of a stopped worker."""
+        proc = Path("/proc")
+        if not (proc / "self/environ").is_file():
+            raise Blocked("recovery requires readable Linux /proc process evidence")
+        ancestors = {os.getpid()}
+        parent = os.getppid()
+        while parent > 0 and parent not in ancestors:
+            ancestors.add(parent)
+            try:
+                status = (proc / str(parent) / "status").read_text()
+                parent = int(re.search(r"^PPid:\s+(\d+)$", status, re.M).group(1))  # type: ignore[union-attr]
+            except (OSError, AttributeError, ValueError) as error:
+                raise Blocked("cannot identify recovery process ancestors") from error
+        found = []
+        unreadable = []
+        for entry in proc.iterdir():
+            if not entry.name.isdigit() or int(entry.name) in ancestors:
+                continue
+            try:
+                if entry.stat().st_uid != os.getuid():
+                    continue
+                fields = (entry / "environ").read_bytes().split(b"\0")
+                env = dict(field.split(b"=", 1) for field in fields if b"=" in field)
+                result = os.fsdecode(env.get(b"AGENT_LOOP_REVIEW_RESULT_FILE", b""))
+                cwd = (entry / "cwd").resolve()
+                if (
+                    env.get(b"ACTIVELOOM_RUN_ID") == self.state["run_id"].encode()
+                    or result.startswith(str(self.directory) + os.sep)
+                    or cwd.is_relative_to(self.state["config"]["worktree"])
+                ):
+                    found.append(int(entry.name))
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # Process exited during the probe.
+            except PermissionError:
+                # A non-dumpable process, such as a key agent, hides both fields.
+                try:
+                    name = (entry / "comm").read_text().strip()
+                except OSError:
+                    name = "unknown"
+                unreadable.append(f"{entry.name} ({name})")
+        if unreadable:
+            raise Blocked(
+                "process evidence is unreadable for PID "
+                + ", ".join(sorted(unreadable))
+                + "; stop each process, then rerun --diagnose"
+            )
+        return sorted(found)
+
+    def recovery_files(self) -> dict[str, str]:
+        files = {}
+        for path in sorted(self.directory.rglob("*")):
+            relative = str(path.relative_to(self.directory))
+            if path.is_symlink():
+                raise Blocked("recovery evidence contains a symlink; preserve and reconcile it")
+            if (
+                path.is_file()
+                and relative not in ("runner.lock", "abort.json")
+                and not relative.startswith(".abort-staging/")
+            ):
+                files[relative] = digest(path)
+        return files
+
+    def diagnose_recovery(self) -> dict[str, Any]:
+        if self.state.get("version") != 2 or not re.fullmatch(
+            r"[0-9a-f]{64}", self.state.get("run_id") or ""
+        ):
+            raise Blocked("recovery requires a version 2 checkpoint with a recorded run identity")
+        if Path.cwd().resolve() != Path(self.state["config"]["worktree"]).resolve():
+            raise Blocked("run recovery from the original review worktree root")
+        if not self.state.get("control_hashes"):
+            raise Blocked("checkpoint has no pinned control provenance")
+        self.verify_control()
+        head = self.boundary()
+        ledger = self.recovery_ledger(head)
+        blockers = []
+        workers = self.recovery_workers()
+        if workers:
+            blockers.append("worker may still be running; reconcile listed processes before abort")
+        attempts = self.state.get("attempts", [])
+        pending = self.state.get("pending")
+        if pending and pending.get("phase") != "prepared" and not any(
+            a.get("attempt_id") == pending.get("attempt_id") for a in attempts
+        ):
+            blockers.append("pending worker identity is missing; mutation outcome is uncertain")
+        for attempt in attempts:
+            if (
+                type(attempt.get("exit_status")) is not int
+                and attempt.get("cleanup_completed") is not True
+            ):
+                blockers.append("worker exit is unknown; mutation outcome is uncertain")
+            group = attempt.get("process_group")
+            if group is not None:
+                if type(group) is not int or group <= 0:
+                    blockers.append("invalid worker process group")
+                else:
+                    try:
+                        os.killpg(group, 0)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        blockers.append("worker group probe denied; reconcile before abort")
+                    else:
+                        blockers.append("worker process group still exists; reconcile before abort")
+            elif attempt.get("failure_reason") == "cleanup_denied":
+                blockers.append("worker cleanup is unproven; reconcile before abort")
+        if self.state.get("finishing"):
+            blockers.append("terminal mutation is pending; finish its reconciliation first")
+        if ledger.get("end") and ledger["end"]["outcome"] != "aborted":
+            blockers.append("run already ended with a different outcome")
+        with tempfile.TemporaryDirectory(prefix="review-recovery-") as temp:
+            folder = Path(temp)
+            self.threads(folder / "threads.json")
+            self.comments(folder / "comments.json")
+            comments = read(folder / "comments.json")
+            # Only our exact abort marker may appear after a lost POST response.
+            marker = f"<!-- local-review-run-end:v1 id={self.state['run_id']} outcome=aborted head={head} -->"
+            terminal_body = (
+                f"{marker}\n\nReview aborted at `{head[:12]}`. "
+                "This run does not establish convergence."
+            )
+            comments = [row for row in comments if row.get("body") not in (marker, terminal_body)
+                        or row.get("author") != self.state["actor"]]
+            snapshot = {
+                "run_id": self.state["run_id"], "head": head,
+                "checkpoint_head": self.state["head"],
+                "files": self.recovery_files(),
+                "ledger": {k: v for k, v in ledger.items() if k != "end"},
+                "threads": read(folder / "threads.json"), "comments": comments,
+            }
+        if self.boundary() != head:
+            raise Blocked("head changed during diagnosis; rerun --diagnose")
+        return {"snapshot": snapshot, "evidence_sha256": json_digest(snapshot),
+                "workers": workers, "blockers": blockers, "end": ledger.get("end")}
+
+    def abort_run(self, evidence: str) -> dict[str, Any]:
+        report = self.diagnose_recovery()
+        if report["blockers"]:
+            raise Blocked("; ".join(report["blockers"]))
+        path = self.directory / "abort.json"
+        existing = read(path) if path.exists() else None
+        if existing is not None and (
+            not isinstance(existing, dict)
+            or existing.get("version") != 1
+            or existing.get("phase") not in ("prepared", "aborted")
+            or not isinstance(existing.get("snapshot"), dict)
+            or json_digest(existing["snapshot"]) != existing.get("evidence_sha256")
+        ):
+            raise Blocked("abort receipt is malformed; preserve it for reconciliation")
+        if existing is not None and (existing["phase"] == "aborted" or report["end"]):
+            # The authenticated marker ended the run. Later PR conversation and
+            # commits are not evidence about the preserved checkpoint.
+            saved, live, end = existing.get("snapshot"), report["snapshot"], report["end"]
+            if existing["evidence_sha256"] != evidence:
+                raise Blocked("abort receipt records a different evidence digest; repeat --abort-run with the digest in abort.json")
+            if (
+                not isinstance(saved, dict)
+                or json_digest(saved) != evidence
+                or any(
+                    saved.get(key) != live[key]
+                    for key in ("run_id", "checkpoint_head", "files")
+                )
+                or not end
+                or end["outcome"] != "aborted"
+                or end["head"] != saved["head"]
+            ):
+                raise Blocked("abort receipt conflicts with authenticated terminal evidence")
+            if existing["phase"] == "prepared":
+                existing["phase"] = "aborted"
+                save(path, existing, staging=self.directory / ".abort-staging")
+            return existing
+        if evidence != report["evidence_sha256"]:
+            raise Blocked("recovery evidence changed; rerun --diagnose and inspect before authorizing abort")
+        receipt = {"version": 1, "phase": "prepared", "evidence_sha256": evidence,
+                   "snapshot": report["snapshot"]}
+        if existing is not None:
+            if existing.get("evidence_sha256") != evidence or existing.get("snapshot") != report["snapshot"]:
+                # A fresh digest explicitly authorizes the new live evidence,
+                # but never permits replacement of the preserved checkpoint.
+                if any(existing["snapshot"].get(key) != report["snapshot"][key]
+                       for key in ("run_id", "checkpoint_head", "files")):
+                    raise Blocked("abort intent conflicts with preserved checkpoint files; preserve it for reconciliation")
+                history = self.directory / ".abort-staging" / ("intent-" + existing["evidence_sha256"] + ".json")
+                if history.exists() and read(history) != existing:
+                    raise Blocked("saved abort intent history conflicts; preserve it for reconciliation")
+                save(history, existing, staging=self.directory / ".abort-staging")
+                save(path, receipt, staging=self.directory / ".abort-staging")
+        else:
+            if report["end"]:
+                raise Blocked("run ended outside this recovery; reconcile before abort")
+            save(path, receipt, staging=self.directory / ".abort-staging")
+        self.helper("controller", "finish-run", *self.scope(report["snapshot"]["head"]),
+                    "--run-id", self.state["run_id"], "--outcome", "aborted")
+        receipt["phase"] = "aborted"
+        save(path, receipt, staging=self.directory / ".abort-staging")
+        return receipt
 
     def verify_control(self) -> None:
         for name, expected in self.state.get("control_hashes", {}).items():
@@ -988,6 +1237,8 @@ class Runner:
             config["scope_decision"] = scope_decision
         if getattr(self.args, "restart", False):
             config["restart"] = True
+        if getattr(self.args, "restart_aborted", None):
+            config["restart_aborted"] = self.args.restart_aborted
         if self.state:
             if self.state.get("version") not in (1, 2):
                 raise Blocked("unsupported checkpoint version")
@@ -1396,6 +1647,11 @@ class Runner:
         # Build the environment first: a failure here launched nothing and must
         # leave the owed pass resumable, not an unknown "launching" attempt.
         env = self.environment(pending["engine"])
+        if origin := pending.get("validation_origin"):
+            failed = self.verify_validation_recovery(pending, origin)
+            env["ACTIVELOOM_VALIDATION_FAILURE_LOG"] = str(
+                self.directory / failed["folder"] / failed["validation_failure"]["log"]
+            )
         if origin := pending.get("capacity_origin"):
             attempts = [
                 item for item in self.state["attempts"]
@@ -1532,6 +1788,9 @@ class Runner:
             error = caught
             attempt["exit_status"] = getattr(caught, "exit_status", None)
             attempt["failure_reason"] = "execution_failed_or_unknown"
+            attempt["cleanup_completed"] = (
+                getattr(caught, "cleanup_completed", False) is True
+            )
             marker = folder / "launch.json"
             if marker.is_file():
                 evidence = read(marker)
@@ -1787,10 +2046,23 @@ class Runner:
         ):
             raise Blocked(f"{failure} evidence changed or a reviewer result exists")
         prefix = kind.replace("_", "-")
+        # A validation repair launches after a completed clean candidate that
+        # may have posted. From then on the failed gate's snapshot, not the
+        # pre-pass one, is what a failed worker must have left unchanged.
+        gate = None
+        if origin := pending.get("validation_origin"):
+            gates = [a for a in self.state["attempts"] if a["attempt_id"] == origin]
+            if len(gates) != 1:
+                raise Blocked("validation recovery origin changed")
+            gate = gates[0]
         for name, capture in (("threads", self.threads), ("comments", self.comments)):
             before = folder / f"before-{name}.json"
             if digest(before) != pending.get(f"before_{name}_sha256"):
                 raise Blocked("pre-pass review evidence changed")
+            if gate is not None:
+                before = self.directory / gate["folder"] / f"validation-{name}.json"
+                if digest(before) != gate["validation_failure"][name + "_sha256"]:
+                    raise Blocked("validation review snapshot changed")
             current = folder / f"{prefix}-{name}.json"
             capture(current)
             if digest(current) != digest(before):
@@ -1888,6 +2160,132 @@ class Runner:
                     folder / name, target, attempt["attempt_id"]
                 )
         return retry
+
+    def record_validation_failure(
+        self, pending: dict[str, Any], head: str, result: dict[str, Any],
+        index: int, argv: list[str], error: ProcessFailure,
+    ) -> bool:
+        # Only an ordinary failed gate after a clean, unchanged-head review is
+        # retryable. Unknown exits, timeouts and material transitions keep their
+        # existing recovery boundary. A pass gets at most one repair attempt.
+        if (
+            pending.get("validation_origin")
+            or pending.get("validation_repair_refused")
+            or not {"before_threads_sha256", "before_comments_sha256"} <= set(pending)
+            or result["status"] != "clean"
+            or head != pending["before"]
+            or head != self.state["head"]
+            or not 0 < error.exit_status < 124
+        ):
+            return False
+        attempt = self.state["attempts"][-1]
+        if (
+            attempt["attempt_id"] != pending.get("attempt_id")
+            or attempt["phase"] != "returned"
+            or attempt["exit_status"] != 0
+        ):
+            return False
+        if self.boundary() != head:
+            raise Blocked("validation changed the reviewed head")
+        folder = self.directory / pending["folder"]
+        log = f"check-{index}.log"
+        receipt = {
+            "head": head, "result_sha256": digest(folder / "result.json"),
+            "log": log, "log_sha256": digest(folder / log),
+            "argv": argv, "exit_status": error.exit_status,
+        }
+        for name, capture in (("threads", self.threads), ("comments", self.comments)):
+            path = folder / f"validation-{name}.json"
+            capture(path)
+            receipt[name + "_sha256"] = digest(path)
+        attempt["validation_failure"] = receipt
+        pending["phase"] = "validation_failed"
+        self.persist()
+        return True
+
+    def verify_validation_recovery(
+        self, pending: dict[str, Any], origin: str,
+    ) -> dict[str, Any]:
+        self.verify_control()
+        attempts = [a for a in self.state["attempts"] if a["attempt_id"] == origin]
+        if len(attempts) != 1:
+            raise Blocked("validation recovery origin changed")
+        attempt = attempts[0]
+        receipt = attempt.get("validation_failure", {})
+        if (
+            attempt.get("phase") != "returned" or attempt.get("exit_status") != 0
+            or (attempt.get("engine"), attempt.get("round"))
+            != (pending["engine"], pending["round"])
+            or receipt.get("head") != pending["before"]
+            or self.boundary() != pending["before"]
+            or self.state["head"] != pending["before"]
+            or type(receipt.get("exit_status")) is not int
+            or not 0 < receipt["exit_status"] < 124
+            or not re.fullmatch(r"check-[0-9]+\.log", str(receipt.get("log")))
+        ):
+            raise Blocked("validation recovery requires the unchanged completed pass")
+        decision = self.decision(pending["before"])
+        if (
+            decision.get("passes") != self.state["completed"]
+            or decision.get("status") != "next"
+            or (decision.get("engine"), decision.get("round"))
+            != (pending["engine"], pending["round"])
+        ):
+            raise Blocked("validation recovery cannot change the owed pass or budget")
+        folder = self.directory / attempt["folder"]
+        if (
+            digest(folder / "result.json") != receipt["result_sha256"]
+            or digest(folder / receipt["log"]) != receipt["log_sha256"]
+            or read(folder / "result.json")["status"] != "clean"
+            or digest(folder / "historical.json") != pending["historical_sha256"]
+        ):
+            raise Blocked("validation failure evidence changed")
+        for name, capture in (("threads", self.threads), ("comments", self.comments)):
+            if digest(folder / f"before-{name}.json") != pending[f"before_{name}_sha256"]:
+                raise Blocked("pre-pass review evidence changed")
+            path = folder / f"validation-{name}.json"
+            if digest(path) != receipt[name + "_sha256"]:
+                raise Blocked("validation review snapshot changed")
+            current = folder / f"validation-current-{name}.json"
+            capture(current)
+            if digest(current) != receipt[name + "_sha256"]:
+                raise Blocked("review evidence changed after validation failure")
+        return dict(attempt)
+
+    def recover_validation(self, pending: dict[str, Any]) -> None:
+        if pending.get("validation_origin"):
+            raise Blocked("validation repair already attempted; no further retry")
+        origin = pending["attempt_id"]
+        try:
+            attempt = self.verify_validation_recovery(pending, origin)
+        except ProcessFailure:
+            raise
+        except Blocked as error:
+            if "validation_recovery" in pending:
+                raise
+            # Nothing is staged yet, so an unverifiable repair forfeits its slot
+            # and the pass returns to the ordinary gate rerun.
+            pending["phase"] = "returned"
+            pending["validation_repair_refused"] = True
+            self.persist()
+            raise Blocked(
+                f"automatic validation repair refused ({error}); "
+                "--resume reruns the failed gates without a repair attempt"
+            ) from error
+        retry = self.stage_retry(
+            pending, attempt, "validation_recovery", "validation-retry", "validation repair"
+        )
+        pending.update(
+            folder=str(retry.relative_to(self.directory)), phase="prepared",
+            validation_origin=origin,
+        )
+        pending.pop("validation_recovery")
+        self.persist()
+        print(
+            f"Validation failed: one bounded repair by {pending['engine']} "
+            f"in the same run and round {pending['round']}; original evidence retained",
+            flush=True,
+        )
 
     def recover_startup_stall(self, pending: dict[str, Any]) -> None:
         """Relaunch a Codex pass that stalled before thread.started, once."""
@@ -2263,6 +2661,10 @@ class Runner:
             argv.extend(["--check", check])
         if config.get("scope_decision"):
             argv.extend(["--scope-decision", config["scope_decision"]])
+        if config.get("restart"):
+            argv.append("--restart")
+        if config.get("restart_aborted"):
+            argv.extend(["--restart-aborted", config["restart_aborted"]])
         if (self.state.get("pending") or {}).get("phase") == "preflight_failed":
             argv.append("--recover-preflight")
         intent = (self.state.get("pending") or {}).get("legacy_reconciliation")
@@ -2369,11 +2771,18 @@ class Runner:
             )
         if not (folder / "validated.json").exists():
             for index, check in enumerate(validation["commands"]):
-                managed(
-                    check["argv"],
-                    folder / f"check-{index}.log",
-                    check["environment"],
-                )
+                try:
+                    managed(
+                        check["argv"],
+                        folder / f"check-{index}.log",
+                        check["environment"],
+                    )
+                except ProcessFailure as error:
+                    if self.record_validation_failure(
+                        pending, head, result, index, check["argv"], error
+                    ):
+                        return
+                    raise
             if self.boundary() != head:
                 raise Blocked("validation changed the reviewed head")
             save(folder / "validated.json", expected_validation)
@@ -2786,8 +3195,7 @@ class Runner:
         if usage is None:
             return "not emitted: the engine's usage helper is unavailable"
         rows = self.issue_comments()
-        if self.telemetry_recorded(boundary["key"], rows):
-            return "the reviewer already emitted this pass's record"
+        already_recorded = self.telemetry_recorded(boundary["key"], rows)
         directory = self.directory / boundary["directory"]
         output = directory / ("runner-" + uuid.uuid4().hex)
         output.mkdir(mode=0o700)
@@ -2831,6 +3239,21 @@ class Runner:
                 for attempt, duration in zip(attempts, durations, strict=True)
             ):
                 delta["durationSeconds"] = round(sum(durations), 3)
+        if already_recorded:
+            if delta.get("enabled") is True and delta.get("durationSeconds") is not None:
+                # The record may name either end of a head-moving pass; its key binds both.
+                for recorded_head in dict.fromkeys((head, pending["before"])):
+                    outcome = self.helper(
+                        "ledger", "enrich-telemetry-duration", *self.scope(recorded_head),
+                        "--base", self.state["base"], "--engine", engine,
+                        "--round", str(pending["round"]),
+                        "--idempotency-key", boundary["key"],
+                        "--duration-seconds", str(delta["durationSeconds"]),
+                    )
+                    if outcome.get("emitted") is True:
+                        return "preserved the reviewer's record with measured duration"
+                return "duration enrichment unavailable; preserved the reviewer's record"
+            return "the reviewer already emitted this pass's record"
         findings = self.telemetry_findings(pending, rows, output)
         if isinstance(findings, str):
             return f"not emitted: findings measurement unavailable ({findings})"
@@ -2910,6 +3333,8 @@ class Runner:
         return f"Reviewer settings: {self.settings_call('describe', settings)}.\n"
 
     def run(self) -> str:
+        if (self.directory / "abort.json").exists():
+            raise Blocked("abort recovery exists; complete --abort-run, then explicitly authorize --restart --restart-aborted <run-id> (new budget)")
         self.initialize()
         if self.state["status"] in ("converged", "plan-complete", "exhausted"):
             if self.boundary() != self.state["head"]:
@@ -2943,11 +3368,14 @@ class Runner:
                 self.state["base"],
                 "--tier",
                 config["tier"],
+                "--trigger",
+                str(self.args.trigger) if config["tier"] == "deep" else "none",
                 "--" + config["mode"],
                 config["plan"],
                 "--authorization-file",
                 str(self.directory / "authorization.txt"),
                 *(["--restart"] if config.get("restart") else []),
+                *(["--restart-from-run", config["restart_aborted"]] if config.get("restart_aborted") else []),
                 *(
                     ["--scope-decision", config["scope_decision"]]
                     if config.get("scope_decision")
@@ -2955,6 +3383,7 @@ class Runner:
                 ),
             )
             self.state["run_id"] = started["run_id"]
+            self.state["tier_in_run"] = True
             self.persist()
         if not self.state.get("metadata_posted"):
             engines = [
@@ -2978,10 +3407,14 @@ class Runner:
                     "existing roster differs from this plan; explicitly reconcile it first"
                 )
             # A single-engine finite plan may run, but cannot claim independent coverage.
-            if reviewers:
+            if reviewers and not (
+                roster_state.get("present") and roster_state.get("version") == 2
+            ):
                 roster = self.directory / "roster.txt"
+                labels = {"codex": "Codex", "claude": "Claude", "gemini": "Gemini"}
                 roster.write_text(
-                    "Reviewer roster from the explicitly authorized runner plan.\n"
+                    f"Review author: {labels[self.args.author]}. Independent reviewers: "
+                    + ", ".join(labels[e] for e in reviewers) + ".\n"
                 )
                 self.helper(
                     "ledger",
@@ -2994,24 +3427,19 @@ class Runner:
                     "--content-file",
                     str(roster),
                 )
-            tier = self.directory / "tier.txt"
-            trigger = (
-                f" trigger={self.args.trigger}"
-                if self.args.tier == "deep"
-                else " trigger=none"
-            )
-            tier.write_text(
-                f"<!-- local-review-tier:v1 tier={self.args.tier}{trigger} head={self.state['head']} -->\n"
-                + (self.directory / "authorization.txt").read_text()
-                + "\n"
-            )
-            self.helper(
-                "ledger",
-                "post-pr-comment",
-                *self.scope(self.state["head"]),
-                "--body-file",
-                str(tier),
-            )
+            if not self.state.get("tier_in_run"):
+                # Preserve setup recovery for a run started by an older controller.
+                tier = self.directory / "tier.txt"
+                trigger = self.args.trigger if self.args.tier == "deep" else "none"
+                tier.write_text(
+                    f"<!-- local-review-tier:v1 tier={self.args.tier} trigger={trigger} head={self.state['head']} -->\n"
+                    f"{self.args.tier.title()} review at `{self.state['head'][:12]}` "
+                    f"(trigger {trigger}); scope and authorization are in the run-start comment.\n"
+                )
+                self.helper(
+                    "ledger", "post-pr-comment", *self.scope(self.state["head"]),
+                    "--body-file", str(tier),
+                )
             self.state["metadata_posted"] = True
             self.persist()
         while True:
@@ -3032,6 +3460,8 @@ class Runner:
                     self.recover_startup_stall(pending)
                 elif pending["phase"] == "provider_500_failed":
                     self.recover_provider_500(pending)
+                elif pending["phase"] == "validation_failed":
+                    self.recover_validation(pending)
                 elif pending["phase"] == "cleanup_blocked":
                     self.recover_cleanup(pending)
                 elif pending["phase"] == "prepared":
@@ -3124,19 +3554,19 @@ class Runner:
             self.launch(pending)
 
 
-def archive_terminal_checkpoint(directory: Path) -> bool:
+def archive_terminal_checkpoint(directory: Path, *, aborted: bool = False) -> bool:
     checkpoint = directory / "state.json"
     if checkpoint.is_symlink():
         raise Blocked("checkpoint file cannot be a symlink")
     if not checkpoint.exists():
         return False
     state = read(checkpoint)
-    if (
+    if not aborted and (
         state.get("status") not in ("converged", "plan-complete", "exhausted")
         or state.get("pending") is not None
         or state.get("finishing")
     ):
-        raise Blocked("cannot restart a nonterminal review checkpoint; use --resume")
+        raise Blocked("cannot restart a nonterminal review checkpoint; use --resume or inspect --diagnose for explicit abort recovery")
     run_id = state.get("run_id")
     if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{64}", run_id):
         raise Blocked("terminal checkpoint has no valid run id")
@@ -3150,6 +3580,89 @@ def archive_terminal_checkpoint(directory: Path) -> bool:
     return True
 
 
+def verify_aborted_archive(args: argparse.Namespace, archive: Path) -> None:
+    if archive.is_symlink() or not archive.is_dir():
+        raise Blocked("preserved aborted archive must be a regular directory")
+    old = Runner(args, archive)
+    receipt = read(archive / "abort.json")
+    snapshot = receipt.get("snapshot") if isinstance(receipt, dict) else None
+    if (
+        not isinstance(snapshot, dict)
+        or receipt.get("version") != 1
+        or receipt.get("phase") != "aborted"
+        or receipt.get("evidence_sha256") != json_digest(snapshot)
+        or old.state.get("version") != 2
+        or old.state.get("run_id") != args.restart_aborted
+        or snapshot.get("run_id") != args.restart_aborted
+        or snapshot.get("checkpoint_head") != old.state.get("head")
+        or old.state.get("config", {}).get("repo") != args.repo
+        or old.state.get("config", {}).get("pr") != args.pr
+        or not old.state.get("control_hashes")
+        or snapshot.get("files") != old.recovery_files()
+    ):
+        raise Blocked("preserved aborted archive conflicts with its receipt")
+    old.verify_control()
+
+
+def recovery_main(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Inspect or explicitly abort an interrupted review; never launches a worker.")
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--pr", required=True, type=int)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--diagnose", action="store_true")
+    action.add_argument("--abort-run", metavar="RUN_ID")
+    parser.add_argument("--evidence-sha256")
+    args = parser.parse_args(arguments)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo) or args.pr < 1:
+        parser.error("invalid repository or PR")
+    if args.abort_run and (
+        not re.fullmatch(r"[0-9a-f]{64}", args.abort_run)
+        or not re.fullmatch(r"[0-9a-f]{64}", args.evidence_sha256 or "")
+    ):
+        parser.error("--abort-run requires the diagnosed run ID and --evidence-sha256")
+    if args.diagnose and args.evidence_sha256:
+        parser.error("--evidence-sha256 authorizes abort only")
+    common = Path(command(["git", "rev-parse", "--git-common-dir"])).resolve()
+    directory = common / "activeloom-review" / f"{args.repo.replace('/', '-')}-{args.pr}"
+    if not (directory / "state.json").is_file():
+        raise Blocked(f"no review checkpoint exists for this PR: {directory}")
+    # Open existing lock files only: diagnosis must not create checkpoint state.
+    with ExitStack() as stack:
+        for path in (directory.parent / (directory.name + ".lock"), directory / "runner.lock"):
+            if path.is_symlink() or directory.is_symlink():
+                raise Blocked("recovery paths cannot be symlinks")
+            lock = stack.enter_context(path.open("r"))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise Blocked("another runner owns this PR; wait for it to stop before recovery") from error
+        digest(directory / "state.json")
+        runner = Runner(args, directory)
+        if runner.state["config"]["repo"] != args.repo or runner.state["config"]["pr"] != args.pr:
+            raise Blocked("checkpoint repository or PR identity differs")
+        if args.abort_run:
+            if args.abort_run != runner.state.get("run_id"):
+                raise Blocked("abort authorization names a different run")
+            receipt = runner.abort_run(args.evidence_sha256)
+            print(json.dumps({"status": "aborted", "run_id": args.abort_run,
+                              "receipt": str(directory / "abort.json"),
+                              "head": receipt["snapshot"]["head"],
+                              "next": "Separate --restart --restart-aborted <run_id> authorization creates a NEW budget; previous convergence is not implied."}))
+            return 0
+        report = runner.diagnose_recovery()
+        snapshot = report["snapshot"]
+        print(json.dumps({"run_id": snapshot["run_id"], "head": snapshot["head"],
+                          "checkpoint_head": snapshot["checkpoint_head"],
+                          "pending": runner.state.get("pending"),
+                          "attempts": runner.state.get("attempts"),
+                          "completed": runner.state.get("completed"),
+                          "ledger": snapshot["ledger"], "end": report["end"],
+                          "workers": report["workers"], "blockers": report["blockers"],
+                          "evidence_sha256": report["evidence_sha256"],
+                          "checkpoint": str(directory)}, sort_keys=True))
+        return 2 if report["blockers"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments == ["--validate-contract"]:
@@ -3160,6 +3673,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if os.environ.get("AGENT_LOOP_REVIEW_RESULT_FILE"):
         raise Blocked("a one-pass reviewer cannot start another chain runner")
+    if any(
+        a in ("--diagnose", "--abort-run") or a.startswith("--abort-run=")
+        for a in arguments
+    ):
+        try:
+            return recovery_main(arguments)
+        except (Blocked, OSError, ValueError, KeyError) as error:
+            print(f"review-chain blocked: {error}", file=sys.stderr)
+            return 2
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--pr", required=True, type=int)
@@ -3198,6 +3720,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="explicitly authorize a new run after the prior run has ended",
     )
+    parser.add_argument("--restart-aborted", metavar="RUN_ID",
+                        help="bind --restart to one aborted run; repeats resume its successor")
     parser.add_argument(
         "--recover-preflight",
         action="store_true",
@@ -3225,6 +3749,8 @@ def main(argv: list[str] | None = None) -> int:
         help="preserve and replace the managed installation at its existing pins",
     )
     args = parser.parse_args(arguments)
+    if args.restart_aborted and (not args.restart or not re.fullmatch(r"[0-9a-f]{64}", args.restart_aborted)):
+        parser.error("--restart-aborted requires --restart and a full run ID")
     if (
         args.recover_preflight or args.migrate_controller or args.repair_installation
     ) and not args.resume:
@@ -3277,9 +3803,36 @@ def main(argv: list[str] | None = None) -> int:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise Blocked("another runner owns this PR") from error
+            if args.restart_aborted and (directory / "state.json").exists():
+                saved = read(directory / "state.json")
+                if saved.get("config", {}).get("restart_aborted") == args.restart_aborted:
+                    try:
+                        verify_aborted_archive(
+                            args, directory.with_name(directory.name + "-run-" + args.restart_aborted)
+                        )
+                    except (Blocked, OSError, ValueError, KeyError) as error:
+                        print(f"review-chain blocked: {error}; checkpoint: {directory}", file=sys.stderr)
+                        return 2
+                    args.resume = True
             if args.restart and not args.resume:
                 try:
-                    archived = archive_terminal_checkpoint(directory)
+                    aborted = False
+                    if (directory / "abort.json").exists():
+                        old = Runner(args, directory)
+                        if args.restart_aborted != old.state.get("run_id"):
+                            raise Blocked("aborted checkpoint requires --restart-aborted <its run ID> with --restart")
+                        receipt = read(directory / "abort.json")
+                        if not isinstance(receipt, dict) or receipt.get("phase") != "aborted":
+                            raise Blocked("abort is not complete; repeat the same --abort-run command before restart")
+                        old.abort_run(receipt["evidence_sha256"])
+                        aborted = True
+                        print("Restart creates a NEW review budget; the aborted run does not establish convergence.", file=sys.stderr)
+                    elif args.restart_aborted:
+                        archive = directory.with_name(directory.name + "-run-" + args.restart_aborted)
+                        if (directory / "state.json").exists() or not (archive / "abort.json").is_file():
+                            raise Blocked("restart authorization does not name the preserved aborted checkpoint")
+                        verify_aborted_archive(args, archive)
+                    archived = archive_terminal_checkpoint(directory, aborted=aborted)
                 except (Blocked, OSError, ValueError, KeyError) as error:
                     print(
                         f"review-chain blocked: {error}; checkpoint: {directory}",
@@ -3308,7 +3861,8 @@ def run_with_checkpoint(runner: Runner, directory: Path) -> int:
             f"review-chain blocked: {error}; checkpoint: {directory}",
             file=sys.stderr,
         )
-        if runner.state:
+        # A saved abort intent closes --resume; its refusal names the next step.
+        if runner.state and not (directory / "abort.json").exists():
             print(
                 f"After reconciliation, in {runner.state['config']['worktree']}:\n{runner.recovery_command()}",
                 file=sys.stderr,

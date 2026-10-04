@@ -63,6 +63,34 @@ Use an allowlist for every scoped or retrospective-driven run.
 Collection branches and worker-side publication are removed. Every selected
 issue gets a unique `agent-loop/issue-<N>-<run>` branch and linked worktree.
 
+## Isolated repository runs
+
+For a new run alongside other work in the same repository, add
+`--isolate <new-directory>`. The wrapper runs preflight, then creates an
+independent clone under that owner-only directory and a linked `controller`
+worktree. Issue worktrees belong to that clone, so unrelated branch-tracking
+or ref changes in the original checkout do not change the batch's Git state.
+`--dry-run --isolate <new-directory>` previews selection without creating it.
+
+The launcher, isolation helper, consumer config, instructions, and optional
+prompt must match committed files on the configured base. Commit and land
+bootstrap changes before using isolation; local edits and untracked inputs are
+not copied. Origin fetch/push destinations and repository-local operational
+Git settings are preserved. Relative configuration paths and hooks resolve
+from the isolated checkout; configure external paths explicitly when needed.
+Hooks and `info/` files installed in the original checkout's Git directory are
+not copied, so checks that live only there do not run in the isolated batch.
+
+The clone, controller, and local branches are retained after completion or
+failure. Keep them until their work and recovery state are no longer needed.
+Resume with the `--resume-run` or `--resume-batch` command the isolated run
+printed: it names the controller's runner and, where the runner needs it, the
+controller checkout. Do not pass `--isolate` again or move an existing run into
+a new clone.
+This costs an additional repository copy per run. Global/system Git settings,
+credentials, and installed tools remain shared and subject to existing checks;
+this mode isolates repository metadata, not processes or credentials.
+
 ## Required Consumer Files
 
 - `agent-loop-instructions.md`: repository conventions and worker safety rules.
@@ -97,27 +125,27 @@ The config is parsed as literal `key = value` lines and is never sourced.
 Unknown or duplicate keys fail closed. Hook values are shell commands executed
 with the issue worktree as the current directory.
 
-| Key                                              | Purpose                                                                                                                                        |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `base_branch`                                    | Integration branch; env `AGENT_LOOP_BASE_BRANCH` overrides it.                                                                                 |
-| `setup_hook`                                     | Isolated bootstrap, such as `pnpm install --frozen-lockfile`. It must not change HEAD or leave Git-visible worktree changes.                   |
-| `validation_hook`                                | Required non-mutating validation after the worker, every review pass, and fresh-base integration.                                              |
-| `claude_review_hook`                             | Pinned trusted-launcher invocation for the fresh local Claude review. Consumer overrides are rejected.                                         |
-| `codex_review_hook`                              | Pinned trusted-launcher invocation for the fresh local Codex review. Consumer overrides are rejected.                                          |
-| `review_contract_version`                        | Required hook contract. New and migrated consumers use `4`; versions `2` and `3` remain accepted for staged migration.                         |
-| `config_doctor`                                  | Run the consumer compatibility doctor after settings are pinned and before selection or claim. Contract-v3/v4 consumers set `true`.            |
-| `claude_effort_policy`                           | Retired. The doctor refuses a non-empty value; remove the key from the config.                                                                 |
-| `review_max_rounds`                              | Codex-then-Claude round cap from `1` through the hard ceiling `4`. Default `4`; cap exhaustion preserves the worktree and blocks publication.  |
-| `review_timeout_seconds`                         | Positive wall-clock budget for the entire review run, persisted across resume. Default `7200`; each pass is capped at the remaining budget.    |
-| `worker_hook`                                    | Optional worker command override. Default is `codex exec`.                                                                                     |
-| `worker_model`, `worker_fallback_model`          | Retired. The default worker's settings come from the review profile; the doctor refuses a non-empty value, so remove the keys from the config. |
-| `worker_effort`                                  | Retired, like `worker_model`.                                                                                                                  |
-| `worker_retries`                                 | Retries after clean capacity/timeout failures. Default `1`.                                                                                    |
-| `worker_timeout_seconds`, `hook_timeout_seconds` | Positive bounded execution time; zero is rejected because GNU `timeout 0` disables the bound.                                                  |
-| `retry_on_timeout`, `retry_delay_seconds`        | Timeout retry policy.                                                                                                                          |
-| `dependency_gate`                                | `ready` (legacy) or `merged-to-base`.                                                                                                          |
-| `branch_prefix`, `worktree_root`, `log_root`     | Isolated path/ref controls.                                                                                                                    |
-| `log_max_kb`, `output_max_lines`                 | Bound captured logs and displayed failure tails.                                                                                               |
+| Key                                              | Purpose                                                                                                                                           |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base_branch`                                    | Integration branch; env `AGENT_LOOP_BASE_BRANCH` overrides it.                                                                                    |
+| `setup_hook`                                     | Isolated bootstrap, such as `pnpm install --frozen-lockfile`. It must not change HEAD or leave Git-visible worktree changes.                      |
+| `validation_hook`                                | Required non-mutating validation after the worker, every review pass, and fresh-base integration.                                                 |
+| `claude_review_hook`                             | Pinned trusted-launcher invocation for the fresh local Claude review. Consumer overrides are rejected.                                            |
+| `codex_review_hook`                              | Pinned trusted-launcher invocation for the fresh local Codex review. Consumer overrides are rejected.                                             |
+| `review_contract_version`                        | Required hook contract. New and migrated consumers use `4`; versions `2` and `3` remain accepted for staged migration.                            |
+| `config_doctor`                                  | Run the consumer compatibility doctor after settings are pinned and before selection or claim. Contract-v3/v4 consumers set `true`.               |
+| `claude_effort_policy`                           | Retired. The doctor refuses a non-empty value; remove the key from the config.                                                                    |
+| `review_max_rounds`                              | Codex-then-Claude round cap from `1` through the hard ceiling `4`. Default `4`; cap exhaustion preserves the worktree and blocks publication.     |
+| `review_timeout_seconds`                         | Positive active-execution budget for the entire review run, persisted across resume. Default `7200`; each pass is capped at the remaining budget. |
+| `worker_hook`                                    | Optional worker command override. Default is `codex exec`.                                                                                        |
+| `worker_model`, `worker_fallback_model`          | Retired. The default worker's settings come from the review profile; the doctor refuses a non-empty value, so remove the keys from the config.    |
+| `worker_effort`                                  | Retired, like `worker_model`.                                                                                                                     |
+| `worker_retries`                                 | Retries after clean capacity/timeout failures. Default `1`.                                                                                       |
+| `worker_timeout_seconds`, `hook_timeout_seconds` | Positive bounded execution time; zero is rejected because GNU `timeout 0` disables the bound.                                                     |
+| `retry_on_timeout`, `retry_delay_seconds`        | Timeout retry policy.                                                                                                                             |
+| `dependency_gate`                                | `ready` (legacy) or `merged-to-base`.                                                                                                             |
+| `branch_prefix`, `worktree_root`, `log_root`     | Isolated path/ref controls.                                                                                                                       |
+| `log_max_kb`, `output_max_lines`                 | Bound captured logs and displayed failure tails.                                                                                                  |
 
 Hooks receive `AGENT_LOOP_ISSUE_ID`, `AGENT_LOOP_ISSUE_TITLE`,
 `AGENT_LOOP_ISSUE_BODY`, `AGENT_LOOP_BASE_BRANCH`, `AGENT_LOOP_BRANCH`,
@@ -192,6 +220,16 @@ Minor means low-risk, non-behavioral cleanup, clarity, or test/docs polish. Only
 material fixes restart at Codex. A missing, invalid, or blocked result stops
 clearly even if the hook process exits zero. Accepted result bytes remain
 unchanged through final validation.
+
+A blocked result beside a `<result-file>.recovery.json` sidecar is a completed
+pass whose `write-result` verification was refused, such as a `minor`
+classification on a behavioral range. After a zero-exit hook the wrapper pins
+the sidecar's SHA-256, runs `review-ledger.js recover-result` with the pass's
+identity arguments and its pre-pass comment snapshot, re-validates the result,
+and continues with the ordinary validation and attestation steps. Recovery may
+promote a saved `minor` to `material`; it launches no reviewer and spends no
+round. A blocked result without a sidecar, a sidecar that changed after the
+hook returned, or a failed recovery stops the run as blocked.
 
 The wrapper pins `GH_REPO` from the current checkout before any
 repository-scoped GitHub operation. Setup, worker, and validation hooks cannot
@@ -368,3 +406,10 @@ Do not insert `--` before `TestName`; that can run the full suite.
 
 This directory is upstream-owned and synced to consumers. Change reusable
 mechanics here, not in a consumer's synced copy.
+
+## Budget recovery
+
+Legacy absolute-deadline checkpoints require explicit, bounded migration, even
+when their deadline has expired. Follow the [budget recovery reference](https://github.com/loomantix/activeloom/blob/main/docs/agent-loop-budget-recovery.md).
+Do not edit checkpoint fields or start a replacement run to reset the budget.
+Neither `--resume-run` nor `--resume-batch` supports `--dry-run`.

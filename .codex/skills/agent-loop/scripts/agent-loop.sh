@@ -50,6 +50,7 @@ RESUME_RUN_FILE=""
 RESUME_BATCH_FILE=""
 BATCH_STATE_FILE=""
 DRY_RUN=false
+ISOLATE_DIR=""
 LEGACY_ITERATIONS_SEEN=false
 
 usage() {
@@ -64,6 +65,7 @@ Options:
   --resume-run FILE    Resume review/finalization from a private run-state file.
   --resume-batch FILE  Resume an ordered multi-issue batch from durable state.
   --dry-run            Show selection, gates, paths, hooks, and publication only.
+  --isolate DIR        Start a new run in an independent repository under DIR.
   -h, --help           Show this help.
 
 The legacy numeric first argument remains supported. Collection branches are no
@@ -100,6 +102,12 @@ while [ "$#" -gt 0 ]; do
         --dry-run)
             DRY_RUN=true
             shift
+            ;;
+        --isolate)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "--isolate requires a directory" >&2; exit 2; }
+            [ -z "$ISOLATE_DIR" ] || { echo "--isolate may be specified only once" >&2; exit 2; }
+            ISOLATE_DIR="$(realpath -m -- "$2")"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -140,6 +148,10 @@ if [ -n "$RESUME_BATCH_FILE" ] && { [ -n "$RESUME_RUN_FILE" ] || [ -n "$ISSUE_AL
 fi
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "$ISOLATE_DIR" ] && { [ -n "$RESUME_RUN_FILE" ] || [ -n "$RESUME_BATCH_FILE" ]; }; then
+    echo "--isolate starts new runs; resume using the retained controller's runner" >&2
+    exit 2
+fi
 if [ -n "${AGENT_LOOP_PROJECT_DIR:-}" ]; then
     PROJECT_DIR="$(git -C "$AGENT_LOOP_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 else
@@ -149,6 +161,10 @@ if [ -z "$PROJECT_DIR" ]; then
     echo "Could not find a Git repository from the invocation directory" >&2
     exit 1
 fi
+# A run given its project directory is not resumable from the invocation
+# directory alone, so its resume commands carry that directory.
+RESUME_ENV=""
+[ -z "${AGENT_LOOP_PROJECT_DIR:-}" ] || RESUME_ENV="AGENT_LOOP_PROJECT_DIR='$PROJECT_DIR' "
 
 PROJECT_SKILL_BASE="$PROJECT_DIR/.codex/skills"
 PACKAGED_SKILL_BASE="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -187,6 +203,8 @@ IGNORED_EFFORT_POLICY=false
 REVIEW_MAX_ROUNDS=4
 REVIEW_TIMEOUT_SECONDS=7200
 REVIEW_DEADLINE_EPOCH=0
+REVIEW_REMAINING_SECONDS=0
+REVIEW_PASS_MIN_SECONDS=1
 REVIEW_PASS_TIMEOUT_SECONDS="$HOOK_TIMEOUT_SECONDS"
 RETRY_ON_TIMEOUT=true
 RETRY_DELAY_SECONDS=15
@@ -901,11 +919,10 @@ print(path.resolve(strict=True))
         REVIEW_MAX_ROUNDS="$recorded_review_max_rounds"
         echo "   Review round cap restored from run state: $REVIEW_MAX_ROUNDS"
     fi
-    REVIEW_DEADLINE_EPOCH="$(jq -r '.reviewDeadlineEpoch // empty' <<<"$RESUME_STATE_JSON")"
-    if [ -z "$REVIEW_DEADLINE_EPOCH" ]; then
-        REVIEW_DEADLINE_EPOCH=$(( $(stat -c %Y "$RESUME_RUN_FILE") + REVIEW_TIMEOUT_SECONDS ))
-        echo "   Legacy run state uses its original checkpoint time for the review deadline"
-    fi
+    [ "$(jq -r '.version' <<<"$RESUME_STATE_JSON")" = 4 ] || {
+        echo "Legacy review budget requires explicit budget-migrate; see https://github.com/loomantix/activeloom/blob/main/docs/agent-loop-budget-recovery.md" >&2
+        exit 1
+    }
     [ "$(jq -r '.repo' <<<"$RESUME_STATE_JSON")" = "$GH_REPO" ] || {
         echo "run state repository does not match $GH_REPO" >&2
         exit 1
@@ -940,6 +957,8 @@ print(path.resolve(strict=True))
         exit 1
     }
     case "$resume_worktree" in "$WORKTREE_ROOT"/*) ;; *) echo "run state worktree is outside configured worktree_root" >&2; exit 1 ;; esac
+    run_state_helper budget-show --file "$RESUME_RUN_FILE" \
+        --lock-fd "$AGENT_LOOP_RUN_LOCK_FD" >/dev/null || exit 1
     resume_phase="$(jq -r '.phase' <<<"$RESUME_STATE_JSON")"
     case "$resume_phase" in
         draft-open|reviewing|converged|finalizing|finalized) ;;
@@ -964,10 +983,10 @@ recovery_message() {
        { [ -n "$BATCH_STATE_FILE" ] && [ -f "$BATCH_STATE_FILE" ]; }; then
         if require_trusted_git_config && require_pinned_agent_loop_entrypoint; then
             if [ -n "$AGENT_LOOP_RUN_STATE_FILE" ] && [ -f "$AGENT_LOOP_RUN_STATE_FILE" ]; then
-                echo "Resume review with: '$SCRIPT_DIR/agent-loop.sh' --resume-run '$AGENT_LOOP_RUN_STATE_FILE'" >&2
+                echo "Resume review with: ${RESUME_ENV}'$SCRIPT_DIR/agent-loop.sh' --resume-run '$AGENT_LOOP_RUN_STATE_FILE'" >&2
             fi
             if [ -n "$BATCH_STATE_FILE" ] && [ -f "$BATCH_STATE_FILE" ]; then
-                echo "Resume batch with: '$SCRIPT_DIR/agent-loop.sh' --resume-batch '$BATCH_STATE_FILE'" >&2
+                echo "Resume batch with: ${RESUME_ENV}'$SCRIPT_DIR/agent-loop.sh' --resume-batch '$BATCH_STATE_FILE'" >&2
             fi
         else
             echo "The controller trust boundary changed after startup; restore the pinned entrypoint and trusted Git configuration before resuming." >&2
@@ -1179,6 +1198,30 @@ if [ "$CONFIG_DOCTOR" = true ]; then
     else
         AGENT_LOOP_REAL_GIT="$REAL_GIT_BIN" \
             python3 -I "$CONFIG_DOCTOR_HELPER" "${doctor_command[@]}" || exit 1
+    fi
+fi
+
+if [ -n "$ISOLATE_DIR" ]; then
+    if [ "$DRY_RUN" = true ]; then
+        echo "   Isolation plan: independent repository and controller under $ISOLATE_DIR"
+        echo "   Dry-run uses current refs; no isolation directory will be created."
+    else
+        isolation_helper="$SCRIPT_DIR/isolate-repository.py"
+        isolation_args=(--project-dir "$PROJECT_DIR" --base-ref "$BASE_REMOTE_REF"
+            --destination "$ISOLATE_DIR" --harness .codex -- --iterations "$MAX_ITERATIONS")
+        [ -z "$ISSUE_ALLOWLIST" ] || isolation_args+=(--issues "$ISSUE_ALLOWLIST")
+        [ "$INCLUDE_ASSIGNED" = false ] || isolation_args+=(--include-assigned)
+        if [ "$REVIEW_CONTRACT_VERSION" = 4 ]; then
+            require_trusted_project_git_config || exit 1
+            isolation_oid="$(require_base_pinned_tool "$isolation_helper" \
+                ".codex/skills/agent-loop/scripts/isolate-repository.py" 100755 \
+                "agent-loop isolation helper")" || exit 1
+            "$REAL_GIT_BIN" --no-replace-objects -C "$PROJECT_DIR" cat-file blob "$isolation_oid" | \
+                AGENT_LOOP_REAL_GIT="$REAL_GIT_BIN" python3 -I - "${isolation_args[@]}" || exit $?
+        else
+            AGENT_LOOP_REAL_GIT="$REAL_GIT_BIN" python3 -I "$isolation_helper" "${isolation_args[@]}" || exit $?
+        fi
+        exit 0
     fi
 fi
 
@@ -1691,6 +1734,7 @@ install_pinned_review_launcher() {
 run_bounded_hook() {
     local phase="$1" hook_command="$2" timeout_seconds="$3" log_file="$4"
     local allow_review_mutations="${5:-false}"
+    local BUDGET_ATTEMPT="" BUDGET_STARTED_NS=""
     local direct_review_engine="${6:-}"
     local disable_consumer_git_extensions="${7:-false}"
     local max_bytes=$((LOG_MAX_KB * 1024)) status=0
@@ -1755,6 +1799,9 @@ run_bounded_hook() {
         echo "hook command guard directory holds unexpected entries" >&2
         return 1
     }
+    if [ "${budgeted:-false}" = true ]; then
+        budget_begin "$timeout_seconds" || return 1
+    fi
     (
         set +e
         if [ -n "$AGENT_LOOP_RUN_LOCK_FD" ]; then
@@ -1804,6 +1851,15 @@ run_bounded_hook() {
         fi
         exit "${PIPESTATUS[0]}"
     ) >"$log_file" 2>&1 || status=$?
+    if [ "${budgeted:-false}" = true ]; then
+        # A signal/timeout retains the full durable reservation. Ordinary exits,
+        # including failures, charge rounded-up monotonic execution time.
+        if [ "$status" -lt 124 ]; then
+            budget_finish "$timeout_seconds" || return 1
+        else
+            echo "Budget reservation retained; reconcile after confirming all workers stopped." >&2
+        fi
+    fi
     if ! require_trusted_git_config; then
         echo "hook changed trusted Git configuration" >>"$log_file"
         status=1
@@ -1927,7 +1983,7 @@ run_validation() {
         return 1
     fi
     before_sha="$(git rev-parse HEAD)" || return 1
-    if [ "$budgeted" = true ] && [ "$REVIEW_DEADLINE_EPOCH" -gt 0 ]; then
+    if [ "$budgeted" = true ]; then
         prepare_review_pass_budget || return 1
         timeout_seconds="$REVIEW_PASS_TIMEOUT_SECONDS"
     fi
@@ -2188,7 +2244,33 @@ reset_interrupted_review_publication_journal() {
     mv -f -- "$state_tmp" "$state_file"
 }
 
+# Finalize a completed pass whose `write-result` verification was refused. The
+# helper left a blocked result beside a recovery sidecar holding the candidate.
+# As in the review-chain runner, the sidecar must still hash to the digest
+# pinned at the hook's zero exit, and `recover-result` rechecks the live head,
+# Git transition, dispositions, and range classification before it writes. No
+# reviewer is launched and no round is spent. Prints the re-validated result.
+finalize_blocked_review_result() {
+    local slug="$1" round="$2" before_sha="$3" after_sha="$4" result_file="$5"
+    local pinned_signature="$6" historical_comment_ids_file="$7" signature
+    local -a identity=(--engine "$slug" --round "$round"
+        --base "$AGENT_LOOP_REVIEW_BASE_SHA" --before "$before_sha"
+        --head "$after_sha" --result-file "$result_file")
+    signature="$(review_outcome_signature "$result_file.recovery.json")" || return 1
+    if [ "$signature" != "$pinned_signature" ]; then
+        echo "completed result recovery evidence changed after the review hook returned" >&2
+        return 1
+    fi
+    run_review_ledger recover-result \
+        --repo "$GH_REPO" --pr "$AGENT_LOOP_PR_NUMBER" "${identity[@]}" \
+        --actor "$CURRENT_LOGIN" \
+        --expected-recovery-sha256 "${pinned_signature#file:}" \
+        --historical-comment-ids-file "$historical_comment_ids_file" >/dev/null || return 1
+    run_review_ledger validate-result "${identity[@]}"
+}
+
 run_review_pass() {
+    local budgeted=true
     local engine="$1" slug="$2" hook="$3" round="$4"
     local hook_description="$5" hook_failure_description="$6"
     local review_description="$7" validation_description="$8"
@@ -2197,6 +2279,7 @@ run_review_pass() {
     local pre_pass_threads_file historical_comment_ids_file review_push_state_file
     local review_push_lock_file
     local historical_comment_ids_signature direct_review_engine
+    local result_recovery_signature=missing recovered_result_json
     local review_hook_status
     local boundary_status
 
@@ -2317,6 +2400,10 @@ run_review_pass() {
         return 1
     fi
     if [ "$REVIEW_CONTRACT_VERSION" -ge 3 ]; then
+        # Pin a result recovery sidecar at the hook's observed zero exit. Only
+        # these bytes may finalize a blocked result below.
+        result_recovery_signature="$(review_outcome_signature "$result_file.recovery.json")" || \
+            result_recovery_signature=unsafe
         require_review_outcome_signature "$engine pre-pass history" \
             "$historical_comment_ids_file" "$historical_comment_ids_signature" \
             "after review round $round" || return 1
@@ -2364,8 +2451,26 @@ run_review_pass() {
         result_hash="$(jq -r '.resultSha256' <<<"$result_json")"
         if [ "$result_status" = blocked ]; then
             blocker="$(jq -r '.blocker' <<<"$result_json")"
+            case "$result_recovery_signature" in
+                file:*)
+                    if recovered_result_json="$(finalize_blocked_review_result "$slug" "$round" \
+                        "$before_sha" "$after_sha" "$result_file" \
+                        "$result_recovery_signature" "$historical_comment_ids_file")"; then
+                        result_json="$recovered_result_json"
+                        result_status="$(jq -r '.status' <<<"$result_json")"
+                        result_hash="$(jq -r '.resultSha256' <<<"$result_json")"
+                    else
+                        echo "$engine review result finalization recovery failed in round $round" >&2
+                    fi
+                    ;;
+            esac
+        fi
+        if [ "$result_status" = blocked ]; then
             recovery_message "$engine review blocked in round $round: $blocker"
             return 1
+        fi
+        if [ -n "${recovered_result_json:-}" ]; then
+            echo "   recovered: result-finalization ($engine, round $round); no reviewer launched"
         fi
     fi
     boundary_status=0
@@ -2474,22 +2579,56 @@ require_fast_forward_base_advance() {
     fi
 }
 
+budget_state() { run_state_helper "$@"; }
+
+# agent-loop-budget:begin
+# Shared budget protocol; rendered into the three controllers.
 prepare_review_pass_budget() {
-    local now remaining
-    now="$(date +%s)"
-    if [ "$REVIEW_DEADLINE_EPOCH" -eq 0 ]; then
-        REVIEW_DEADLINE_EPOCH=$((now + REVIEW_TIMEOUT_SECONDS))
+    local remaining
+    if [ -n "$AGENT_LOOP_RUN_STATE_FILE" ]; then
+        remaining="$(budget_state budget-show --file "$AGENT_LOOP_RUN_STATE_FILE" \
+            --lock-fd "$AGENT_LOOP_RUN_LOCK_FD")" || return 1
+    else
+        remaining="$REVIEW_REMAINING_SECONDS"
     fi
-    remaining=$((REVIEW_DEADLINE_EPOCH - now))
-    if [ "$remaining" -le 0 ]; then
-        recovery_message "Local review exceeded its configured whole-run time budget."
+    if [ "$remaining" -lt "$REVIEW_PASS_MIN_SECONDS" ]; then
+        recovery_message "Local review exhausted its active execution budget." budget-exhausted
         return 1
     fi
     REVIEW_PASS_TIMEOUT_SECONDS="$HOOK_TIMEOUT_SECONDS"
     if [ "$remaining" -lt "$REVIEW_PASS_TIMEOUT_SECONDS" ]; then
         REVIEW_PASS_TIMEOUT_SECONDS="$remaining"
     fi
+    # Compatibility for nested pre-push validation. This transient bound is
+    # enclosed by the hook timeout and is never restored from a checkpoint.
+    REVIEW_DEADLINE_EPOCH=$(( $(date +%s) + REVIEW_PASS_TIMEOUT_SECONDS ))
+    echo "Review execution budget: ${remaining}s; hook bound ${REVIEW_PASS_TIMEOUT_SECONDS}s"
 }
+
+budget_begin() {
+    local seconds="$1"
+    if [ -n "$AGENT_LOOP_RUN_STATE_FILE" ]; then
+        BUDGET_ATTEMPT="$(budget_state budget-begin --file "$AGENT_LOOP_RUN_STATE_FILE" \
+            --lock-fd "$AGENT_LOOP_RUN_LOCK_FD" --seconds "$seconds" --owner "$$")" || return 1
+    else
+        [ "$seconds" -le "$REVIEW_REMAINING_SECONDS" ] || return 1
+        REVIEW_REMAINING_SECONDS=$((REVIEW_REMAINING_SECONDS - seconds))
+        BUDGET_STARTED_NS="$(python3 -c 'import time; print(time.monotonic_ns())')" || return 1
+    fi
+}
+
+budget_finish() {
+    local seconds="$1" elapsed
+    if [ -n "$AGENT_LOOP_RUN_STATE_FILE" ]; then
+        budget_state budget-finish --file "$AGENT_LOOP_RUN_STATE_FILE" \
+            --lock-fd "$AGENT_LOOP_RUN_LOCK_FD" --attempt "$BUDGET_ATTEMPT" --owner "$$" >/dev/null || return 1
+    else
+        elapsed="$(python3 -c 'import sys,time; print(max(1,(time.monotonic_ns()-int(sys.argv[1])+999999999)//1000000000))' "$BUDGET_STARTED_NS")" || return 1
+        [ "$elapsed" -le "$seconds" ] || elapsed="$seconds"
+        REVIEW_REMAINING_SECONDS=$((REVIEW_REMAINING_SECONDS + seconds - elapsed))
+    fi
+}
+# agent-loop-budget:end
 
 # A range with no review-significant file needs a human glance, not a review
 # chain. Classify before the first round so no hook, checkpoint, latch, or
@@ -2508,6 +2647,7 @@ human_glance_gate() {
 }
 
 run_review_convergence() {
+    REVIEW_REMAINING_SECONDS="$REVIEW_TIMEOUT_SECONDS"
     local round="${1:-1}" codex_classification claude_classification
     local resume_engine="${2:-codex}"
     local recovered_complete_round=false
@@ -3818,7 +3958,6 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
 
     if [ "$REVIEW_CONTRACT_VERSION" -ge 3 ]; then
         AGENT_LOOP_RUN_STATE_FILE="$AGENT_LOOP_LOG_DIR/run-state.json"
-        REVIEW_DEADLINE_EPOCH=$(( $(date +%s) + REVIEW_TIMEOUT_SECONDS ))
         run_state_helper create --file "$AGENT_LOOP_RUN_STATE_FILE" \
             --run-id "$RUN_TAG-issue-$SELECTED_ID" --repo "$GH_REPO" \
             --issue "$SELECTED_ID" --base-branch "$BASE_BRANCH" \
@@ -3831,7 +3970,7 @@ while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
             --log-dir "$AGENT_LOOP_LOG_DIR" --pr "$AGENT_LOOP_PR_NUMBER" \
             --pr-url "$AGENT_LOOP_PR_URL" --base-sha "$initial_base_sha" \
             --head-sha "$initial_pr_sha" \
-            --review-deadline-epoch "$REVIEW_DEADLINE_EPOCH" \
+            --review-budget-seconds "$REVIEW_TIMEOUT_SECONDS" \
             --review-max-rounds "$REVIEW_MAX_ROUNDS" \
             --review-settings-file "$SETTINGS_PIN_FILE" >/dev/null || {
             recovery_message "Could not create the private review run-state checkpoint."
@@ -3927,7 +4066,7 @@ if [ -n "$BATCH_STATE_FILE" ]; then
         if [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
             echo -e "${YELLOW}○${NC} Ordered batch paused cleanly at the $MAX_ITERATIONS-issue iteration cap."
             if require_trusted_git_config && require_pinned_agent_loop_entrypoint; then
-                echo "Resume batch with: '$SCRIPT_DIR/agent-loop.sh' --resume-batch '$BATCH_STATE_FILE'"
+                echo "Resume batch with: ${RESUME_ENV}'$SCRIPT_DIR/agent-loop.sh' --resume-batch '$BATCH_STATE_FILE'"
             else
                 echo "The controller trust boundary changed after startup; restore the pinned entrypoint and trusted Git configuration before resuming." >&2
             fi

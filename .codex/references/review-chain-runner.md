@@ -230,6 +230,15 @@ revision, resolved schema, and allowlisted execution environment. Changes to the
 pinned runner require deliberate migration, not execution from an unverified
 replacement.
 
+### Conversation updates
+
+Run setup publishes its tier, engine order and authorization together in the
+run-start comment. A matching v2 cross-engine roster is reused across runs;
+initial or legacy rosters get one declaration naming the author and independent
+reviewers. Run-end comments show the outcome and head, including an explicit
+absence of convergence for aborted or exhausted runs. Historical evidence is
+preserved.
+
 ### Pass telemetry
 
 The runner owns each launched pass's telemetry boundary. Before the launcher
@@ -248,6 +257,14 @@ includes launcher setup and cleanup, excludes later controller validation and
 operator waiting, and does not imply measured tokens or model identity. Older
 checkpoints and attempts without an observed successful return keep duration
 unavailable.
+
+If the worker already published a record with a null duration, the runner uses
+`enrich-telemetry-duration` to fill that field on the same comment after its
+observed return. The ledger checks the actor, pass key, engine, round, base and
+head, verifies the original body before updating, then reads it back. Existing
+measurements, findings, token counts and timestamps are preserved. The operation
+is idempotent and nonfatal; emission and extraction opt-outs both prevent it.
+It does not infer token counts or model identity from elapsed time.
 
 For managed Gemini passes, the Agy launcher retains a numeric-only receipt from
 its successful single-turn JSON result. The runner binds the receipt to the
@@ -346,7 +363,40 @@ No reviewer is relaunched and the run ID, round and budget stay unchanged.
 This requires a helper that implements `recover-result`; update the published
 bundle through its normal verified distribution path, never patch it locally.
 
-`--resume` can retry this finalization, rerun a failed validation command and reconcile an attestation
+### Automatic validation repair
+
+When a reviewer returns a clean canonical result at the unchanged head and a
+required controller validation command then exits ordinarily with status 1–123,
+the runner automatically offers that same reviewer **one repair attempt for the
+owed pass**. This applies to Codex, Claude and Gemini. The reviewer receives the
+failed gate log as diagnostic evidence, must post verified findings before fixes,
+and may repair necessary fixtures within the authorized task. It may not weaken
+gates or expand unrelated scope. The controller reruns every required gate on
+the resulting head before attestation; the earlier candidate is never attested.
+
+The original result, failed log, command, exit status and ledger snapshots remain
+in the original pass directory. The retry lives in `validation-retry`. The run
+ID, base, engine, model pins, round, round cap and previous attempts are retained.
+The repair slot uses the existing per-launch timeout (at most 3660 seconds
+including launcher cleanup); it is persisted and cannot be renewed by resume.
+This is a bounded extra attempt, not an automatic abort/restart or fresh run.
+New controllers include this behavior in the authorized automatic-chain policy;
+older pinned controllers retain their original recovery behavior.
+
+An interrupted staging transaction resumes that same slot. Changed heads or
+ledger evidence, modified saved evidence, failed cleanup, unknown exits,
+timeouts and signals block automatic repair. A candidate that already changed
+the head also requires ordinary explicit recovery: this narrow path does not
+rewrite its unfinalized transition. When the repair is refused before its retry
+is staged, the slot is forfeited and the pass returns to the ordinary gate
+rerun: `--resume` reruns the failed gates and attests the original candidate
+only if they pass. A pending pass saved without pre-pass ledger digests gets no
+repair either. A second failed gate cannot launch another
+repair. `--resume` may rerun its gates after an environmental fix, but cannot
+replenish the repair slot. No abort, new budget, ready transition or merge is
+implied. Independent exact-head review remains required after a repair commit.
+
+`--resume` can retry finalization, rerun a failed validation command and reconcile an attestation
 posted before a checkpoint write, without relaunching the worker. Each launch
 attempt records its execution boundary, known exit status, and structured
 failure reason. A crash between the boundary write and process creation remains
@@ -437,3 +487,106 @@ After host failure or an uncatchable kill, an operator must reconcile any
 surviving reviewer before recovery; no script can guarantee progress while its
 host is down. The guarantee is that a running controller advances verified
 passes without another conversational turn, not that workers cannot fail.
+
+### Abort an interrupted run, then separately authorize restart
+
+A worker that exits without `result.json` can leave a nonterminal checkpoint
+that neither `--resume` nor `--restart` can advance. Use the recovery interface
+from the **original review worktree root**, with a reviewed controller that
+supports these commands. Diagnosis and abort read the checkpoint's original
+pinned helpers; they do not migrate its controller or launch reviewers.
+
+```bash
+python3 /path/to/reviewed/checkout/.codex/skills/critique/scripts/review-chain-runner.py \
+  --repo example/project --pr 42 --diagnose
+```
+
+Diagnosis is read-only. It reports the local and authenticated ledger states,
+current and checkpoint heads, worker attempts, potential surviving workers,
+blockers, and an `evidence_sha256`. Inspect the discrepancy and the preserved
+files at the printed checkpoint path. Exit 2 with a report means the listed
+blockers need reconciliation. Exit 2 with only a `review-chain blocked:` line
+means a mandatory condition failed and no digest was produced. A clean dedicated worktree, matching local/remote/PR heads,
+unchanged authenticated actor, original controller hashes, and the same run
+identity are mandatory. Linux `/proc` must be readable, and recovery must run
+in the process namespace the review ran in: inside a sandbox with its own PID
+namespace the probes cannot see a surviving worker, so an empty `workers` list
+from there proves nothing. A same-user process
+that hides its environment, such as `gpg-agent` or `ssh-agent`, cannot be shown
+to be unrelated: diagnosis names each one by PID and stops until it is stopped.
+Any other same-user process whose working directory is inside the worktree is
+reported as a potential worker, including a second shell, an editor, or the
+other side of a pipe; close them and run the command unpiped. An unknown exit without
+an explicit cleanup-completed receipt, live process groups, unreadable process evidence, unfinished terminal writes,
+or conflicting terminal markers refuse abort. Do not edit a checkpoint to
+manufacture proof of a worker exit or discard it to obtain another budget.
+
+After explicitly authorizing abandonment of that run at the inspected head,
+copy its exact run ID and evidence digest into:
+
+```bash
+python3 /path/to/reviewed/checkout/.codex/skills/critique/scripts/review-chain-runner.py \
+  --repo example/project --pr 42 --abort-run <diagnosed-run-id> \
+  --evidence-sha256 <diagnosed-evidence-sha256>
+```
+
+This command rechecks the evidence and records an intent in `abort.json` before
+posting the authenticated `aborted` terminal marker. It never marks a failed
+attempt successful. The original `state.json`, logs, results, snapshots,
+findings and attestations remain intact. An evidence change before the remote
+abort requires fresh read-only diagnosis, inspection and explicit authorization
+using the new digest. The command preserves the prior intent under
+`.abort-staging/intent-<old-digest>.json` before replacing it; changed checkpoint
+files remain a blocker. If the authenticated aborted marker already exists,
+repeat the command with the digest recorded in `abort.json`, not a freshly
+diagnosed one: it completes the receipt despite later PR
+conversation or commits, provided the marker matches that intent and
+the preserved files are unchanged. Once `abort.json` exists, `--resume` is
+refused for this run. Conflicting terminal evidence requires
+manual reconciliation, not deletion. If interrupted after the intent or after
+the remote marker was posted, repeat the **same abort command**. An identical
+completed invocation is a no-op after live verification. Do not run standalone
+reviewers or change the PR during recovery; the per-PR lock excludes other
+controllers but is not a lock on all GitHub writers.
+
+Abort stops there. Only after separate authorization, run the normal full plan
+command with `--restart --restart-aborted <aborted-run-id>`, the desired pinned base and a fresh authorization
+file. For example, in a repository with a validation contract:
+
+```bash
+python3 .codex/skills/critique/scripts/review-chain-runner.py \
+  --repo example/project --pr 42 --base <pinned-base-sha> \
+  --author codex --tier deep --trigger 3 \
+  --cycle codex,claude --until-converged \
+  --authorization-file /absolute/path/new-review-authorization.txt \
+  --restart --restart-aborted <aborted-run-id>
+```
+
+Restart requires the completed abort: a receipt in the `aborted` phase, the
+authenticated `aborted` marker at its head, and unchanged preserved files. If
+the abort is still only prepared, repeat the same abort command first. Comments,
+thread changes or commits made on the PR after the completed abort do not block
+restart. The first restart repeats the diagnosis, so its mandatory conditions
+and process checks apply again at the live head. It then
+archives the **entire directory** as `<owner>-<repo>-<pr>-run-<full-run-id>`. It creates a
+**new budget**; previous convergence is not implied and stale-head passes are
+not current-head evidence. The aborted run ID is the restart idempotency key. Repeating the same command
+resumes or reports that one successor; it never creates another budget, even
+after the successor ends. Its printed `--resume` command also preserves this key.
+An interrupted archive rename preserves the old directory; rerunning restart
+can initialize the empty active location. If the remote start succeeds before the local run ID is saved, the same command
+replays only the matching authenticated successor. A different successor, plan
+or terminal outcome blocks reconciliation rather than granting another budget.
+
+Same-run adoption of later standalone attestations is **unsupported** here.
+Their presence in an authenticated ledger does not bind them to the failed
+local worker's result, validation receipts, head transitions and attempt
+budget. Diagnosis displays the ledger decision; abort preserves it. It does
+not synthesize a canonical result or count those passes in the old checkpoint.
+
+Consumer rollout: verify that the installed runner contains `--diagnose`,
+`--abort-run` and `--restart-aborted`. For a run pinned before the update,
+invoke the reviewed checkout's entry point from the original consumer worktree
+for all three steps and retain the original controls. Test diagnosis first,
+obtain explicit abort and restart authorization separately, and retain the
+archived directory.
