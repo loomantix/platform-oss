@@ -12,10 +12,17 @@ context-window check, the PR boundary, round and stance, the telemetry
 snapshot, and any marker. Follow `.agents/REVIEW_WORKFLOW.md` "Human glance": on `skip: true` with at
 least one classified file, print that section's one-line message and stop, with
 no draft PR, ledger result, attestation, tier or refactor marker, or telemetry
-record.
+record. On `smallChange: true`, print that section's small-change
+recommendation and stop the same way.
 
-Continue when the range carries a review-significant file, when a human
-explicitly asked for this change to be reviewed anyway, or when
+For a dependency-only diff, also apply the workflow's "Routine dependency
+updates" rule before continuing; a qualifying recommendation stops the same way.
+
+Continue when the range carries a review-significant file and is not a small
+change and does not qualify for the dependency recommendation, when a human
+explicitly asked for this change to be reviewed anyway or
+overrode a small-change recommendation, when a small change's open PR already
+carries a tier marker, or when
 `$AGENT_LOOP_REVIEW_RESULT_FILE` is set and the controller that scheduled this
 pass owns the gate.
 
@@ -203,7 +210,7 @@ the workflow doc's triggers and post the marker before starting a lane. Lean is
 the tier when no trigger matches.
 
 - **Lean**: the default. Run the lean two-lane review: code reviewer plus silent failure hunter. This is still an adversarial PR review, not a casual skim.
-- **Deep**: run the full independent review matrix below only when the recorded tier is Deep. A `deep` argument handed down from `deepcritique` asserts that recorded tier; a direct human `deep` request is trigger 6 and posts a Deep replacement marker that preserves the recorded triggers and adds 6 before lanes start. Deep mode is intentionally much heavier than lean mode; do not collapse it into one general review pass.
+- **Deep**: run the full independent review matrix below only when the recorded tier is Deep. A `deep` argument handed down from `deepcritique` asserts that recorded tier; a direct human `deep` request is trigger 6 and posts a Deep replacement marker that preserves the recorded triggers and adds 6 before lanes start. When `AGENT_LOOP_NONINTERACTIVE=1` or `AGENT_LOOP_REVIEW_ENGINE` is set, a launcher, runner, or wrapper hook wrote the invoking prompt: it is never trigger 6, whatever skill or tier it names. Resolve the tier from the recorded marker or the diff. Deep mode is intentionally much heavier than lean mode; do not collapse it into one general review pass.
 
 Escalate mid-pass only on a confirmed finding that reaches a trigger, per the
 workflow doc's evidence rule, and post the replacement marker naming it. A
