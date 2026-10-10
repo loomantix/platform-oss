@@ -17,7 +17,8 @@ Place the user's authorization, scope and tier rationale in a public-safe text
 file outside the worktree. Its contents are posted to the PR. Do not include
 credentials or confidential context. Prefer the repository-declared validation
 contract below. Its selected commands run without a shell, in the review
-worktree, after each worker and before attestation. Commands are published in
+worktree, after each worker and before attestation, unless the pass cites an
+earlier gate as described below. Commands are published in
 pass summaries, so they must not contain credentials. Scoped tests are not a
 substitute for the declared gate.
 
@@ -63,6 +64,25 @@ local process values (`PATH`, home/user/shell, locale and timezone), pins those
 values in the checkpoint, and adds the gate's declared environment. Other
 ambient values do not reach validation commands. A resume with different
 allowlisted values blocks instead of silently changing the gate.
+
+Route documentation and other non-executable paths to a gate of their own.
+Matching is default-deny, so a path no gate claims selects the fallback on
+every pass, and when the fallback is the full suite one edited Markdown file
+costs a full run per pass. Give those paths a cheap gate that runs whatever
+actually reads them: a link or prose linter, or a drift check for a generated
+document.
+
+```json
+"docs": {
+  "paths": ["docs/**", "*.md"],
+  "commands": [{ "argv": ["just", "lint-docs"] }]
+}
+```
+
+`*` does not cross `/`, so `*.md` claims root-level Markdown only. Prefer that
+to `**/*.md`, which would also claim Markdown that tests or builds read from
+directories no other gate owns and silently drop the fallback for it. There is
+no ignore list: a path is either validated by a gate or it fails closed.
 
 The contract is consumer-owned and is not created or rewritten by ActiveLoom
 sync. A pull request that first adds or changes it continues to use the pinned
@@ -220,6 +240,20 @@ required gates, then attests. It snapshots control scripts outside the worktree
 so a worker's source changes cannot replace the next launcher. DCO is checked
 when the repository has its standard DCO workflow, or with `--require-dco`.
 It never repairs DCO by rewriting history.
+
+The runner does not repeat a gate it has already passed on the same commit. When
+a pass returns clean and leaves the head and worktree unchanged, and this runner
+process recorded the same resolved gates passing at that exact head under the
+same validation contract and policy revision, the pass cites that earlier gate
+instead of running it again. Its `validated.json` names the cited pass and the
+digest of that pass's receipt, and its attestation lists the gate commands, the
+head, and the pass that ran them. Every other pass runs its gates: one that
+changed the head, the first pass of a run, the first pass validated after a
+restart or `--resume`, and a validation repair. A pass interrupted after its
+receipt was saved keeps that receipt on resume, and a saved citation is
+rechecked against the cited receipt. A gate an engine ran inside its own pass
+is never cited. One consequence: a suite is no longer run several times on one
+commit, so a flaky test that only fails on a repeat run goes unnoticed.
 
 State, private logs and result files live under the Git common directory's
 `activeloom-review/<owner>-<repo>-<pr>/`. A per-PR lock prevents concurrent
@@ -508,15 +542,38 @@ files at the printed checkpoint path. Exit 2 with a report means the listed
 blockers need reconciliation. Exit 2 with only a `review-chain blocked:` line
 means a mandatory condition failed and no digest was produced. A clean dedicated worktree, matching local/remote/PR heads,
 unchanged authenticated actor, original controller hashes, and the same run
-identity are mandatory. Linux `/proc` must be readable, and recovery must run
+identity are mandatory. Linux uses readable `/proc` process evidence. macOS
+uses the system `ps` and `lsof` tools plus `KERN_PROCARGS2` for process
+environments. It checks working directories before environments: a process in
+the worktree is always a potential worker. For a hidden environment outside the
+worktree, macOS can establish that the process or its session leader predates
+the authenticated run by more than one minute. This follows the runner's
+one-shot, new-session launch contract; it does not authorize reviewers to hand
+work to existing desktop sessions. Process creation time survives `exec`, so a
+readable review identity still overrides age. The margin accommodates small
+clock skew; recovery assumes the host and GitHub clocks agree within that
+margin. A second exception covers launchd-owned Apple services at system service
+paths whose live kernel code-signing flags prove a valid, restricted platform
+binary with no untrusted helpers and no debug allowance. A name or path alone
+does not qualify. A third exception covers the `/usr/bin/caffeinate` session
+helper Claude Code keeps running: with the same code-signing proof, and whose
+parent is an ancestor of the diagnosing command other than launchd. The runner
+starts each worker as its own child and an orphaned worker is reparented to
+launchd, so no worker has such a parent. Shells also hide their environment and
+are never exempt, because a session shell that launched the runner can still
+run commands after it. The helper's descendants are still checked individually.
+Zombies have already exited and cannot mutate the review.
+Unknown creation times, new review sessions, unverified services, and unreadable
+working directories remain blockers. Other platforms are unsupported. Recovery must run
 in the process namespace the review ran in: inside a sandbox with its own PID
 namespace the probes cannot see a surviving worker, so an empty `workers` list
 from there proves nothing. A same-user process
-that hides its environment, such as `gpg-agent` or `ssh-agent`, cannot be shown
-to be unrelated: diagnosis names each one by PID and stops until it is stopped.
+that hides its environment and cannot be excluded by the platform's evidence
+checks is named by PID, and diagnosis stops until it is reconciled.
 Any other same-user process whose working directory is inside the worktree is
 reported as a potential worker, including a second shell, an editor, or the
-other side of a pipe; close them and run the command unpiped. An unknown exit without
+other side of a pipe such as `--diagnose | tail` started from the worktree;
+close them and run the command unpiped. An unknown exit without
 an explicit cleanup-completed receipt, live process groups, unreadable process evidence, unfinished terminal writes,
 or conflicting terminal markers refuse abort. Do not edit a checkpoint to
 manufacture proof of a worker exit or discard it to obtain another budget.
