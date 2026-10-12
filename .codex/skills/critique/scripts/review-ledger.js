@@ -22,11 +22,11 @@ THE SOFTWARE.
 */
 
 // src/cli.ts
-import { readFileSync as readFileSync4 } from "fs";
+import { readFileSync as readFileSync5 } from "fs";
 
 // src/constants.ts
 var PROTOCOL_VERSION = 3;
-var PACKAGE_VERSION = true ? "1.7.0" : "0.0.0-dev";
+var PACKAGE_VERSION = true ? "1.9.0" : "0.0.0-dev";
 var SUBPROCESS_MAX_BUFFER = 256 * 1024 * 1024;
 var EXPECTED_ACTOR_ENV = "AGENT_LOOP_REVIEW_ACTOR";
 var EXPECTED_THREADS_SHA256_ENV = "AGENT_LOOP_REVIEW_THREADS_SHA256";
@@ -88,6 +88,9 @@ var TELEMETRY_MARKER_PREFIX = "<!-- local-review-telemetry:";
 var OPEN_TOKEN_RE = /^[a-z0-9-]+$/;
 var PROVIDER_BUCKET_KEY_RE = /^[a-z0-9_]+$/;
 var UTC_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+function isCanonicalUtcTimestamp(value) {
+  return UTC_TIMESTAMP_RE.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().replace(".000Z", "Z") === value;
+}
 var REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 var TELEMETRY_PASS_TYPES = [
   "review",
@@ -137,6 +140,9 @@ var LedgerError = class extends Error {
 };
 function fail(message) {
   throw new LedgerError(message);
+}
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 // src/io.ts
@@ -17852,6 +17858,133 @@ function classifyRange(params) {
 
 // src/telemetry.ts
 import { createHash as createHash2 } from "crypto";
+
+// src/telemetry-store.ts
+import { readFileSync as readFileSync4 } from "fs";
+var METRICS_STORE_LABEL = "activeloom:review-metrics";
+var METRICS_STORE_WARNING = 2e3;
+var METRICS_STORE_LIMIT = 2500;
+function telemetryStore() {
+  let config = {};
+  try {
+    config = JSON.parse(
+      readFileSync4(new URL("./review-telemetry.json", import.meta.url), "utf8")
+    );
+    if (!config || typeof config !== "object" || Array.isArray(config))
+      fail("invalid review metrics configuration");
+    for (const [key, value2] of Object.entries(config)) {
+      const allowed = key === "LOOM_REVIEW_TELEMETRY_STORE" ? ["pr", "issue"] : ["LOOM_REVIEW_TELEMETRY", "LOOM_REVIEW_TELEMETRY_EXTRACT"].includes(
+        key
+      ) ? ["on", "off"] : [];
+      if (typeof value2 !== "string" || !allowed.includes(value2.trim().toLowerCase()))
+        fail("invalid review metrics configuration");
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const value = process.env["LOOM_REVIEW_TELEMETRY_STORE"]?.trim() || config["LOOM_REVIEW_TELEMETRY_STORE"] || "pr";
+  if (typeof value !== "string" || !["pr", "issue"].includes(value.trim().toLowerCase()))
+    fail("LOOM_REVIEW_TELEMETRY_STORE must be pr or issue");
+  return value.trim().toLowerCase();
+}
+function metricsStores(repo, state = "open") {
+  if (!REPO_RE.test(repo)) fail("metrics store --repo must be owner/name");
+  const rows = flattenPages(
+    jsonOutput([
+      "api",
+      "--paginate",
+      "--slurp",
+      `repos/${repo}/issues?state=${state}&labels=${encodeURIComponent(METRICS_STORE_LABEL)}&per_page=100`
+    ]),
+    "metrics stores"
+  );
+  return rows.filter((row) => row["pull_request"] == null).map((row) => {
+    if (!Number.isSafeInteger(row["number"]) || Number(row["number"]) < 1 || !Number.isSafeInteger(row["comments"]) || Number(row["comments"]) < 0 || typeof row["locked"] !== "boolean" || !["open", "closed"].includes(String(row["state"]))) {
+      fail("invalid metrics store issue response");
+    }
+    return {
+      number: Number(row["number"]),
+      comments: Number(row["comments"]),
+      locked: row["locked"],
+      state: String(row["state"])
+    };
+  });
+}
+function activeMetricsStore(repo) {
+  const stores = metricsStores(repo);
+  if (stores.length !== 1)
+    fail(
+      "metrics emission needs exactly one open store; run metrics-setup or repair duplicate stores"
+    );
+  const store = stores[0];
+  if (!store.locked) fail("metrics store is not locked; emission skipped");
+  if (store.comments >= METRICS_STORE_LIMIT)
+    fail("metrics store is full; run metrics-rotate");
+  if (store.comments >= METRICS_STORE_WARNING)
+    process.stderr.write(
+      "review metrics: store nearing capacity; run metrics-rotate\n"
+    );
+  return store;
+}
+function setupMetricsStore(repo, rotate = false) {
+  const existing = metricsStores(repo);
+  if (existing.length > 1)
+    fail("multiple open metrics stores; repair before setup or rotation");
+  if (existing.length === 1 && !rotate) {
+    if (!existing[0].locked)
+      fail("existing metrics store is not locked; lock it before proceeding");
+    return existing[0];
+  }
+  if (rotate && existing.length !== 1)
+    fail("rotation needs exactly one open metrics store");
+  const labels = flattenPages(
+    jsonOutput([
+      "api",
+      "--paginate",
+      "--slurp",
+      `repos/${repo}/labels?per_page=100`
+    ]),
+    "labels"
+  );
+  if (!labels.some((label) => label["name"] === METRICS_STORE_LABEL)) {
+    jsonOutput(["api", "-X", "POST", `repos/${repo}/labels`], {
+      name: METRICS_STORE_LABEL,
+      color: "ededed",
+      description: "ActiveLoom review metrics store"
+    });
+  }
+  const created = jsonOutput(
+    ["api", "-X", "POST", `repos/${repo}/issues`],
+    {
+      title: "ActiveLoom review metrics",
+      labels: [METRICS_STORE_LABEL],
+      body: "Machine-readable review metrics. Subscribers receive a notification per record. Read with review-ledger export or report. Keep this issue locked; retain closed stores for historical export."
+    }
+  );
+  const number = created["number"];
+  if (!Number.isSafeInteger(number) || Number(number) < 1)
+    fail("store creation returned no issue number");
+  const path = `repos/${repo}/issues/${number}`;
+  jsonOutput(["api", "-X", "PATCH", path], { state: "closed" });
+  runGh(["api", "-X", "PUT", `${path}/lock`]);
+  const locked = jsonOutput(["api", path]);
+  if (locked["locked"] !== true || locked["state"] !== "closed")
+    fail("new metrics store lock could not be verified");
+  if (existing[0])
+    jsonOutput(
+      ["api", "-X", "PATCH", `repos/${repo}/issues/${existing[0].number}`],
+      { state: "closed" }
+    );
+  jsonOutput(["api", "-X", "PATCH", path], { state: "open" });
+  const active = activeMetricsStore(repo);
+  if (active.number !== number)
+    fail(
+      "metrics store setup raced with another operator; repair the labeled stores"
+    );
+  return active;
+}
+
+// src/telemetry.ts
 function isTelemetryComment(body) {
   return body.includes(TELEMETRY_MARKER_PREFIX);
 }
@@ -18097,7 +18230,7 @@ function validateTelemetryRecord(value) {
     fail("telemetry record version must be 1 or 3");
   }
   const emittedAt = source["emittedAt"];
-  if (typeof emittedAt !== "string" || !UTC_TIMESTAMP_RE.test(emittedAt) || Number.isNaN(Date.parse(emittedAt)) || new Date(emittedAt).toISOString().replace(".000Z", "Z") !== emittedAt) {
+  if (typeof emittedAt !== "string" || !isCanonicalUtcTimestamp(emittedAt)) {
     fail("telemetry emittedAt must be an RFC 3339 UTC timestamp");
   }
   const repo = source["repo"];
@@ -18400,15 +18533,20 @@ function replayFingerprint(record) {
     ) : void 0
   });
 }
-function errorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
+function withDurationFrom(record, other) {
+  return record.durationSeconds === null ? { ...record, durationSeconds: other.durationSeconds } : record;
 }
-function prCommentSink(target) {
+function isTelemetryReplay(left, right) {
+  return replayFingerprint(withDurationFrom(left, right)) === replayFingerprint(withDurationFrom(right, left));
+}
+function commentSink(target, name = "pr-comment", historicalIssues) {
   return {
-    name: "pr-comment",
+    name,
     emit({ record, body }) {
       const actor = assertActor(target.actor);
-      const rows = getIssueComments(target.repo, target.pr, actor);
+      const rows = (historicalIssues ?? [target.pr]).flatMap(
+        (issue) => getIssueComments(target.repo, issue, actor)
+      );
       for (const row of rows) {
         const existing = String(row["body"] ?? "");
         if (!isTelemetryComment(existing)) {
@@ -18421,11 +18559,11 @@ function prCommentSink(target) {
           continue;
         }
         if (parsed?.idempotencyKey === record.idempotencyKey) {
-          const replay = record.durationSeconds === null ? { ...record, durationSeconds: parsed.durationSeconds } : record;
+          const replay = withDurationFrom(record, parsed);
           if (replayFingerprint(parsed) !== replayFingerprint(replay)) {
             fail("telemetry idempotency key conflicts with an existing record");
           }
-          return { sink: "pr-comment", reference: String(row["id"] ?? "") };
+          return { sink: name, reference: String(row["id"] ?? "") };
         }
       }
       assertLiveActor(actor);
@@ -18452,13 +18590,55 @@ function prCommentSink(target) {
         }
         throw error;
       }
-      return { sink: "pr-comment", reference: String(commentId) };
+      return { sink: name, reference: String(commentId) };
     }
   };
 }
+function prCommentSink(target) {
+  return commentSink(target);
+}
+function configuredTelemetrySink(target) {
+  let store;
+  try {
+    store = telemetryStore();
+  } catch (error) {
+    return {
+      name: "unresolved",
+      emit() {
+        throw error;
+      }
+    };
+  }
+  if (store === "pr") return prCommentSink(target);
+  return {
+    name: "store-issue",
+    emit(input) {
+      const issue = activeMetricsStore(target.repo);
+      return commentSink(
+        { ...target, pr: issue.number },
+        "store-issue",
+        metricsStores(target.repo, "all").map((store2) => store2.number)
+      ).emit(input);
+    }
+  };
+}
+function telemetryRecorded(target) {
+  const issues = telemetryStore() === "issue" ? metricsStores(target.repo, "all").map((store) => store.number) : [target.pr];
+  const actor = assertActor(target.actor);
+  return issues.flatMap((issue) => getIssueComments(target.repo, issue, actor)).some((row) => {
+    try {
+      const record = matchTelemetry(String(row["body"] ?? ""));
+      return record?.repo === target.repo && record.pr === target.pr && record.idempotencyKey === target.idempotencyKey;
+    } catch {
+      return false;
+    }
+  });
+}
 function emitTelemetry(params) {
   const { record, sink } = params;
+  let recoveryRecord;
   try {
+    recoveryRecord = knownTelemetryRecord(record);
     const body = buildTelemetryBody(record);
     const result = sink.emit({ record, body });
     return {
@@ -18475,7 +18655,8 @@ function emitTelemetry(params) {
       sink: sink.name,
       reference: null,
       idempotencyKey: record.idempotencyKey,
-      error: message
+      error: message,
+      ...recoveryRecord === void 0 ? {} : { recoveryRecord }
     };
   }
 }
@@ -18489,19 +18670,20 @@ function enrichTelemetryDuration(params) {
     if (!Number.isFinite(params.durationSeconds) || params.durationSeconds < 0) {
       fail("telemetry duration must be a finite non-negative number");
     }
+    const store = telemetryStore();
+    result.sink = store === "issue" ? "store-issue" : "pr-comment";
+    const issues = store === "issue" ? metricsStores(params.repo, "all").map((issue) => issue.number) : [params.pr];
     const actor = assertActor(params.actor);
-    const matches = getIssueComments(params.repo, params.pr, actor).flatMap(
-      (row2) => {
-        const body = String(row2["body"] ?? "");
-        let record2;
-        try {
-          record2 = matchTelemetry(body);
-        } catch {
-          return [];
-        }
-        return record2?.idempotencyKey === params.idempotencyKey ? [{ row: row2, body, record: record2 }] : [];
+    const matches = issues.flatMap((issue) => getIssueComments(params.repo, issue, actor)).flatMap((row2) => {
+      const body = String(row2["body"] ?? "");
+      let record2;
+      try {
+        record2 = matchTelemetry(body);
+      } catch {
+        return [];
       }
-    );
+      return record2?.idempotencyKey === params.idempotencyKey ? [{ row: row2, body, record: record2 }] : [];
+    });
     if (matches.length !== 1)
       fail(
         "duration enrichment requires exactly one existing telemetry record"
@@ -19040,6 +19222,341 @@ function verifyCoverage(params) {
   return report;
 }
 
+// src/export.ts
+var EXPORT_LINE_SCHEMA = "activeloom.review-metrics.export/v1";
+var EXPORT_TRAILER_SCHEMA = "activeloom.review-metrics.export-trailer/v1";
+var EXPORT_AUTHOR_ASSOCIATIONS = [
+  "OWNER",
+  "MEMBER",
+  "COLLABORATOR"
+];
+var EXPORT_MAX_PULL_REQUESTS = 1e3;
+var LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?(?:\[bot\])?$/;
+var DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function parsePullRequestNumbers(spec) {
+  const numbers = /* @__PURE__ */ new Set();
+  for (const part of spec.split(",")) {
+    const match = part.match(/^([1-9]\d*)(?:-([1-9]\d*))?$/);
+    if (!match) {
+      fail("--prs must be a comma-separated list of numbers and A-B ranges");
+    }
+    const first = Number(match[1]);
+    const last = match[2] === void 0 ? first : Number(match[2]);
+    if (!Number.isSafeInteger(last) || last < first) {
+      fail("--prs ranges must run from a lower number to a higher one");
+    }
+    if (numbers.size + (last - first + 1) > EXPORT_MAX_PULL_REQUESTS) {
+      fail(
+        `--prs names more than ${EXPORT_MAX_PULL_REQUESTS} pull requests; export in smaller ranges`
+      );
+    }
+    for (let number = first; number <= last; number++) {
+      numbers.add(number);
+    }
+  }
+  return [...numbers].sort((left, right) => left - right);
+}
+function parseExportBound(value, name) {
+  const timestamp = DATE_RE.test(value) ? `${value}T${name === "--since" ? "00:00:00" : "23:59:59"}Z` : value;
+  if (!isCanonicalUtcTimestamp(timestamp)) {
+    fail(`${name} must be YYYY-MM-DD or an RFC 3339 UTC timestamp`);
+  }
+  return timestamp;
+}
+function parseAllowedLogins(spec) {
+  const logins = spec.split(",");
+  if (logins.some((login) => !LOGIN_RE.test(login))) {
+    fail("--allowed-logins must be a comma-separated list of GitHub logins");
+  }
+  return logins;
+}
+function reportedComments(issue) {
+  const count = issue["comments"];
+  if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) {
+    fail("GitHub issue response has an unexpected shape");
+  }
+  return count;
+}
+function prCommentSource(target) {
+  const { repo, selection } = target;
+  return (warn) => {
+    const reads = [];
+    const read = (issue, commentsReported) => {
+      let comments = null;
+      try {
+        comments = getAllIssueComments(repo, issue);
+      } catch (error) {
+        warn(`could not read comments on #${issue}: ${errorMessage(error)}`);
+      }
+      reads.push({ kind: "pr-comment", issue, commentsReported, comments });
+    };
+    if ("numbers" in selection) {
+      for (const number of selection.numbers) {
+        let issue;
+        try {
+          issue = jsonOutput([
+            "api",
+            `repos/${repo}/issues/${number}`
+          ]);
+        } catch (error) {
+          warn(`could not read #${number}: ${errorMessage(error)}`);
+          reads.push({
+            kind: "pr-comment",
+            issue: number,
+            commentsReported: null,
+            comments: null
+          });
+          continue;
+        }
+        if (typeof issue !== "object" || issue === null) {
+          fail("GitHub issue response has an unexpected shape");
+        }
+        if (issue["pull_request"] == null) {
+          warn(`skipped #${number}: not a pull request`);
+          continue;
+        }
+        read(number, reportedComments(issue));
+      }
+      return reads;
+    }
+    const query = `repos/${repo}/issues?state=all&sort=created&direction=asc&per_page=100` + (selection.since === void 0 ? "" : `&since=${selection.since}`);
+    const issues = flattenPages(
+      jsonOutput(["api", "--paginate", "--slurp", query]),
+      "issues"
+    );
+    for (const issue of issues) {
+      const number = issue["number"];
+      const createdAt = issue["created_at"];
+      if (typeof number !== "number" || !Number.isSafeInteger(number) || typeof createdAt !== "string") {
+        fail("GitHub issues item has an unexpected shape");
+      }
+      if (issue["pull_request"] == null || selection.until !== void 0 && createdAt > selection.until) {
+        continue;
+      }
+      read(number, reportedComments(issue));
+    }
+    return reads;
+  };
+}
+function storeIssueSource(repo) {
+  return (warn) => metricsStores(repo, "all").map((issue) => {
+    let comments = null;
+    try {
+      comments = getAllIssueComments(repo, issue.number);
+    } catch (error) {
+      warn(`could not read store #${issue.number}: ${errorMessage(error)}`);
+    }
+    return {
+      kind: "store-issue",
+      issue: issue.number,
+      commentsReported: issue.comments,
+      comments
+    };
+  });
+}
+function exportLineFrom(repo, read, row, record) {
+  const commentId = row["id"];
+  const createdAt = row["created_at"];
+  const updatedAt = row["updated_at"];
+  if (typeof commentId !== "number" || !Number.isSafeInteger(commentId) || typeof createdAt !== "string" || typeof updatedAt !== "string") {
+    fail("GitHub comment has an unexpected shape");
+  }
+  return {
+    schema: EXPORT_LINE_SCHEMA,
+    source: {
+      kind: read.kind,
+      repo,
+      issue: read.issue,
+      commentId,
+      authorAssociation: String(row["author_association"]),
+      createdAt,
+      updatedAt
+    },
+    record
+  };
+}
+function exportTelemetry(params) {
+  const { repo, write, warn } = params;
+  if (!REPO_RE.test(repo)) {
+    fail("export --repo must be owner/name");
+  }
+  const allowedLogins = params.allowedLogins === void 0 ? null : new Set(params.allowedLogins.map((login) => login.toLowerCase()));
+  const trailer = {
+    schema: EXPORT_TRAILER_SCHEMA,
+    sources: [],
+    records: 0,
+    duplicatesCollapsed: 0,
+    conflicts: 0,
+    rejectedAuthor: 0,
+    malformed: 0,
+    complete: true
+  };
+  const candidates = [];
+  for (const source of params.sources) {
+    for (const read of source(warn)) {
+      const commentsRead = read.comments?.length ?? null;
+      trailer.sources.push({
+        kind: read.kind,
+        issue: read.issue,
+        commentsReported: read.commentsReported,
+        commentsRead
+      });
+      if (commentsRead === null || commentsRead !== read.commentsReported) {
+        trailer.complete = false;
+      }
+      for (const row of read.comments ?? []) {
+        const body = String(row["body"] ?? "");
+        if (!isTelemetryComment(body)) {
+          continue;
+        }
+        const login = row["user"]?.login;
+        if (!EXPORT_AUTHOR_ASSOCIATIONS.includes(
+          String(row["author_association"])
+        ) || allowedLogins !== null && (typeof login !== "string" || !allowedLogins.has(login.toLowerCase()))) {
+          trailer.rejectedAuthor += 1;
+          continue;
+        }
+        let record = null;
+        let reason = "the marker carries no record";
+        try {
+          record = matchTelemetry(body);
+        } catch (error) {
+          reason = errorMessage(error);
+        }
+        if (record !== null && read.kind === "pr-comment" && record.pr !== read.issue) {
+          reason = `the record names pull request #${record.pr}`;
+          record = null;
+        }
+        if (record === null) {
+          trailer.malformed += 1;
+          warn(
+            `malformed record in comment ${String(row["id"])} on #${read.issue}: ${reason}`
+          );
+          continue;
+        }
+        candidates.push(exportLineFrom(repo, read, row, record));
+      }
+    }
+  }
+  candidates.sort(
+    (left, right) => left.source.createdAt.localeCompare(right.source.createdAt) || left.source.commentId - right.source.commentId
+  );
+  const kept = /* @__PURE__ */ new Map();
+  for (const line of candidates) {
+    const key = line.record.idempotencyKey;
+    const earliest = kept.get(key);
+    if (earliest === void 0) {
+      kept.set(key, line);
+    } else if (isTelemetryReplay(earliest.record, line.record)) {
+      trailer.duplicatesCollapsed += 1;
+    } else {
+      trailer.conflicts += 1;
+      warn(
+        `conflicting records for idempotency key ${key}: kept comment ${earliest.source.commentId} on #${earliest.source.issue}, dropped comment ${line.source.commentId} on #${line.source.issue}`
+      );
+    }
+  }
+  for (const line of kept.values()) {
+    if (params.select === void 0 || params.select(line.record)) {
+      write(JSON.stringify(line));
+      trailer.records++;
+    } else {
+      trailer.excludedBySelection = (trailer.excludedBySelection ?? 0) + 1;
+    }
+  }
+  write(JSON.stringify(trailer));
+  return trailer;
+}
+
+// src/metrics-report.ts
+var CANONICAL_TOKEN_BUCKETS2 = [
+  "input",
+  "output",
+  "cacheRead",
+  "cacheWrite",
+  "reasoning"
+];
+function metricsReport(lines, trailer) {
+  const engines = /* @__PURE__ */ new Map();
+  const prs = /* @__PURE__ */ new Map();
+  for (const { record } of lines) {
+    const engine = engines.get(record.engine) ?? {
+      passes: 0,
+      findings: 0,
+      fixed: 0,
+      deferred: 0,
+      dismissed: 0,
+      tokens: Object.fromEntries(
+        CANONICAL_TOKEN_BUCKETS2.map((key) => [key, { total: 0, missing: 0 }])
+      )
+    };
+    engine.passes++;
+    engine.findings += record.findings.posted;
+    for (const counts of Object.values(record.findings.bySeverityAndOutcome)) {
+      engine.fixed += counts.validFixed;
+      engine.deferred += counts.validDeferred;
+      engine.dismissed += counts.invalidDismissed;
+    }
+    for (const key of CANONICAL_TOKEN_BUCKETS2) {
+      const summary = engine.tokens[key];
+      if (record.tokens.length === 0) summary.missing++;
+      for (const bucket of record.tokens) {
+        if (bucket[key] === null) summary.missing++;
+        else summary.total += bucket[key];
+      }
+    }
+    engines.set(record.engine, engine);
+    const pr = prs.get(record.pr) ?? {
+      rounds: 0,
+      passes: 0,
+      clean: false,
+      input: 0,
+      output: 0,
+      unknown: 0
+    };
+    pr.passes++;
+    if (record.tokens.length === 0) pr.unknown++;
+    for (const bucket of record.tokens) {
+      pr.input += bucket.input ?? 0;
+      pr.output += bucket.output ?? 0;
+      if (bucket.input === null || bucket.output === null) pr.unknown++;
+    }
+    if (record.passType === "review") {
+      pr.rounds = Math.max(pr.rounds, record.round);
+      pr.clean ||= record.status === "clean";
+    }
+    prs.set(record.pr, pr);
+  }
+  const output = [
+    `Review metrics: ${lines.length} records across ${prs.size} pull requests`,
+    `Source enumeration: ${trailer.complete ? "complete" : "INCOMPLETE"}; conflicts: ${trailer.conflicts}; rejected authors: ${trailer.rejectedAuthor}; malformed: ${trailer.malformed}`,
+    "Counts are reported per pass, not unique findings. Missing usage is unknown, not zero.",
+    ""
+  ];
+  for (const [name, value] of [...engines].sort(
+    ([a], [b]) => a.localeCompare(b)
+  )) {
+    output.push(
+      `${name}: ${value.passes} passes; ${value.findings} findings; ${value.fixed} fixed, ${value.deferred} deferred, ${value.dismissed} dismissed`
+    );
+    output.push(
+      "  Tokens: " + Object.entries(value.tokens).map(
+        ([key, count]) => `${key}=${count.total}${count.missing ? ` (+${count.missing} unknown measurements)` : ""}`
+      ).join(", ")
+    );
+  }
+  output.push(
+    "",
+    "Observed rounds (telemetry cannot prove convergence; separate runs may restart numbering):"
+  );
+  for (const [number, value] of [...prs].sort(([a], [b]) => a - b)) {
+    output.push(
+      `PR ${number}: max review round ${value.rounds}; ${value.passes} passes; clean pass observed: ${value.clean ? "yes" : "no"}; known input/output tokens ${value.input}/${value.output}${value.unknown ? ` (+${value.unknown} unknown measurements)` : ""}`
+    );
+  }
+  return output.join("\n") + "\n";
+}
+
 // src/format.ts
 function formatFindings(findings) {
   if (findings.length === 0) {
@@ -19073,7 +19590,7 @@ function writeSortedJson(value) {
 function readJsonFile(pathValue, label) {
   assertRegularFile(pathValue, `${label} must be a regular non-symlink file`);
   return parseJsonOrFail(
-    readFileSync4(pathValue, "utf8"),
+    readFileSync5(pathValue, "utf8"),
     `${label} must contain valid UTF-8 JSON`
   );
 }
@@ -19092,7 +19609,7 @@ function resolveChangesetReport(args) {
       "diff file must be a regular non-symlink file"
     );
     return classifyFiles(
-      parseDiffPatch(readFileSync4(args.diffFile, "utf8")),
+      parseDiffPatch(readFileSync5(args.diffFile, "utf8")),
       options
     );
   }
@@ -19355,6 +19872,18 @@ function parseCliArgs(argv) {
         args.reviewers = parseVal(arg);
         break;
       }
+      case "--prs":
+        args.prs = parseVal(arg);
+        break;
+      case "--since":
+        args.since = parseVal(arg);
+        break;
+      case "--until":
+        args.until = parseVal(arg);
+        break;
+      case "--allowed-logins":
+        args.allowedLogins = parseVal(arg);
+        break;
       default:
         fail(`unknown argument: ${arg}`);
     }
@@ -19368,9 +19897,11 @@ function validateArgs(args) {
   if (!args.command) {
     fail("subcommand required");
   }
-  if (args.engineRaw !== void 0 && !["emit-telemetry", "enrich-telemetry-duration"].includes(
-    args.command ?? ""
-  )) {
+  if (args.engineRaw !== void 0 && ![
+    "emit-telemetry",
+    "enrich-telemetry-duration",
+    "replay-telemetry"
+  ].includes(args.command ?? "")) {
     args.engine = parseEnum("--engine", args.engineRaw, SUPPORTED_ENGINES);
   }
   for (const name of ["head", "base", "before", "resultHead"]) {
@@ -19803,6 +20334,57 @@ function runCliCommand(argv) {
       );
       break;
     }
+    case "replay-telemetry": {
+      if (!args.repo || !args.file)
+        fail("replay-telemetry requires --repo and --file");
+      const record = validateTelemetryRecord(
+        readJsonFile(args.file, "metrics recovery record")
+      );
+      if (record.repo !== args.repo)
+        fail("recovery record belongs to another repository");
+      if (args.dryRun) {
+        process.stdout.write(buildTelemetryBody(record) + "\n");
+        break;
+      }
+      writeSortedJson(
+        emitTelemetry({
+          record,
+          sink: configuredTelemetrySink({
+            repo: args.repo,
+            pr: record.pr,
+            actor: args.actor
+          })
+        })
+      );
+      break;
+    }
+    case "metrics-setup":
+    case "metrics-rotate": {
+      if (!args.repo || args.dryRun)
+        fail(
+          "metrics setup/rotation requires --repo and does not support --dry-run"
+        );
+      process.stderr.write(
+        "Review metrics store subscribers receive notifications for every record. No repository configuration is changed.\n"
+      );
+      writeSortedJson(
+        setupMetricsStore(args.repo, args.command === "metrics-rotate")
+      );
+      break;
+    }
+    case "telemetry-recorded": {
+      if (!args.repo || args.pr === void 0 || !args.idempotencyKey)
+        fail("telemetry-recorded requires --repo, --pr, and --idempotency-key");
+      writeSortedJson({
+        recorded: telemetryRecorded({
+          repo: args.repo,
+          pr: args.pr,
+          actor: args.actor,
+          idempotencyKey: args.idempotencyKey
+        })
+      });
+      break;
+    }
     case "emit-telemetry": {
       let outcome;
       try {
@@ -19861,7 +20443,7 @@ function runCliCommand(argv) {
         }
         outcome = emitTelemetry({
           record,
-          sink: prCommentSink({
+          sink: configuredTelemetrySink({
             repo: args.repo,
             pr: args.pr,
             actor: args.actor
@@ -19871,6 +20453,56 @@ function runCliCommand(argv) {
         outcome = telemetryFailure(error);
       }
       writeSortedJson(outcome);
+      break;
+    }
+    case "report":
+    case "export": {
+      if (!args.repo) {
+        fail("export requires --repo");
+      }
+      const byNumber = args.pr !== void 0 || args.prs !== void 0;
+      const byDate = args.since !== void 0 || args.until !== void 0;
+      if (byNumber === byDate || args.pr !== void 0 && args.prs !== void 0) {
+        fail(
+          "export requires exactly one selection: --pr, --prs, or --since and/or --until"
+        );
+      }
+      const since = args.since === void 0 ? void 0 : parseExportBound(args.since, "--since");
+      const until = args.until === void 0 ? void 0 : parseExportBound(args.until, "--until");
+      if (since !== void 0 && until !== void 0 && since > until) {
+        fail("export --since must not be later than --until");
+      }
+      const selection = byNumber ? {
+        numbers: args.pr !== void 0 ? [args.pr] : parsePullRequestNumbers(args.prs)
+      } : { since, until };
+      const reportLines = [];
+      const trailer = exportTelemetry({
+        repo: args.repo,
+        sources: [
+          prCommentSource({ repo: args.repo, selection }),
+          storeIssueSource(args.repo)
+        ],
+        select: (record) => byNumber ? selection.numbers.includes(record.pr) : (since === void 0 || record.emittedAt >= since) && (until === void 0 || record.emittedAt <= until),
+        allowedLogins: args.allowedLogins === void 0 ? void 0 : parseAllowedLogins(args.allowedLogins),
+        write: (line) => {
+          if (args.command === "export") process.stdout.write(`${line}
+`);
+          else {
+            const parsed = JSON.parse(line);
+            if (parsed.record) reportLines.push(parsed);
+          }
+        },
+        warn: (message) => process.stderr.write(`review-ledger export: ${message}
+`)
+      });
+      if (args.command === "report")
+        process.stdout.write(metricsReport(reportLines, trailer));
+      if (!trailer.complete) {
+        process.stderr.write(
+          "review-ledger export: incomplete; see the trailer for the sources that fell short\n"
+        );
+        return 1;
+      }
       break;
     }
     case "read-result": {
@@ -19892,7 +20524,7 @@ function runCliCommand(argv) {
         "findings file must be a regular non-symlink file"
       );
       const parsed = parseJsonOrFail(
-        readFileSync4(jsonPath, "utf8"),
+        readFileSync5(jsonPath, "utf8"),
         "findings file must contain valid UTF-8 JSON"
       );
       if (!Array.isArray(parsed) || parsed.some(
@@ -19928,9 +20560,11 @@ function commandFromArgv(argv) {
 }
 function runCli(argv = process.argv.slice(2)) {
   resetGitHubRunner();
-  if (!["emit-telemetry", "enrich-telemetry-duration"].includes(
-    commandFromArgv(argv) ?? ""
-  )) {
+  if (![
+    "emit-telemetry",
+    "enrich-telemetry-duration",
+    "replay-telemetry"
+  ].includes(commandFromArgv(argv) ?? "")) {
     return runCliCommand(argv);
   }
   try {
