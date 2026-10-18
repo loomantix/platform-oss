@@ -128,6 +128,7 @@ allowed_destinations:
   - .claude/hooks/**
   - .claude/prompt-stack.json
   - .claude/references/local-review-ledger.md
+  - .claude/references/herdr.md
   - .claude/references/house-tokens.css
   - .claude/REVIEW_WORKFLOW.md
   - .claude/MODEL_NOTES.md
@@ -138,6 +139,7 @@ allowed_destinations:
   - .codex/hooks/**
   - .codex/prompt-stack.json
   - .codex/references/review-chain-runner.md
+  - .codex/references/herdr.md
   - .codex/references/roles/code-explorer.md
   - .codex/references/roles/code-architect.md
   - .codex/references/roles/code-reviewer.md
@@ -152,6 +154,7 @@ allowed_destinations:
   - .agents/agents/**
   - .agents/hooks/**
   - .agents/references/roles/code-explorer.md
+  - .agents/references/herdr.md
   - .agents/references/roles/code-architect.md
   - .agents/references/roles/code-reviewer.md
   - .agents/references/roles/silent-failure-hunter.md
