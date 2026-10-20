@@ -6,6 +6,9 @@ harnesses: [claude, codex, gemini]
 telemetry:
   emit: 'on'
   extract: 'on'
+  # Review metrics go to the locked `activeloom:review-metrics` issue, not PR
+  # conversations. Run `review-ledger metrics-setup` before changing this.
+  store: issue
 
 substitutions:
   PROJECT_NAME: platform-oss
