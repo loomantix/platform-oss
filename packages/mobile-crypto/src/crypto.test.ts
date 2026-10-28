@@ -266,6 +266,31 @@ describe('crypto (factory)', () => {
     expect(await cold.getOrCreateKey()).toEqual(key);
   });
 
+  it('deletion barrier: a second delete waits for an earlier delete still waiting on a write', async () => {
+    const writeStarted = deferred<void>();
+    const write = deferred<void>();
+    vi.mocked(SecureStore.setItemAsync).mockImplementationOnce(async (k, v) => {
+      writeStarted.resolve();
+      await write.promise;
+      secureStore.set(k, v);
+    });
+    const caller = instance.getOrCreateKey();
+    await writeStarted.promise;
+    const first = instance.deleteKey();
+    const second = instance.deleteKey();
+    const next = instance.getOrCreateKey();
+    write.resolve();
+    await Promise.all([first, second]);
+    const key = await next;
+    expect(await caller).toEqual(key);
+    // The key handed out after both deletes is the one left in storage.
+    expect(secureStore.get(TEST_ALIAS)).toBe(
+      Buffer.from(key).toString('base64'),
+    );
+    const cold = createCrypto({ keyAlias: TEST_ALIAS });
+    expect(await cold.getOrCreateKey()).toEqual(key);
+  });
+
   it('deletion barrier: a failed delete rejects deleteKey without blocking later key loads', async () => {
     const key = await instance.getOrCreateKey();
     vi.mocked(SecureStore.deleteItemAsync).mockRejectedValueOnce(
