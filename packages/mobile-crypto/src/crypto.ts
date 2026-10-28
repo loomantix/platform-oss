@@ -6,6 +6,8 @@ const KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const AUTH_TAG_BYTES = 16;
 
+class KeyLoadInvalidatedError extends Error {}
+
 export const MAGIC_VERSION = 1 as const;
 
 // Magic prefix: 'L','M','X',0x01 — Loomantix mobile-crypto, format version 1.
@@ -95,13 +97,16 @@ export function createCrypto(opts: CreateCryptoOptions): MobileCrypto {
 
   let cachedKey: Uint8Array | null = null;
   let keyPromise: Promise<Uint8Array> | null = null;
+  let deletionGeneration = 0;
+  let deletionPromise: Promise<void> = Promise.resolve();
 
-  async function loadOrGenerateKey(): Promise<Uint8Array> {
+  async function loadOrGenerateKey(generation: number): Promise<Uint8Array> {
     const stored = await SecureStore.getItemAsync(keyAlias);
     if (stored) {
       return base64ToBytes(stored);
     }
     const fresh = await ExpoCrypto.getRandomBytesAsync(KEY_BYTES);
+    if (generation !== deletionGeneration) throw new KeyLoadInvalidatedError();
     // THIS_DEVICE_ONLY: the Keychain key is NOT included in iCloud Keychain
     // backup. That means an iCloud backup of this device cannot decrypt the
     // ciphertext files on a different device, even if the ciphertext itself
@@ -116,30 +121,42 @@ export function createCrypto(opts: CreateCryptoOptions): MobileCrypto {
   }
 
   async function getOrCreateKey(): Promise<Uint8Array> {
-    if (cachedKey) return cachedKey;
-    // In-flight singleton — two racing getOrCreateKey() calls on a cold start
-    // (e.g. hydrateQueryClient + enqueueCreate both firing in the same tick)
-    // would otherwise each generate their own key and race on setItemAsync,
-    // leaving ciphertext encrypted with a key that was overwritten on disk.
-    if (!keyPromise) {
-      // Wrap so a rejection (transient SecureStore error, etc.) doesn't stick
-      // the rejected promise into the cache and lock out every subsequent
-      // call until process restart. On failure, clear keyPromise and re-throw
-      // so the next caller gets a fresh attempt.
-      keyPromise = loadOrGenerateKey().catch((err) => {
-        keyPromise = null;
+    for (;;) {
+      const generation = deletionGeneration;
+      // New loads and stale callers retry only after the deletion barrier.
+      await deletionPromise;
+      if (generation !== deletionGeneration) continue;
+      if (cachedKey) return cachedKey;
+      // Share one load per generation, including parallel cold-start calls.
+      const pending = (keyPromise ??= loadOrGenerateKey(generation));
+      try {
+        const key = await pending;
+        if (generation !== deletionGeneration) continue;
+        cachedKey = key;
+        return key;
+      } catch (err) {
+        if (keyPromise === pending) keyPromise = null;
+        if (err instanceof KeyLoadInvalidatedError) continue;
         throw err;
-      });
+      }
     }
-    const key = await keyPromise;
-    cachedKey = key;
-    return key;
   }
 
   async function deleteKey(): Promise<void> {
+    deletionGeneration++;
+    const pending = keyPromise;
+    const previousDeletion = deletionPromise;
     cachedKey = null;
     keyPromise = null;
-    await SecureStore.deleteItemAsync(keyAlias);
+    const deletion = (async () => {
+      await previousDeletion;
+      await pending?.catch(() => undefined);
+      await SecureStore.deleteItemAsync(keyAlias);
+    })();
+    // Key loads wait on a barrier that always settles; only this caller sees
+    // a delete failure, so one failed delete cannot block later key loads.
+    deletionPromise = deletion.catch(() => undefined);
+    await deletion;
   }
 
   async function encryptString(plaintext: string): Promise<Uint8Array> {

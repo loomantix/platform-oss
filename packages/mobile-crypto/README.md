@@ -45,6 +45,17 @@ run. Throws are safe to retry on a later read.
 See `src/crypto.ts` for the full factory contract and the magic-byte
 versioning scheme.
 
+## 0.3.2
+
+`deleteKey()` now waits for in-flight key loads and writes before deleting the
+stored key. Invalidated callers retry after deletion and share a newly loaded
+or generated key. Calls waiting across deletion may therefore create a new key;
+consumers that need storage to remain empty should stop key requests before
+calling `deleteKey()`. If the delete itself fails, only that `deleteKey()` call
+rejects; later key requests re-read whatever key storage still holds, and a
+retried `deleteKey()` can complete the deletion. The API and ciphertext format
+are unchanged.
+
 ## Security
 
 See the repository's [`SECURITY.md`](https://github.com/loomantix/platform-oss/blob/main/SECURITY.md) for the responsible-disclosure process.

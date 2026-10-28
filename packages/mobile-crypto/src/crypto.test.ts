@@ -1,4 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as SecureStore from 'expo-secure-store';
+import * as ExpoCrypto from 'expo-crypto';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 const secureStore = new Map<string, string>();
 
@@ -43,6 +53,7 @@ const TEST_ALIAS = 'loomantix-mobile-crypto.test-alias.v1';
 let instance = createCrypto({ keyAlias: TEST_ALIAS }) as MobileCryptoInternal;
 
 beforeEach(() => {
+  vi.clearAllMocks();
   secureStore.clear();
   // Rebuild the instance so its internal cachedKey/keyPromise closures
   // start fresh per test. Constructor-level reset is sufficient; no need
@@ -74,7 +85,7 @@ describe('crypto (factory)', () => {
   });
 
   it('round-trips unicode', async () => {
-    const src = 'patient: Émile — visited 2026-04-22 · 11:30';
+    const src = 'user: Émile — visited 2026-04-22 · 11:30';
     const ct = await instance.encryptString(src);
     expect(await instance.decryptString(ct)).toBe(src);
   });
@@ -91,11 +102,11 @@ describe('crypto (factory)', () => {
   });
 
   it('ciphertext does not contain the plaintext verbatim', async () => {
-    const secret = 'OHIP-1234567-AB patient bleeding';
+    const secret = 'account-1234567-AB confidential message';
     const ct = await instance.encryptString(secret);
     const view = new TextDecoder('utf-8', { fatal: false }).decode(ct);
-    expect(view).not.toContain('OHIP-1234567-AB');
-    expect(view).not.toContain('patient bleeding');
+    expect(view).not.toContain('account-1234567-AB');
+    expect(view).not.toContain('confidential message');
   });
 
   it('uses a fresh nonce per encryption (two encrypts of same plaintext differ)', async () => {
@@ -141,6 +152,157 @@ describe('crypto (factory)', () => {
     const ct = await instance.encryptString('will be orphaned');
     await instance.deleteKey();
     expect(await instance.decryptString(ct)).toBeNull();
+  });
+
+  it('deletion barrier: a stored-key continuation re-reads instead of caching the deleted key', async () => {
+    const stale = Buffer.alloc(32, 1).toString('base64');
+    secureStore.set(TEST_ALIAS, stale);
+    const readStarted = deferred<void>();
+    const read = deferred<string | null>();
+    const retry = deferred<string | null>();
+    vi.mocked(SecureStore.getItemAsync)
+      .mockImplementationOnce(() => {
+        readStarted.resolve();
+        return read.promise;
+      })
+      .mockReturnValueOnce(retry.promise);
+    const caller = instance.getOrCreateKey();
+    await readStarted.promise;
+    const deletion = instance.deleteKey();
+    read.resolve(stale);
+    await deletion;
+    expect(secureStore.has(TEST_ALIAS)).toBe(false);
+    const next = instance.getOrCreateKey();
+    retry.resolve(null);
+    const [key, nextKey] = await Promise.all([caller, next]);
+    expect(SecureStore.getItemAsync).toHaveBeenCalledTimes(2);
+    expect(Buffer.from(key).toString('base64')).not.toBe(stale);
+    expect(nextKey).toEqual(key);
+  });
+
+  it('deletion barrier: invalidated generation never writes its generated key', async () => {
+    const generationStarted = deferred<void>();
+    const random = deferred<Uint8Array>();
+    const retry = deferred<string | null>();
+    vi.mocked(ExpoCrypto.getRandomBytesAsync).mockImplementationOnce(() => {
+      generationStarted.resolve();
+      return random.promise;
+    });
+    vi.mocked(SecureStore.getItemAsync)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(retry.promise);
+    const caller = instance.getOrCreateKey();
+    await generationStarted.promise;
+    const deletion = instance.deleteKey();
+    random.resolve(new Uint8Array(32).fill(1));
+    await deletion;
+    // Let the old load settle even when testing the implementation without the barrier.
+    await Promise.resolve();
+    expect(SecureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(secureStore.has(TEST_ALIAS)).toBe(false);
+    retry.resolve(null);
+    await caller;
+  });
+
+  it('deletion barrier: waits for an in-flight write before deleting storage', async () => {
+    const writeStarted = deferred<void>();
+    const write = deferred<void>();
+    const retry = deferred<string | null>();
+    const events: string[] = [];
+    vi.mocked(SecureStore.getItemAsync)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(retry.promise);
+    vi.mocked(SecureStore.setItemAsync).mockImplementationOnce(async (k, v) => {
+      writeStarted.resolve();
+      await write.promise;
+      secureStore.set(k, v);
+      events.push('write');
+    });
+    vi.mocked(SecureStore.deleteItemAsync).mockImplementationOnce(async (k) => {
+      secureStore.delete(k);
+      events.push('delete');
+    });
+    const caller = instance.getOrCreateKey();
+    await writeStarted.promise;
+    const deletion = instance.deleteKey();
+    write.resolve();
+    await deletion;
+    expect(events).toEqual(['write', 'delete']);
+    expect(secureStore.has(TEST_ALIAS)).toBe(false);
+    retry.resolve(null);
+    await caller;
+  });
+
+  it('deletion barrier: an awaiting caller receives the persisted key after deletion', async () => {
+    const stale = Buffer.alloc(32, 1).toString('base64');
+    secureStore.set(TEST_ALIAS, stale);
+    const readStarted = deferred<void>();
+    const read = deferred<string | null>();
+    const deleteStarted = deferred<void>();
+    const finishDelete = deferred<void>();
+    vi.mocked(SecureStore.getItemAsync).mockImplementationOnce(() => {
+      readStarted.resolve();
+      return read.promise;
+    });
+    vi.mocked(SecureStore.deleteItemAsync).mockImplementationOnce(async (k) => {
+      deleteStarted.resolve();
+      await finishDelete.promise;
+      secureStore.delete(k);
+    });
+    const caller = instance.getOrCreateKey();
+    await readStarted.promise;
+    const deletion = instance.deleteKey();
+    read.resolve(stale);
+    await deleteStarted.promise;
+    const concurrent = instance.getOrCreateKey();
+    finishDelete.resolve();
+    await deletion;
+    const [key, concurrentKey] = await Promise.all([caller, concurrent]);
+    expect(secureStore.get(TEST_ALIAS)).toBe(
+      Buffer.from(key).toString('base64'),
+    );
+    expect(concurrentKey).toEqual(key);
+    const cold = createCrypto({ keyAlias: TEST_ALIAS });
+    expect(await cold.getOrCreateKey()).toEqual(key);
+  });
+
+  it('deletion barrier: a second delete waits for an earlier delete still waiting on a write', async () => {
+    const writeStarted = deferred<void>();
+    const write = deferred<void>();
+    vi.mocked(SecureStore.setItemAsync).mockImplementationOnce(async (k, v) => {
+      writeStarted.resolve();
+      await write.promise;
+      secureStore.set(k, v);
+    });
+    const caller = instance.getOrCreateKey();
+    await writeStarted.promise;
+    const first = instance.deleteKey();
+    const second = instance.deleteKey();
+    const next = instance.getOrCreateKey();
+    write.resolve();
+    await Promise.all([first, second]);
+    const key = await next;
+    expect(await caller).toEqual(key);
+    // The key handed out after both deletes is the one left in storage.
+    expect(secureStore.get(TEST_ALIAS)).toBe(
+      Buffer.from(key).toString('base64'),
+    );
+    const cold = createCrypto({ keyAlias: TEST_ALIAS });
+    expect(await cold.getOrCreateKey()).toEqual(key);
+  });
+
+  it('deletion barrier: a failed delete rejects deleteKey without blocking later key loads', async () => {
+    const key = await instance.getOrCreateKey();
+    vi.mocked(SecureStore.deleteItemAsync).mockRejectedValueOnce(
+      new Error('transient delete failure'),
+    );
+    await expect(instance.deleteKey()).rejects.toThrow(
+      'transient delete failure',
+    );
+    // The key is still stored, so the next load re-reads it.
+    expect(await instance.getOrCreateKey()).toEqual(key);
+    await instance.deleteKey();
+    expect(secureStore.has(TEST_ALIAS)).toBe(false);
   });
 
   it('caches the key across calls (one SecureStore round-trip)', async () => {
