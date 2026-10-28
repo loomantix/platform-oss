@@ -266,6 +266,20 @@ describe('crypto (factory)', () => {
     expect(await cold.getOrCreateKey()).toEqual(key);
   });
 
+  it('deletion barrier: a failed delete rejects deleteKey without blocking later key loads', async () => {
+    const key = await instance.getOrCreateKey();
+    vi.mocked(SecureStore.deleteItemAsync).mockRejectedValueOnce(
+      new Error('transient delete failure'),
+    );
+    await expect(instance.deleteKey()).rejects.toThrow(
+      'transient delete failure',
+    );
+    // The key is still stored, so the next load re-reads it.
+    expect(await instance.getOrCreateKey()).toEqual(key);
+    await instance.deleteKey();
+    expect(secureStore.has(TEST_ALIAS)).toBe(false);
+  });
+
   it('caches the key across calls (one SecureStore round-trip)', async () => {
     const mod = await import('expo-secure-store');
     const getSpy = mod.getItemAsync as ReturnType<typeof vi.fn>;

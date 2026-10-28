@@ -51,7 +51,10 @@ versioning scheme.
 stored key. Invalidated callers retry after deletion and share a newly loaded
 or generated key. Calls waiting across deletion may therefore create a new key;
 consumers that need storage to remain empty should stop key requests before
-calling `deleteKey()`. The API and ciphertext format are unchanged.
+calling `deleteKey()`. If the delete itself fails, only that `deleteKey()` call
+rejects; later key requests re-read whatever key storage still holds, and a
+retried `deleteKey()` can complete the deletion. The API and ciphertext format
+are unchanged.
 
 ## Security
 

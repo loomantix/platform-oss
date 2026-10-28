@@ -148,12 +148,15 @@ export function createCrypto(opts: CreateCryptoOptions): MobileCrypto {
     const previousDeletion = deletionPromise;
     cachedKey = null;
     keyPromise = null;
-    deletionPromise = (async () => {
-      await previousDeletion.catch(() => undefined);
+    const deletion = (async () => {
+      await previousDeletion;
       await pending?.catch(() => undefined);
       await SecureStore.deleteItemAsync(keyAlias);
     })();
-    await deletionPromise;
+    // Key loads wait on a barrier that always settles; only this caller sees
+    // a delete failure, so one failed delete cannot block later key loads.
+    deletionPromise = deletion.catch(() => undefined);
+    await deletion;
   }
 
   async function encryptString(plaintext: string): Promise<Uint8Array> {
