@@ -221,6 +221,15 @@ files directly instead of depending on mutable development trees or global
 skill symlinks. Consumer instructions and review addenda still come from the
 review worktree; model and effort are the run's pinned profile settings.
 
+Launches outside the runner, such as `/hreview` or a direct
+`run-agy-review.sh` call, nominate no surface. The launcher then builds the same
+kind of standalone checkout at its pin once, under
+`<git-common-dir>/activeloom-review/agy-surface/<sha>`, and reuses it. Agy's
+skill discovery is never consulted, because it finds the review worktree's own
+`.agents` copy. That checkout faces the same remote, commit, and cleanliness
+checks; when one refuses it, `--repair-surface` preserves it beside the
+original and rebuilds it.
+
 The managed Gemini checkout is a standalone Git repository, not a linked
 worktree of a developer's upstream clone. Moving that clone cannot invalidate
 the installation's Git metadata. For other linked worktrees, run
@@ -401,6 +410,17 @@ then continues ordinary validation and attestation in the same pending pass.
 No reviewer is relaunched and the run ID, round and budget stay unchanged.
 This requires a helper that implements `recover-result`; update the published
 bundle through its normal verified distribution path, never patch it locally.
+
+Older helpers could accept a `minor` result from a package directory and then
+reject it as behavioral during root-level attestation. After a successful worker
+return, the controller rechecks the range's effect before validation. For a
+completed behavioral range labeled `minor`, it preserves the original result,
+snapshot and any validation receipt, and derives a `material` result through
+`write-result` in `classification-recovery/`. All ordinary evidence checks,
+validation and attestation still apply. Interrupted staging resumes only while
+the original digests, exact head and successful worker exit remain unchanged.
+No reviewer is relaunched and no run or round budget is reset. An affected
+existing run can adopt committed tooling through `--resume --migrate-controller`.
 
 ### Automatic validation repair
 
