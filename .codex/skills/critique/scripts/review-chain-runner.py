@@ -424,6 +424,8 @@ def darwin_protected_service(pid: int) -> bool:
             # App extensions such as widgets live in sealed system app bundles.
             executable.is_relative_to("/System/Applications")
             and any(part.endswith(".appex") for part in executable.parts)
+        ) or executable.match(
+            "/System/Library/ExtensionKit/Extensions/*.appex/Contents/MacOS/*"
         )
     )
 
@@ -2872,7 +2874,9 @@ class Runner:
         if diagnostic == b"agy relay surface checkout must be clean\n":
             return {"exit_status": 1, "failure_reason": "dirty_surface"}
         if not re.fullmatch(
-            rb"fatal: not a git repository: (/[^\x00-\x1f\x7f]+/\.git/worktrees/[^/\x00-\x1f\x7f]+|\(null\))\n",
+            rb"fatal: (?:not a git repository: "
+            rb"(/[^\x00-\x1f\x7f]+/\.git/worktrees/[^/\x00-\x1f\x7f]+|\(null\))"
+            rb"|gitfile does not point to a valid repository: /[^\x00-\x1f\x7f]+/\.git)\n",
             diagnostic,
         ):
             raise Blocked("legacy log does not prove a preflight-only failure")
@@ -3068,9 +3072,64 @@ class Runner:
             raise Blocked("active run changed; refuse to adopt a different budget")
         return result
 
+    def recover_classification(self, pending: dict[str, Any], head: str) -> None:
+        """Re-derive a completed result without overwriting its original evidence."""
+        origin = pending["classification_origin"]
+        attempts = [
+            attempt for attempt in self.state.get("attempts", [])
+            if attempt["attempt_id"] == pending.get("attempt_id")
+        ]
+        if (
+            pending["phase"] != "returned" or len(attempts) != 1
+            or attempts[0].get("phase") != "returned"
+            or attempts[0].get("exit_status") != 0
+        ):
+            raise Blocked("classification recovery requires a successfully returned worker")
+        source = self.directory / origin["folder"]
+        if head != origin["head"]:
+            raise Blocked("classification recovery head changed")
+        for name, expected in origin["files"].items():
+            if digest(source / name) != expected:
+                raise Blocked("classification recovery evidence changed")
+        original = read(source / "result.json")
+        target = source / "classification-recovery"
+        if target.is_symlink():
+            raise Blocked("classification recovery directory cannot be a symlink")
+        target.mkdir(mode=0o700, exist_ok=True)
+        for name in origin["files"]:
+            if name in ("result.json", "validated.json"):
+                continue
+            destination = target / name
+            if destination.exists() or destination.is_symlink():
+                if digest(destination) != origin["files"][name]:
+                    raise Blocked("classification recovery snapshot changed")
+            else:
+                shutil.copyfile(source / name, destination)
+        expected_result = {**original, "classification": "material"}
+        result_path = target / "result.json"
+        if result_path.exists() or result_path.is_symlink():
+            digest(result_path)
+            if read(result_path) != expected_result:
+                raise Blocked("classification recovery result changed")
+        self.helper(
+            "ledger", "write-result", "--repo", self.args.repo,
+            "--pr", str(self.args.pr), "--head", head,
+            "--engine", pending["engine"], "--round", str(pending["round"]),
+            "--base", self.state["base"], "--before", pending["before"],
+            "--result-file", str(result_path), "--classification", "material",
+            "--historical-comment-ids-file", str(target / "historical.json"),
+        )
+        if read(result_path) != expected_result:
+            raise Blocked("classification recovery changed the completed candidate")
+        pending["folder"] = str(target.relative_to(self.directory))
+        pending["result_recovery_sha256"] = None
+        self.persist()
+
     def complete_pass(self, pending: dict[str, Any]) -> None:
         head = self.boundary()
         self.decision(head)
+        if pending.get("classification_origin"):
+            self.recover_classification(pending, head)
         folder = self.directory / pending["folder"]
         if digest(folder / "historical.json") != pending["historical_sha256"]:
             raise Blocked("pre-pass comment snapshot changed")
@@ -3130,6 +3189,28 @@ class Runner:
                 raise Blocked("blocked validation repair requires explicit recovery")
             self.recover_blocked_pass(pending, head, result)
             return
+        if result["status"] == "changed" and result["classification"] == "minor":
+            effect = self.helper(
+                "ledger", "classify-effect", "--base", pending["before"],
+                "--head", head,
+            )
+            if effect.get("effect") not in ("behavioral", "non-behavioral"):
+                raise Blocked("helper did not classify the completed range")
+            if effect["effect"] == "behavioral":
+                if pending.get("validation_origin"):
+                    raise Blocked("classification recovery of a validation repair is unsupported")
+                names = ["result.json", "historical.json"]
+                names.extend(
+                    name for name in ("validated.json", "before-comments.json", "before-threads.json")
+                    if (folder / name).exists()
+                )
+                pending["classification_origin"] = {
+                    "folder": pending["folder"], "head": head,
+                    "files": {name: digest(folder / name) for name in names},
+                }
+                self.persist()
+                self.complete_pass(pending)
+                return
         if origin := pending.get("validation_origin"):
             original = next(a for a in self.state["attempts"] if a["attempt_id"] == origin)
             review_before = pending.get("review_before", pending["before"])
