@@ -27,17 +27,17 @@ Never ask a herder to restart a review run, or send it `--restart`. Only the use
 
 ## Scope: one workspace, owned
 
-- The workspace is `$HERDR_WORKSPACE_ID`. Other workspaces may run their own orchestrator; they own theirs.
+- The workspace is the live workspace containing this session, resolved in preflight. Inherited `HERDR_WORKSPACE_ID` and `HERDR_PANE_ID` are hints, not authority. Other workspaces may run their own orchestrator; they own theirs.
 - Inside this workspace you own every tab, pane and agent session, including ones the user opened by hand and ones an earlier orchestrator left behind. You may read, prompt, rename and direct any of them.
 - Leave review tabs open after they ship; they are the record. Close a build tab only once its PR exists and its session has finished. Keep a production-lane tab open until the user approves its artifact; it carries the revision context. Never close the tab you run in.
-- Outside this workspace: read `herdr workspace list` for awareness only (herdr.md). If work needs to cross workspaces, tell the user.
+- Outside this workspace: read `herdr workspace list` for awareness only, except for the read-only identity discovery in preflight (herdr.md). Discovery grants no authority to direct another workspace. If work needs to cross workspaces, tell the user.
 - One exception crosses repositories: an upstream fix build for a missing or stale skill ([below](#missing-or-stale-skill-fix-it-upstream)). Invoking this skill authorizes it unless the instruction file says not to; it runs in a tab of this workspace and never ships.
 - The repository is the workspace's primary checkout. It stays clean on the integration branch.
 
 ## Preflight
 
-1. `test "${HERDR_ENV:-}" = 1`, or stop. Then the permissions preflight and its Claude auto-mode check (herdr.md) for every engine this session may start a build, fix or review on.
-2. **Instruction of record.** Read the file the user named, in full, before any other tool call. With no file, use the newest `orchestrator-*.md` in the state directory (below); if there is none, ask the user what this push covers. Its hard stops, decisions-reserved list and sequencing govern; this skill adds the mechanics. The instruction file stays local; never commit it.
+1. **Resolve this session.** If the user named an instruction file, read it in full first. Follow herdr.md's [Live workspace discovery](../../references/herdr.md#live-workspace-discovery) before selecting a state directory or acting on any tab. Recover stale or missing environment IDs automatically when live evidence identifies this session; do not require a fresh tab just to repair inherited IDs. Pin the resolved workspace, tab and pane IDs, and use those explicit IDs in all commands below (including commands written with `$HERDR_WORKSPACE_ID` or `$HERDR_PANE_ID`). Then run the permissions preflight and its Claude auto-mode check for every engine this session may start a build, fix or review on.
+2. **Instruction of record.** With no named file, resolve the repository from this session's checkout and use `paths` (below) with the live workspace label to locate the newest `orchestrator-*.md`; read it in full. If there is none, complete the read-only inventory and ask what this push covers before dispatching work. Its hard stops, decisions-reserved list and sequencing govern; this skill adds the mechanics. The instruction file stays local; never commit it.
 3. `repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)`. `C` = `.claude/skills/hreview/scripts/herd-config.py`; `H` = `.claude/skills/critique/scripts/local-review-handoff.py`. Read `python3 -I $C repo` and `python3 -I $C user`; either failing is a block, and a missing `C` or `H` is a [missing skill](#missing-or-stale-skill-fix-it-upstream). The integration branch is the config's `integration_branch`.
 4. Read the repository's `AGENTS.md or CLAUDE.md` and `.claude/REVIEW_WORKFLOW.md` if not already in context. Tier, round caps, authorship and convergence come from there.
 5. **Inventory the workspace.** `herdr tab list --workspace $HERDR_WORKSPACE_ID`, `herdr pane list --workspace $HERDR_WORKSPACE_ID`, `herdr agent list` filtered to this workspace. Map each pane's cwd to a worktree, its branch (`git -C <cwd> branch --show-current`) and its PR (`gh pr list --head <branch>`). Give every agent without a name one now (`herdr agent rename <pane id> <name>`): the pattern under [Starting work](#starting-work-in-a-new-tab) once its role is known, `user-<k>` until then. `herdr agent prompt` cannot address an unnamed session, and the user may have started some by hand. Where a session's task is not clear from its pane, prompt it once for issue, PR, worktree and role (building, running a chain, one review pass) and read the answer from its pane. Don't guess.
@@ -60,6 +60,16 @@ Every new session gets its own tab, labelled the way the workspace already does 
 **Review chain** — start the herder on this session's engine and prompt it the `hreview` skill with `<n>` (add `--companion` for an ordered set), addressed the way herdr.md's Engines table gives for that engine. Every skill prompt below is addressed the same way. Start one when the PR is open, its author session has finished, and its head is not about to move: a PR due a rebase or a merge from its base waits until that lands, because a second run needs a restart only the user can name.
 
 Before starting one, read `python3 -I $H run-state --repo $repo --pr <n>`. A failed read is a block: start no herder for that PR. With `restart_required` true, the PR's latest run has ended, and a new run needs the user's own approval:
+
+Check `transition_required` first. A foreign active or ended run is never `none`:
+stop and report its actor, comment identity and run identity. Use the protocol's
+[Cross-actor lifecycle](../../references/local-review-ledger.md#cross-actor-lifecycle)
+only after the user's exact transition approval. Do not terminalize another
+actor's run, overwrite pins, or launch a replacement chain. State `transitioned`
+still requires a separate restart approval and scope decision; it conveys no
+coverage or additional rounds. Pass the verified transition identity to hreview
+as context, never as an invented restart authorization. Keep watchers and shipping
+on this same PR-wide lifecycle decision.
 
 - **Recorded approval:** `python3 -I $C check-restart --repo $repo --pr <n> --head <head>`, `<head>` being the PR's full current head SHA (`gh pr view <n> --json headRefOid`), exits 0, and when `scope_decision_required` is true the record's `scope_decision` is `keep`. Start the herder as usual; it claims the approval itself. Do not mention a restart in its prompt.
 - **None** (exit 4, or a record without the required scope decision): start no herder, even when the instruction file or the user's message to this session names the restart. Alert as in Problems, giving the run's outcome and the user's two ways forward: type into a fresh session in a new tab of this workspace
