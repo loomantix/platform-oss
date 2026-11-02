@@ -365,6 +365,11 @@ A Lean change that reaches round 3 has either been mis-tiered — escalate it
 deliberately, below — or is not converging, which is a signal about the change
 rather than a licence for another round. Say which, and stop.
 
+A round spent only on integrating the base is neither. When an engine already
+attested the PR's diff against its base clean, and the current diff against the
+current base is byte-identical, that engine runs the round as the convergence
+round instead of stopping.
+
 ### The run controller
 
 Rounds are numbered inside an authenticated `local-review-run:v1` marker, not
@@ -384,6 +389,12 @@ the active run (1 when it has none), then confirm it with `authorize-pass`.
 An aborted run is terminal in this controller. Preserve its evidence; a new
 `start-run --restart` requires fresh explicit user authorization and starts
 at round 1 with a full cap. This is a new review, not a budget-preserving resume.
+
+Lifecycle inventory is PR-wide, while evidence stays actor-owned. A foreign active
+or ended run is never `none`: follow the ledger protocol's **Cross-actor lifecycle**
+for exact user-approved abandonment/transition, then obtain separate restart and
+scope approvals and declare a fresh roster. Never forge an old-actor terminal
+marker, import its attestations or replace a pinned active runner's controls.
 
 For a requested alternating chain, record its ordered participants with
 `start-run --sequence claude,codex` (or the user's chosen order). The author
