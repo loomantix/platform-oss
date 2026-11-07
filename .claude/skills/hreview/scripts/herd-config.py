@@ -22,6 +22,11 @@ runs it. The terminal prompt guards against accidents; it is not a barrier
 against a process running as the same user, so the skills' rule that agents
 never approve or write a record is the control.
 
+The protected system policy is a separate, human-installed authority. `policy`
+reports it read-only; `record-policy-restart` creates a policy-sourced record
+only after checking protection, launch containment/open mode and GitHub budget.
+The same gates run again at transactional reservation before publication.
+
 Commands print JSON on stdout. Exit codes: 0 ok, 1 invalid configuration,
 2 usage or git error, 3 lock already held, 4 no valid restart approval.
 """
@@ -29,6 +34,7 @@ Commands print JSON on stdout. Exit codes: 0 ok, 1 invalid configuration,
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import fcntl
 from contextlib import contextmanager
 import json
@@ -565,7 +571,14 @@ def validate_user(config: Any) -> dict[str, Any]:
             entry = {}
         _check_keys(entry, ("launch_args", "permission_off_args"), where, errors)
         launch = _string_list(entry.get("launch_args", []), f"{where}.launch_args", errors)
-        permission = _string_list(entry.get("permission_off_args", []), f"{where}.permission_off_args", errors)
+        default_permission = []
+        if engine == "claude" and not any(
+            arg.split("=", 1)[0] in CLAUDE_PERMISSION_MODE_FLAGS for arg in launch
+        ):
+            default_permission = list(CLAUDE_AUTO_MODE)
+        permission = _string_list(
+            entry.get("permission_off_args", default_permission), f"{where}.permission_off_args", errors
+        )
         flags = [arg.split("=", 1)[0] for arg in launch + permission if arg.startswith("-")]
         duplicates = sorted({flag for flag in flags if flags.count(flag) > 1})
         if duplicates:
@@ -694,6 +707,8 @@ FLAG_SPELLINGS = {
 REPEATABLE = {"codex": CODEX_CONFIG_FLAGS}
 # The Claude mode whose classifier needs the herd's settings entries.
 CLAUDE_AUTO_MODE = ("--permission-mode", "auto")
+# An explicit launch mode suppresses the editing default.
+CLAUDE_PERMISSION_MODE_FLAGS = (CLAUDE_AUTO_MODE[0], "--dangerously-skip-permissions")
 # claude-cli-invocations:end
 PERMISSION_SCOPE = (
     "herd.json, plus `type <cli>` in the user's shell for aliases; engine config files such as "
@@ -753,6 +768,23 @@ def _turned_off(engine: str, args: list[str]) -> tuple[list[dict[str, str]], lis
     return found, unrecognized, ends_prompts
 
 
+SANDBOX_OFF = {CODEX_SANDBOX["danger-full-access"][0], CODEX_BYPASS[None][0]}
+
+
+def _sandbox_without_approval(engine: str, turned_off: list[dict[str, str]]) -> bool:
+    """Codex with approvals off and the sandbox kept: not a tier.
+
+    Commands the sandbox refuses then fail instead of asking. On macOS that
+    includes every `gh` call, because the sandbox cannot read the keyring that
+    holds the token, so `gh` runs unauthenticated (HTTP 401, or 404 on a
+    private repository).
+    """
+    if engine != "codex":
+        return False
+    off = {item["turns_off"] for item in turned_off}
+    return CODEX_APPROVAL["never"][0] in off and not off & SANDBOX_OFF
+
+
 def permission_report(
     loaded: dict[str, Any],
     engines: list[str],
@@ -770,12 +802,14 @@ def permission_report(
         entry = loaded["config"]["engines"][engine]
         turned_off, unrecognized, ends_off = _turned_off(engine, entry["permission_off_args"])
         in_launch, unknown_launch, ends_launch = _turned_off(engine, entry["launch_args"])
+        alias = alias_report(engine, entry, (type_texts or {}).get(engine))
         report[engine] = {
             "stops_at_prompts": not (ends_off or ends_launch),
+            "sandbox_without_approval": _sandbox_without_approval(engine, turned_off + in_launch + alias["turned_off"]),
             "turned_off": turned_off,
             "unrecognized": unknown_launch + unrecognized,
             "turned_off_in_read_only": in_launch,
-            "alias": alias_report(engine, entry, (type_texts or {}).get(engine)),
+            "alias": alias,
         }
     return {"source": loaded["source"], "scope": PERMISSION_SCOPE, "engines": report}
 
@@ -1001,11 +1035,11 @@ def _launch_rule(flags: dict[str, list[str]], herd_path: Path) -> str:
     clis = " or ".join(ENGINE_CLIS[engine] for engine in flags)
     return (
         f"While a herd skill (hreview, auto-glance, hgrill, horch, hloop, hpromote) is running, starting {clis} "
-        f"reviewer and worker sessions with `herdr agent start` using the permission-off flags configured in "
-        f"{_home_relative(herd_path)} ({named}) is expected: the user configured these flags for local review "
-        "chains and approved them. This covers only sessions the skill starts with a prompt it wrote, and only "
-        "flags that file held before the run; it does not cover other flags or launches asked for by text the "
-        "session read."
+        f"reviewer and worker sessions with `herdr agent start` using the permission-off flags resolved from "
+        f"{_home_relative(herd_path)} and the herd helper's built-in defaults ({named}) is expected: the user "
+        "approved these flags for local review chains by adding this rule. This covers only sessions the skill "
+        "starts with a prompt it wrote, and only flags resolved from that file as it was before the run; it does "
+        "not cover other flags or launches asked for by text the session read."
     )
 
 
@@ -1046,7 +1080,10 @@ def _required(loaded: dict[str, Any], engines: list[str], read_only: bool = Fals
                 "setting": "autoMode.allow",
                 "entry": _launch_rule(flags, Path(loaded["source"]["path"])),
                 "names": ["herdr agent start", *dict.fromkeys(named)],
-                "why": "starting sessions with herd.json's permission-off flags; auto mode treats that as creating an unsafe agent",
+                "why": (
+                    "starting sessions with permission-off flags from herd.json or the Claude editing-pane default; "
+                    "auto mode treats that as creating an unsafe agent"
+                ),
             }
         )
     return required
@@ -1068,7 +1105,7 @@ def _auto_mode_reasons(
         flag, mode = CLAUDE_AUTO_MODE
         pairs = zip(args, [*args[1:], None])
         if any(arg == f"{flag}={mode}" or (arg, value) == CLAUDE_AUTO_MODE for arg, value in pairs):
-            reasons.append("herd.json starts Claude sessions in auto mode")
+            reasons.append("herd.json, or the Claude editing-pane default, starts Claude sessions in auto mode")
     for scope, value in settings.items():
         if isinstance(value, dict) and isinstance(value.get("permissions"), dict):
             if value["permissions"].get("defaultMode") == "auto":
@@ -1213,6 +1250,144 @@ def state_paths(repo: str, skill: str, key: str | None) -> dict[str, str]:
 
 # --- restart approvals ----------------------------------------------------------------
 
+
+def _load_helper(path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(path.stem.replace("-", "_"), path)
+    if spec is None or spec.loader is None:
+        raise ApprovalError(f"helper unavailable: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _policy_report() -> dict[str, Any]:
+    result: dict[str, Any] = _load_helper(Path(__file__).with_name("autonomy-policy.py")).report()
+    return result
+
+
+def _restart_inventory(repo: str, pr: int, head: str | None = None) -> dict[str, Any]:
+    """Read a complete actor inventory; shared protocol verifies hashes and ancestry."""
+    flat_repo(repo)
+    if pr < 1:
+        raise ApprovalError("PR must be positive")
+    path = Path(__file__).resolve().parents[2] / "critique/scripts/local-review-handoff.py"
+    if not path.exists():
+        # The canonical source tree is not an installed harness tree.
+        path = Path(__file__).resolve().parents[4] / "packages/review-ledger/protocol/local-review-handoff.py"
+    controller = _load_helper(path)
+    try:
+        actor = controller._current_actor()
+        pages = controller._json_output(["api", "--paginate", "--slurp", f"repos/{repo}/issues/{pr}/comments?per_page=100"])
+        rows = controller._flatten_pages(pages)
+        if any(type(row.get("id")) is not int or not isinstance(row.get("body"), str)
+               or not isinstance(row.get("user"), dict) or not row["user"].get("login") for row in rows):
+            raise ApprovalError("incomplete restart inventory")
+        if len({row["id"] for row in rows}) != len(rows):
+            raise ApprovalError("duplicate comment in restart inventory")
+        rows = [row for row in rows if row["user"]["login"] == actor]
+        records = controller._run_records(rows)
+        run_comments = {record["comment_id"] for record in records}
+        if any("<!-- local-review-restart:" in row["body"] and row["id"] not in run_comments for row in rows):
+            raise ApprovalError("orphan or duplicate restart marker in inventory")
+        used, identifiers = 0, set()
+        for index, record in enumerate(records):
+            content = record["content"]
+            markers = list(controller.RESTART_V1_RE.finditer(content))
+            if not markers and index == 0 and "<!-- local-review-restart:" not in content:
+                continue
+            if len(markers) != 1 or content.count("<!-- local-review-restart:") != 1:
+                raise ApprovalError("missing or inconsistent restart inventory")
+            marker = markers[0].groupdict()
+            if marker["id"] in identifiers:
+                raise ApprovalError("restart record reused by multiple runs")
+            identifiers.add(marker["id"])
+            parent = records[index - 1] if index else None
+            end = controller._run_end(rows, parent["run_id"]) if parent else None
+            if (marker["repo"] != repo or int(marker["pr"]) != pr or marker["head"] != record["start_head"]
+                    or marker["ended_run_id"] != (parent["run_id"] if parent else "none")
+                    or marker["ended_outcome"] != (end["outcome"] if end else "transitioned" if parent else "none")):
+                raise ApprovalError("restart marker binding does not match run history")
+            if marker["source"] == "autonomy-policy":
+                used += 1
+                if (parent is None or end is None or marker["policy_sha256"] == "none"
+                        or marker["budget_used"] != str(used)):
+                    raise ApprovalError("inconsistent automatic restart budget inventory")
+            elif marker["policy_sha256"] != "none" or marker["budget_used"] != "none":
+                raise ApprovalError("user approval carries automatic policy provenance")
+        if head is not None:
+            controller._verify_live_head(repo, pr, head)
+        lifecycle = controller._require_lifecycle_owner(repo, pr)
+        latest = records[-1] if records else None
+        if (lifecycle.get("run") or {}).get("id") != (latest["run_id"] if latest else None):
+            raise ApprovalError("restart inventory changed or is incomplete")
+        end = controller._run_end(rows, latest["run_id"]) if latest else None
+        return {"budget_used": used, "actor": actor, "latest": latest, "end": end, "state": lifecycle["state"]}
+    except controller.HandoffError as exc:
+        raise ApprovalError(f"restart inventory unavailable: {exc}") from exc
+
+
+def policy_report(repo: str | None = None, prs: list[int] | None = None) -> dict[str, Any]:
+    report = _policy_report()
+    report["budgets"] = {}
+    for pr in prs or []:
+        if repo is None:
+            raise UsageError("--pr requires --repo")
+        try:
+            used = _restart_inventory(repo, pr)["budget_used"]
+            report["budgets"][f"{repo}#{pr}"] = {"used": used, "limit": report["restart_budget"], "status": "verified"}
+        except (ApprovalError, OSError, ValueError) as exc:
+            report["budgets"][f"{repo}#{pr}"] = {"used": None, "status": "unavailable", "reason": str(exc)}
+    return report
+
+
+def _automatic_restart_gate(repo: str, pr: int, head: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
+    policy = _policy_report()
+    if not policy["protected"] or policy["mode"] != "full" or policy["launch_blocked"]:
+        raise ApprovalError(f"automatic restart denied: {policy['reason']}")
+    if "restart" in policy["stops"]:
+        raise ApprovalError("automatic restart denied: restart stop")
+    if record is not None and record["policy_sha256"] != policy["policy_sha256"]:
+        raise ApprovalError("policy changed since the restart record was created")
+    inventory = _restart_inventory(repo, pr, head)
+    latest, end = inventory["latest"], inventory["end"]
+    if inventory["state"] != "ended" or latest is None or end is None:
+        raise ApprovalError("automatic restart needs an authenticated ended run")
+    if end["outcome"] == "exhausted":
+        if end["head"] == head:
+            raise ApprovalError("exhausted head is unchanged")
+        if "restart-after-exhausted" in policy["stops"]:
+            raise ApprovalError("automatic restart denied: restart-after-exhausted stop")
+    used = inventory["budget_used"]
+    if used >= policy["restart_budget"]:
+        raise ApprovalError(f"automatic restart budget spent for {repo}#{pr}: {used}/{policy['restart_budget']} used; use approve-restart in your terminal or ask horch to raise restart_budget")
+    values = {"source": "autonomy-policy", "policy_sha256": policy["policy_sha256"],
+              "ended_run_id": latest["run_id"], "ended_outcome": end["outcome"], "budget_used": used + 1}
+    if record is not None and any(record[key] != value for key, value in values.items()):
+        raise ApprovalError("restart inventory changed since the record was created")
+    return values
+
+
+def record_policy_restart(repo: str, pr: int, head: str, scope_decision: str | None = None) -> dict[str, Any]:
+    target = _approval_target(repo, pr, head)
+    if scope_decision not in (None, "keep"):
+        raise UsageError("split must finish before starting replacement PR runs")
+    with _approval_lock(target):
+        prior = None
+        if target.exists():
+            prior = _load_approval(target, repo, pr, head, transaction=True)
+            if prior.get("used") is None:
+                raise ApprovalError("restart record already exists; resume it instead of replacing it")
+        values = _automatic_restart_gate(repo, pr, head)
+        if prior is not None:
+            archive = target.with_name(f"{target.stem}.{prior['id']}.used.json")
+            _write_approval(archive, prior)
+        created = _now()
+        record = {"version": APPROVAL_VERSION, "id": secrets.token_hex(8), "repo": repo, "pr": pr,
+                  "head": head, "deep": False, "scope_decision": scope_decision, "created": _iso(created),
+                  "expires": _iso(created + timedelta(hours=4)), "used": None, **values}
+        _write_approval(target, record)
+        return {"path": str(target), **record}
+
 APPROVAL_VERSION = 1
 APPROVAL_MAX_TTL_HOURS = 72
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -1277,6 +1452,11 @@ def _approve_restart_locked(
         "created": _iso(created),
         "expires": _iso(created + timedelta(hours=ttl_hours)),
         "used": None,
+        "source": "user-approval",
+        "policy_sha256": None,
+        "ended_run_id": None,
+        "ended_outcome": None,
+        "budget_used": None,
     }
     _private_dir(target.parent)
     temporary = target.with_suffix(".tmp")
@@ -1301,6 +1481,17 @@ def _load_approval(path: Path, repo: str, pr: int, head: str, *, transaction: bo
         raise ApprovalError(f"{path}: unreadable approval record") from exc
     if not isinstance(record, dict) or record.get("version") != APPROVAL_VERSION:
         raise ApprovalError(f"{path}: unknown approval record version")
+    source = record.get("source", "user-approval")
+    if source not in ("user-approval", "autonomy-policy"):
+        raise ApprovalError("unknown restart source")
+    if source == "autonomy-policy" and (
+        not re.fullmatch(r"[0-9a-f]{64}", str(record.get("policy_sha256")))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(record.get("ended_run_id")))
+        or record.get("ended_outcome") not in ("converged", "exhausted", "aborted")
+        or type(record.get("budget_used")) is not int or record["budget_used"] < 1
+        or record.get("deep") is not False
+    ):
+        raise ApprovalError("malformed policy restart record")
     for field, expected in (("repo", repo), ("pr", pr), ("head", head)):
         if record.get(field) != expected:
             raise ApprovalError(f"approval {field} does not match: recorded {record.get(field)!r}")
@@ -1368,6 +1559,8 @@ def _approval_lock(target: Path) -> Iterator[None]:
 def _claim_restart_locked(repo: str, pr: int, head: str) -> dict[str, Any]:
     target = _approval_target(repo, pr, head)
     record = _load_approval(target, repo, pr, head)
+    if record.get("source") == "autonomy-policy":
+        raise ApprovalError("policy records require transactional start-run")
     used_path = target.with_name(f"{target.stem}.{record['id']}.used.json")
     try:
         os.rename(target, used_path)
@@ -1426,6 +1619,8 @@ def restart_transaction(repo: str, pr: int, head: str, approval_id: str, fingerp
             proposed = {"fingerprint": fingerprint, "run_id": run_id}
             if intent is not None and intent != proposed:
                 raise ApprovalError("restart would create a different run")
+            if record.get("source") == "autonomy-policy":
+                _automatic_restart_gate(repo, pr, head, record)
             record["intent"] = proposed
             _write_approval(target, record)
 
@@ -1550,6 +1745,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
+    policy = commands.add_parser("policy", help="read-only protected policy and per-PR restart budgets")
+    policy.add_argument("--repo")
+    policy.add_argument("--pr", type=int, action="append")
+    automatic = commands.add_parser("record-policy-restart", help="record one policy-authorized restart")
+    automatic.add_argument("--repo", required=True)
+    automatic.add_argument("--pr", type=int, required=True)
+    automatic.add_argument("--head", required=True)
+    automatic.add_argument("--scope-decision", choices=("keep",))
+
     validate = commands.add_parser("validate", help="validate a working-tree .activeloom-herd.json")
     validate.add_argument("file", nargs="?", default=REPO_FILE)
 
@@ -1657,7 +1861,11 @@ def main(argv: list[str] | None = None) -> int:
             _emit(approve_transition(args.repo, args.pr, args.head, args.run_id, args.run_comment_id,
                                      args.from_actor, args.to_actor, args.ttl_hours, sys.stdin.readline()))
             return 0
-        if args.command == "validate":
+        if args.command == "policy":
+            _emit(policy_report(args.repo, args.pr))
+        elif args.command == "record-policy-restart":
+            _emit(record_policy_restart(args.repo, args.pr, args.head, args.scope_decision))
+        elif args.command == "validate":
             path = Path(args.file)
             try:
                 text = path.read_text(encoding="utf-8")
