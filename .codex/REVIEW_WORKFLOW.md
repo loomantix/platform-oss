@@ -40,6 +40,25 @@ attestation, and bounded progression. Existing handoff sessions and the separate
 issue-implementation `agent-loop` keep their own contracts. An active legacy run
 is not silently converted to a new plan or granted a fresh budget.
 
+## Starting the review chain
+
+When a PR needs review and the session runs inside herdr (`HERDR_ENV=1`) with
+the herd skills installed, the default entry point for every user is
+`hreview <pr-number>`, typed in a fresh session, or `horch`,
+which always starts review chains through `hreview`. Recommend that and nothing
+else: `hreview` runs the review profile's engines in order, each pass in a
+fresh pane, so the author session never reviews its own change. Otherwise,
+run each pass yourself in a fresh session, in the profile's order.
+
+This sets the default recommendation. It does not override an explicit request
+for the automatic chain, the local-or-hosted question when a request names no
+style ([Hosted Reviewers](#hosted-reviewers)), or a one-pass reviewer's return
+to its controller: that session recommends no entry point.
+
+`reviewit` is not a step of this chain. Never recommend it as the next step
+after a local pass or a converged chain; offer it only when the user asks for
+hosted review ([Hosted Reviewers](#hosted-reviewers)).
+
 ## PR-First Rule
 
 Open a draft pull request before any structured review cleanup such as
@@ -558,7 +577,7 @@ identities, so their comments are context rather than actor-owned ledger
 evidence, and they do not attest. Coverage counts local engines only — a hosted
 pass does not turn a solo relay into a cross-model one.
 
-Invocation:
+Invocation, only when the user asks for hosted review:
 
 - **Lean** — `reviewit <pr-number>` for the bounded Gemini Flash and Copilot
   loop. It verifies and deduplicates their findings, fixes confirmed issues,
@@ -877,7 +896,9 @@ rather than a licence for another round. Say which, and stop.
 A round spent only on integrating the base is neither. When an engine already
 attested the PR's diff against its base clean, and the current diff against the
 current base is byte-identical, that engine runs the round as the convergence
-round instead of stopping.
+round instead of stopping. Under agent-loop the runner makes this comparison
+itself and sets `$AGENT_LOOP_REVIEW_DIFF_UNCHANGED=1` when it holds; an engine
+that sees it set runs the convergence round without recomputing the diff.
 
 ### Escalate and de-escalate on evidence
 
