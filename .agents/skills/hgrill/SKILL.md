@@ -68,7 +68,7 @@ Split one row below the driver's pane with one pane per engine, titled by engine
 ### Each pass (strictly in order)
 
 1. **Start** the engine in its pane, named `g<n>-<engine>`. Before the first pass, record `git -C <primary checkout> status --porcelain` and `git worktree list` in `state.md` as the debris baseline.
-2. **Prompt.** First line: the `<kind>` skill for issue `#<n>`, addressed the way the engine expects. Then:
+2. **Prompt.** The invocation is the `<kind>` skill for issue `#<n>`, addressed the way the engine expects; the brief below goes with it as herdr.md's Prompting gives (on Claude and agy: brief first as its own prompt, then the bare `/<kind> <n>`; on Codex: one prompt, invocation first). The brief:
 
    ```text
    Automated grill chain for <repo>#<n>, pass <k> of <total> (<engine>), kind <kind>. An orchestrator answers for the issue owner under their standing approval.
@@ -186,12 +186,13 @@ After reconcile, the driver does this itself.
 
 A refuted premise means a decision was made on a false fact. Fix it here; never hand it to the owner as a finding.
 
-1. Run one more pass on the chain's first engine, same kind and prompt (`pass <total+1> of <total+1>`), plus:
+1. Run one more pass on the chain's first engine, same kind, invocation and brief (`pass <total+1> of <total+1>`), with this appended to the brief:
 
    ```text
    This is a correction pass. A read-only check after the last pass refuted these premises:
    - <false belief> — fact: <fact> (<source>). Affects: <decision, with its comment URL>.
    Re-decide every decision that rests on them, and anything that follows from those. Keep every other decision as it stands; do not reopen agreed calls. Your decision comment supersedes only the decisions you change, and names them.
+   If your handback plan excludes the issue, add_labels names its exclusion label: the current one unless this pass changes it, never <hold label>. Leave <hold label> out of add_labels and remove_labels; the applier keeps it whenever it is on the issue.
    ```
 
    Answer it as any other pass.
