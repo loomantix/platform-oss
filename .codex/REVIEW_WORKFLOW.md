@@ -124,12 +124,24 @@ The launcher also owns a 45-minute pass timeout. Operators may lower it with
 `LOCAL_REVIEW_PASS_TIMEOUT_SECONDS`; values above the hard 3600-second ceiling
 are rejected.
 
-The contract-v4 `agent-loop` is the sole exception: its wrapper directly
-invokes the separately tested
+There are exactly two exceptions. First, the contract-v4 `agent-loop`: its
+wrapper directly invokes the separately tested
 `.codex/skills/agent-loop/scripts/run-codex-review.sh`, which starts Claude with
-its own literal `--effort low` and the same permission, persistence, and output policy against an
-immutable base-blob `.claude` snapshot. Interactive review and every
-non-agent-loop caller continue to use `run-claude-review.sh` only.
+the run's pinned model and effort against an immutable base-blob `.claude`
+snapshot. The hook owns its permission, persistence, and output options.
+
+Second, a herd chain's interactive Claude reviewer pane. When a herd skill such
+as `hreview` starts a Claude reviewer as an interactive session, either in a
+herdr pane with `herdr agent start` or as a user pass rendered by
+`local-review-handoff.py user-handoff` for the user's own terminal, build the
+launch exactly as `herdr.md` gives it for the `claude` engine. Take model and
+effort only from `review-profile.py launch-args` (or the pair the run recorded
+from it), the user's extra launch argv only from `herd-config.py user-args`,
+and the pane environment only from that reference. Never add an option of your
+own or override one of those values; a missing or failing helper is a blocker.
+
+Outside the contract-v4 `agent-loop` hook and the herd-launched interactive
+reviewer session, use `run-claude-review.sh` for every Claude review.
 
 ### Select the local session mode
 
@@ -299,10 +311,12 @@ engine in a fresh terminal.
    - **Use the resolved tier's stance:** Lean round 1 is adversarial and round 2
      converges; Deep rounds 1–2 are adversarial and rounds 3–4 converge.
      The first pass after escalation remains adversarial regardless of ordinal.
-     A reviewer holding no attestation on this PR runs adversarially on its
-     first cold read whatever the round ordinal: the stance tracks how many
-     times that reviewer has read the change, not how many rounds elapsed
-     before it joined.
+     A reviewer holding no pass or completion attestation in the current run
+     runs adversarially on its first cold read whatever the round ordinal: the
+     stance tracks how many times that reviewer has read the change, not how
+     many rounds elapsed before it joined. `authorize-pass` reports that
+     stance and the ledger enforces it; history it cannot attribute counts as
+     a read.
      After the tier's adversarial passes, the remaining
      findings are mostly about the review's own artifacts. A convergence round
      runs only the lanes that can find a reason not to deploy, changes the PR
