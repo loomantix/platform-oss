@@ -1132,6 +1132,26 @@ def _start_run_checked(args: argparse.Namespace) -> None:
     )
 
 
+ATTESTATION_PREFIXES = ("<!-- local-review-pass:v3", "<!-- local-review-complete:v3")
+
+
+def _reader_identity(engine: str) -> str:
+    """Gemini attests under either name; both are one reviewer."""
+    return "gemini" if engine == "antigravity" else engine
+
+
+def _pass_stance(*, tier: str, round_number: int, read_before: bool) -> str:
+    """Mirror the ledger's convergence split, including the late-joiner rule.
+
+    Lean's final round and Deep's rounds 3+ are convergence rounds, except for an
+    engine with no earlier authenticated attestation in this run: it is joining
+    late, and its first cold read is adversarial whatever the round.
+    """
+    if round_number < (2 if tier == "lean" else 3):
+        return "adversarial"
+    return "convergence" if read_before else "adversarial"
+
+
 def _pass_authorization(args: argparse.Namespace) -> dict[str, Any]:
     rows = _issue_comments(args.repo, args.pr)
     records = _run_records(rows)
@@ -1165,16 +1185,32 @@ def _pass_authorization(args: argparse.Namespace) -> dict[str, Any]:
         )
     existing: set[tuple[str, int]] = set()
     highest_round = 0
+    # Engines this run already holds a pass or completion attestation for, with
+    # the earliest such round. An unparseable attestation-shaped row cannot be
+    # attributed, so it marks every engine as having read: fail closed.
+    read_rounds: dict[str, int] = {}
+    unattributed_read = False
     for row in rows:
-        if (
-            not isinstance(row.get("id"), int)
-            or cast(int, row["id"]) <= start_comment_id
-        ):
+        row_id = row.get("id")
+        if type(row_id) is not int:
+            unattributed_read = True
+            continue
+        if row_id <= start_comment_id:
             continue
         body = row.get("body")
         if not isinstance(body, str):
             continue
-        for marker in (*PASS_V3_RE.finditer(body), *COMPLETE_V3_RE.finditer(body), *RECOVERY_V1_RE.finditer(body)):
+        normalized_body = body.replace("\r\n", "\n")
+        if normalized_body.startswith(ATTESTATION_PREFIXES):
+            first_line = normalized_body.split("\n", 1)[0]
+            attestation = PASS_V3_RE.match(first_line) or COMPLETE_V3_RE.match(first_line)
+            if attestation is None:
+                unattributed_read = True
+            else:
+                reader = _reader_identity(attestation.group("engine"))
+                read_round = int(attestation.group("round"))
+                read_rounds[reader] = min(read_rounds.get(reader, read_round), read_round)
+        for marker in (*PASS_V3_RE.finditer(normalized_body), *COMPLETE_V3_RE.finditer(normalized_body), *RECOVERY_V1_RE.finditer(normalized_body)):
             engine = marker.group("engine")
             if engine == "antigravity":
                 engine = "gemini"
@@ -1206,11 +1242,11 @@ def _pass_authorization(args: argparse.Namespace) -> dict[str, Any]:
         "round": args.round,
         "run_round": run_round,
         "run_id": run["run_id"],
-        # Lean's final round and Deep's rounds 3+ use the ledger's convergence split.
-        "stance": (
-            "convergence"
-            if run_round >= (2 if run["tier"] == "lean" else 3)
-            else "adversarial"
+        "stance": _pass_stance(
+            tier=cast(str, run["tier"]),
+            round_number=run_round,
+            read_before=unattributed_read
+            or read_rounds.get(_reader_identity(args.engine), run_round) < run_round,
         ),
         "tier": run["tier"],
         "verified": True,
@@ -1820,6 +1856,36 @@ def _user_skill_line(engine: str, skill: str, target: str) -> str:
     return f"/{skill} {target}"
 
 
+def _unbound_user_instructions(
+    engine: str, worktree: Path, head: str, skills: list[str], target: str,
+) -> list[str]:
+    root = USER_LAUNCH[engine]["root"]
+    pin_path = worktree / root / "skills/critique/scripts/review-ledger.version"
+    try:
+        pin = pin_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        _fail(f"the review worktree has no ledger version pin at {pin_path}")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", pin):
+        _fail(f"the ledger version pin at {pin_path} is malformed")
+    helper = f"{root}/skills/critique/scripts/review-ledger.js"
+    lines = [
+        "2. In that session, check the exact head and the ledger helper pin first:",
+        "",
+        f'   test "$(git rev-parse HEAD)" = {head}',
+        f'   test "$(node {helper} --version)" = {pin}',
+        "",
+        "3. Then give it this prompt:",
+        "",
+    ]
+    if "refactorpass" in skills:
+        lines.append(
+            "   " + _user_skill_line(engine, "refactorpass", target)
+            + "   (its ledger latch decides whether it runs), then:"
+        )
+    lines.append("   " + _user_skill_line(engine, skills[-1], target))
+    return lines
+
+
 def _user_handoff(args: argparse.Namespace) -> None:
     """Read-only: render the handoff for the run's next pass, launched by the user."""
     rows = _issue_comments(args.repo, args.pr)
@@ -1840,14 +1906,6 @@ def _user_handoff(args: argparse.Namespace) -> None:
     worktree = Path(args.worktree)
     if not worktree.is_absolute():
         _fail("--worktree must be an absolute path")
-    root = USER_LAUNCH[engine]["root"]
-    pin_path = worktree / root / "skills/critique/scripts/review-ledger.version"
-    try:
-        pin = pin_path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        _fail(f"the review worktree has no ledger version pin at {pin_path}")
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", pin):
-        _fail(f"the ledger version pin at {pin_path} is malformed")
     silent = SILENT_SCOPE is not None
     skills = (
         ["deepcritique"]
@@ -1862,8 +1920,12 @@ def _user_handoff(args: argparse.Namespace) -> None:
         "findings inline before edits; validate, commit, push, reply and resolve; "
         "publish the normal review result."
         + (
-            " This PR is silent: pass `silent` to the skill and keep the ledger "
-            "local per the protocol's Silent mode."
+            (
+                " This PR is silent: pass `silent` to the skill and keep the ledger "
+                "local per the protocol's Silent mode."
+                if args.bound_entry_file is None
+                else " This PR is silent: keep the ledger local per the protocol's Silent mode."
+            )
             if silent else ""
         )
         + (f" {context}" if context else "")
@@ -1872,7 +1934,6 @@ def _user_handoff(args: argparse.Namespace) -> None:
         "preflight check or a helper refuses, report the command and its exact "
         "error, post nothing, and stop."
     )
-    helper = f"{root}/skills/critique/scripts/review-ledger.js"
     lines = [
         f"USER PASS: {args.repo}#{args.pr} {engine} r{number} at {args.head[:12]}",
         "",
@@ -1883,20 +1944,14 @@ def _user_handoff(args: argparse.Namespace) -> None:
             args.env or [],
         ),
         "",
-        "2. In that session, check the exact head and the ledger helper pin first:",
-        "",
-        f'   test "$(git rev-parse HEAD)" = {args.head}',
-        f'   test "$(node {helper} --version)" = {pin}',
-        "",
-        "3. Then give it this prompt:",
-        "",
     ]
-    if "refactorpass" in skills:
-        lines.append(
-            "   " + _user_skill_line(engine, "refactorpass", target)
-            + "   (its ledger latch decides whether it runs), then:"
-        )
-    lines.append("   " + _user_skill_line(engine, skills[-1], target))
+    if args.bound_entry_file is None:
+        lines.extend(_unbound_user_instructions(engine, worktree, args.head, skills, target))
+    else:
+        entry = _read_context(args.bound_entry_file).strip()
+        if not entry:
+            _fail("bound entry instructions must be present")
+        lines.extend(["2. Give the session this plain prompt:", "", entry])
     lines.append("   " + prompt)
     lines += [
         "",
@@ -2103,6 +2158,7 @@ def _parser() -> argparse.ArgumentParser:
         help="one pane-env entry the launched session must carry (repeat)",
     )
     user.add_argument("--context-file", help="extra prompt text, such as carried findings")
+    user.add_argument("--bound-entry-file", help="verified entry commands and instructions for the assigned lanes")
     user.set_defaults(handler=_user_handoff)
 
     recover = commands.add_parser("recover-pass")
