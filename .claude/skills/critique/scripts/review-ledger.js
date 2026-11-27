@@ -44,7 +44,7 @@ import { createHash } from "crypto";
 
 // src/constants.ts
 var PROTOCOL_VERSION = 3;
-var PACKAGE_VERSION = true ? "1.18.0" : "0.0.0-dev";
+var PACKAGE_VERSION = true ? "1.19.0" : "0.0.0-dev";
 var SUBPROCESS_MAX_BUFFER = 256 * 1024 * 1024;
 var EXPECTED_ACTOR_ENV = "AGENT_LOOP_REVIEW_ACTOR";
 var EXPECTED_THREADS_SHA256_ENV = "AGENT_LOOP_REVIEW_THREADS_SHA256";
@@ -17549,7 +17549,7 @@ function validateResultData(args, rawInput) {
       fail("clean review result conflicts with the observed pass");
     }
   } else if (status === "changed") {
-    if (args.before === expectedHead || classification !== "minor" && classification !== "material" || args.round >= 3 && classification !== "material" || fingerprints.length === 0 || data["finalLaneComplete"] !== true || "blocker" in data) {
+    if (args.before === expectedHead || classification !== "minor" && classification !== "material" || fingerprints.length === 0 || data["finalLaneComplete"] !== true || "blocker" in data) {
       fail("changed review result conflicts with the observed pass");
     }
   } else {
@@ -17981,21 +17981,21 @@ function verifyBlockingNotDeferred(repo, matched) {
   for (const records of grouped.values()) {
     records.sort((a, b) => a[0] - b[0]);
     const [, finding, disposition] = records[records.length - 1];
-    if (finding.severity === "blocking" && disposition.outcome !== "fixed") {
-      fail("blocking local-review findings must be fixed");
+    if (finding.severity === "blocking" && disposition.outcome === "deferred") {
+      fail("blocking local-review findings cannot be deferred");
     }
     const priorUnfixedBlockers = [];
     for (let index = 0; index < records.length - 1; index++) {
       const [, priorFinding, priorDisposition] = records[index];
-      if (priorFinding.severity === "blocking" && priorDisposition.outcome !== "fixed") {
+      if (priorFinding.severity === "blocking" && priorDisposition.outcome === "deferred") {
         priorUnfixedBlockers.push(index);
       }
     }
     if (priorUnfixedBlockers.length === 0) {
       continue;
     }
-    if (disposition.outcome !== "fixed") {
-      fail("an unfixed blocker must be cleared by a later fixed occurrence");
+    if (disposition.outcome === "deferred") {
+      fail("a deferred blocker must be fixed or dismissed with evidence");
     }
     if (repo === void 0) {
       fail(
@@ -18010,7 +18010,9 @@ function verifyBlockingNotDeferred(repo, matched) {
         records[index + 1][1].head
       );
     }
-    verifyForwardTransition(repo, finding.head, disposition.head);
+    if (disposition.outcome === "fixed" || finding.head !== disposition.head) {
+      verifyForwardTransition(repo, finding.head, disposition.head);
+    }
   }
 }
 function verifyThreadDispositions(threads, historicalCommentIds, options) {
@@ -18120,8 +18122,8 @@ function sameRoundDispositions(args, matched, allowedHeads, slips) {
         );
       }
     }
-    if (finding.severity === "blocking" && disposition.outcome !== "fixed") {
-      fail("blocking local-review findings must be fixed");
+    if (finding.severity === "blocking" && disposition.outcome === "deferred") {
+      fail("blocking local-review findings cannot be deferred");
     }
     const fixed = disposition.outcome === "fixed";
     const fixedMajor = fixed && (finding.severity === "blocking" || finding.severity === "major");
@@ -18175,8 +18177,36 @@ function transitionHeads(params) {
   });
   return heads;
 }
-function convergenceStartRound(repo, pr) {
-  return currentRun(repo, pr)?.tier === "lean" ? 2 : 3;
+var ATTESTATION_PREFIXES = [
+  "<!-- local-review-pass:v3",
+  "<!-- local-review-complete:v3"
+];
+function readerIdentity(engine) {
+  return engine === "antigravity" ? "gemini" : engine;
+}
+function readEarlierInRun(rows, run, engine, round) {
+  const reader = readerIdentity(engine);
+  return rows.some((row) => {
+    const id = row["id"];
+    if (typeof id !== "number" || !Number.isSafeInteger(id)) return true;
+    if (id <= run.commentId) return false;
+    const body = row["body"];
+    if (typeof body !== "string") return false;
+    if (!ATTESTATION_PREFIXES.some((prefix2) => body.startsWith(prefix2))) {
+      return false;
+    }
+    const firstLine = body.split("\n", 1)[0].replace(/\r$/, "");
+    const match = PASS_V3_RE.exec(firstLine) ?? COMPLETE_V3_RE.exec(firstLine);
+    if (match?.index !== 0 || !match.groups) return true;
+    return readerIdentity(match.groups["engine"]) === reader && parseInt(match.groups["round"], 10) < round;
+  });
+}
+function isConvergenceRound(params) {
+  const rows = getIssueComments(params.repo, params.pr);
+  const run = reviewRuns(rows).at(-1);
+  if (params.round < (run?.tier === "lean" ? 2 : 3)) return false;
+  if (run === void 0) return true;
+  return readEarlierInRun(rows, run, params.engine, params.round);
 }
 function verifyResultEvidence(args, threads, options) {
   const data = options?.data ?? validateResultData(args, readResultBytes(args.resultFile));
@@ -18218,7 +18248,11 @@ function verifyResultEvidence(args, threads, options) {
   if (!evidence.some(([, hasFix]) => hasFix)) {
     fail("changed review results require a fixed ledger finding");
   }
-  if (args.round >= convergenceStartRound(args.repo, args.pr) && evidence.some(([, , , hasNonblockingFix]) => hasNonblockingFix)) {
+  const convergence = isConvergenceRound(args);
+  if (convergence && data.classification !== "material") {
+    fail("convergence changed review results require material classification");
+  }
+  if (convergence && evidence.some(([, , , hasNonblockingFix]) => hasNonblockingFix)) {
     fail("convergence review results cannot fix non-blocking findings");
   }
   return data;
@@ -18257,7 +18291,7 @@ function writeResult(params) {
   if (!changed && params.classification !== void 0) {
     fail("clean review result cannot have a classification");
   }
-  const convergence = params.round >= convergenceStartRound(params.repo, params.pr);
+  const convergence = isConvergenceRound(params);
   if (changed && convergence && params.classification !== "material") {
     fail("convergence changed review results require material classification");
   }
@@ -18328,7 +18362,7 @@ function checkBlockedRound(params) {
       "the blocked round published a change with no fixed same-round finding; it was not reviewed"
     );
   }
-  if (params.round >= convergenceStartRound(params.repo, params.pr)) {
+  if (isConvergenceRound(params)) {
     for (const [fingerprint, , , hasNonblockingFix] of dispositions) {
       if (hasNonblockingFix) {
         slips.push(
@@ -18392,7 +18426,7 @@ function preflightFix(params) {
   requireCarriedFixRun(params);
   verifyHead(params.repo, params.pr, params.head);
   const comments = ledgerComments(params.repo, params.pr);
-  const stance = roundStance(params.repo, params.pr, params.round);
+  const stance = roundStance(params);
   const severity = fixableFindingSeverity(comments, params, stance);
   verifyHead(params.repo, params.pr, params.head);
   return { ...params, severity, stance, verified: true };
@@ -18411,7 +18445,7 @@ function preflightPublish(params) {
   }
   verifyHead(params.repo, params.pr, params.head);
   const comments = ledgerComments(params.repo, params.pr);
-  const stance = roundStance(params.repo, params.pr, params.round);
+  const stance = roundStance(params);
   for (const finding of params.findings)
     requireCarriedFixRun({ ...params, ...finding });
   const findings = params.findings.map((finding) => ({
@@ -18425,8 +18459,8 @@ function preflightPublish(params) {
   verifyHead(params.repo, params.pr, params.head);
   return { ...params, findings, stance, verified: true };
 }
-function roundStance(repo, pr, round) {
-  return round >= convergenceStartRound(repo, pr) ? "convergence" : "adversarial";
+function roundStance(params) {
+  return isConvergenceRound(params) ? "convergence" : "adversarial";
 }
 function fixableFindingSeverity(comments, params, stance) {
   const label = `${params.fingerprint} occurrence ${params.occurrence}`;
@@ -18734,8 +18768,8 @@ function dispose(params) {
     );
   }
   const finding = matches[0];
-  if (finding.severity === "blocking" && params.outcome !== "fixed") {
-    fail("blocking local-review findings must be fixed");
+  if (finding.severity === "blocking" && params.outcome === "deferred") {
+    fail("blocking local-review findings cannot be deferred");
   }
   const dispMatches = comments.filter((row) => {
     const match = matchDisposition(String(row.body ?? ""));
