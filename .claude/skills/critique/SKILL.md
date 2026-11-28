@@ -8,6 +8,12 @@ argument-hint: (optional PR number and/or "deep"; "silent" keeps the review off 
 
 ## Reviewer environment preflight — hard stop
 
+When hreview supplies a binding, run the controller-supplied absolute `reviewer-entry.py enter`
+command before following this skill and follow its bound skill from the candidate cwd, unless you are
+already following that skill's entered text. Each nested lane gets its own `enter` with `--skill` set
+to that lane; after a pushed fix, set `--head` to the new Git-derived HEAD and keep the base, run,
+round and receipt. A failed entry ends the pass before any evidence operation.
+
 This preflight precedes all other entry gates, including instructions below to
 classify or check context first. Before profile setup, GitHub reads, telemetry,
 classification or any ledger write,
@@ -16,10 +22,11 @@ run these commands separately in the supplied review worktree:
 ```bash
 git rev-parse HEAD
 node .claude/skills/critique/scripts/review-ledger.js --version
+node .claude/skills/critique/scripts/review-ledger.js silent-status --help
 ```
 
-Compare the reported helper version with
-`.claude/skills/critique/scripts/review-ledger.version`. On either command's
+Require the last command to print the command-specific `usage: review-ledger silent-status --repo` synopsis; generic help or an unknown command blocks. Compare the reported helper version with
+`.claude/skills/critique/scripts/review-ledger.version`. On any command's
 nonzero exit, a missing pin or a version mismatch, stop and report the failing
 command, exit status and exact stdout/stderr (or both versions for a mismatch).
 Post nothing. Do not simulate a ledger write, hand-write markers, create a
@@ -129,7 +136,7 @@ from where it paused. Report any other exit verbatim and stop.
 
 A PR is silent when `$ARGUMENTS` holds the word `silent`, or when the ledger
 helper's `silent-status --repo <owner/repo> --pr <number>` reports
-`"silent": true`. For an argument-requested PR, run `silent-pin` before the
+`"silent": true`. A failed or malformed status read blocks every evidence write. For an argument-requested PR, run `silent-pin` before the
 first ledger read. A refused pin ends the pass: report the refusal to the user
 and never continue the review loud. A silent PR keeps its ledger local: follow
 [Silent mode](../../references/local-review-ledger.md#silent-mode) for every
@@ -202,6 +209,10 @@ The stance follows the tier's schedule, not the round ordinal alone:
   the round as the convergence round.
 - **The first round after an escalation is adversarial whatever its ordinal**,
   per the workflow doc's escalation rule.
+- **A late joiner's first read is adversarial whatever its ordinal.** An engine
+  holding no earlier pass or completion attestation in the current run reads
+  adversarially; an unparseable attestation in the current run counts as an
+  earlier read by every engine, and with no run marker the round number decides.
 
 In an adversarial round the matrix and dispositions below apply as written. In a
 convergence round both engines have already read the change cold; the goal moves
